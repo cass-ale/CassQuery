@@ -48,7 +48,7 @@ Intel. `npm run build:mac` also creates architecture-labelled ZIP and DMG files.
 On a host allowed to mount disk images, check the **final** DMG:
 
 ```sh
-python tools/dmg_smoke.py --dmg dist/mac-app/CassQuery-1.0.0-mac-arm64.dmg --arch arm64 --output evidence/dmg
+python tools/dmg_smoke.py --dmg dist/mac-app/CassQuery-0.1.0-mac-arm64.dmg --arch arm64 --output evidence/dmg
 ```
 
 Inspect every generated assembled/apart screenshot. A nonempty PNG and passing
@@ -133,12 +133,14 @@ Publication remains blocked until:
    with **no unsigned fallback**. The candidate does not provision those secrets.
 4. A quarantined browser-download/Finder launch is tested on a clean account and
    the advertised minimum macOS version, without development Python/Node.
-5. A future publication job creates a draft, verifies expected files, re-downloads
-   and hashes those exact final bytes, uses protected approval, and publishes only
-   after authorization. Prefer promoting checked candidate bytes over rebuilding;
-   if rebuilt, re-run all final-package checks. Never mutate a published release.
+5. The explicit version-tag publication workflow promotes the unchanged candidate
+   bytes, verifies its draft inventory by re-downloading/hashing every asset, and
+   passes the configured `releases` protected approval gate before publication.
+   See [RELEASE.md](RELEASE.md); no source push creates tags or releases.
 
-Automatic updates, authenticated update manifests, release promotion and public
-publication are not implemented in this initial macOS development pass. No honest
-engineering process can guarantee a 100% first-attempt rate; these gates remove
-known preventable failures and make remaining risks explicit.
+Automatic updates and authenticated update manifests remain unimplemented.
+Protected candidate promotion is authored and tested, not an executed public
+release. The first version is **0.1.0 / v0.1.0**. Complete the separate
+[pre-push](PRE_PUSH.md) and [pre-release](PRE_RELEASE.md) checklists, including
+all required machine and human gates. No honest engineering process can guarantee
+a 100% first-attempt rate; these gates make remaining risks explicit.

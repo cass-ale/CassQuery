@@ -1,6 +1,6 @@
 {
   "name": "cassquery",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "A local desktop viewer for CadQuery projects — live preview tier, certified gated builds, semantic payloads, and a loopback agent protocol.",
   "main": "shell/main.js",
   "scripts": {
@@ -10,7 +10,7 @@
     "build:worker": "python3 -m PyInstaller --noconfirm --clean packaging/worker.spec",
     "build:mac": "npm run build:worker && electron-builder --config packaging/electron-builder.json --mac --publish never",
     "build:mac:dir": "npm run build:worker && electron-builder --config packaging/electron-builder.json --mac --dir --publish never",
-    "preflight": "npm test && python3 tools/check_release.py && python3 tools/make_brand_assets.py --check",
+    "preflight": "python3 tools/preflight.py",
     "test:visual": "node tools/viewer_render.cjs"
   },
   "keywords": [],

@@ -14,6 +14,29 @@ ACTION_PINS = {
 }
 
 
+REQUIRED_COMMANDS = {
+    'Locked dependencies': '''npm ci
+python -m pip install --require-hashes --only-binary=:all: -r packaging/requirements-macos.lock
+python -m pip check''',
+    'Source identity snapshot': 'python tools/release_evidence.py snapshot --output evidence/source-before.json',
+    'Cheap fail-fast preflight': 'python tools/preflight.py --require-clean --source-before evidence/source-before.json --output evidence/preflight.json',
+    'Native worker freeze': 'npm run build:worker',
+    'Frozen real-CAD build, watcher and failure retention': 'python tools/worker_smoke.py --worker dist/cassquery-worker/cassquery-worker --output evidence/worker-${{ matrix.arch }}.json',
+    'Assemble native app without publishing': 'npx electron-builder --config packaging/electron-builder.json --mac --dir --${{ matrix.arch }} --publish never',
+    'Render the actual bundled application': '''APP=$(printf '%s\\n' dist/mac-app/mac*/CassQuery.app)
+python tools/macos_smoke.py --app "$APP" --output evidence/mac-${{ matrix.arch }}''',
+    'Package checked app': '''npx electron-builder --config packaging/electron-builder.json --mac --${{ matrix.arch }} --prepackaged "$(printf '%s\\n' dist/mac-app/mac*/CassQuery.app)" --publish never''',
+    'Verify and launch the final ZIP': '''ARCH=${{ matrix.arch }}
+if [ "$ARCH" = x64 ]; then ARCH=x86_64; fi
+python tools/zip_smoke.py --zip "$(printf '%s\\n' dist/mac-app/*.zip)" --arch "$ARCH" --output evidence/zip-${{ matrix.arch }}''',
+    'Verify and launch the final DMG': '''ARCH=${{ matrix.arch }}
+if [ "$ARCH" = x64 ]; then ARCH=x86_64; fi
+python tools/dmg_smoke.py --dmg "$(printf '%s\\n' dist/mac-app/*.dmg)" --arch "$ARCH" --output evidence/dmg-${{ matrix.arch }}''',
+    'Candidate identity and hashes': '''python tools/sbom.py --output evidence/sbom.json
+python tools/release_evidence.py stage --arch ${{ matrix.arch }} --output dist/candidate-${{ matrix.arch }}''',
+}
+
+
 def check_python_runtime(version, arches, manifest):
     """Reject a provider pin without a native download for every advertised arch."""
     assert re.fullmatch(r"3\.12\.\d+", version), "review Python ABI changes with the native dependency graph"
@@ -44,22 +67,35 @@ def check(root=ROOT, python_manifest=None):
     assert builder["mac"]["identity"] == "-", "candidate must explicitly ad-hoc sign"
     assert builder["mac"]["hardenedRuntime"] is False, "hardened Developer ID mode requires separate configuration"
     assert builder["files"] == ["shell/**", "package.json"], "bundle allowlist changed"
+    wheel_manifest = json.loads((root / 'packaging/wheel-manifest.json').read_text())
+    assert wheel_manifest.get('schema') == 1 and wheel_manifest.get('python_abi') == 'cp312', 'invalid native wheel manifest'
+    import hashlib
+    assert hashlib.sha256((root / 'requirements-build.txt').read_bytes()).hexdigest() == wheel_manifest['requirements_sha256'], 'wheel manifest source graph drift'
+    wheel_lock = (root / 'packaging/requirements-macos.lock').read_text()
+    for name, version in [line.split('==') for line in (root / 'requirements-build.txt').read_text().splitlines() if line and not line.startswith('#')]:
+        normalized = re.sub(r'[-_.]+', '-', name).lower()
+        files = [wheel for wheel in wheel_manifest['wheels'] if wheel['name'] == normalized and wheel['version'] == version]
+        assert files and f'{normalized}=={version}' in wheel_lock, f'missing locked dependency: {name}'
+        for wheel in files:
+            assert re.fullmatch(r'[0-9a-f]{64}', wheel['sha256']) and '--hash=sha256:' + wheel['sha256'] in wheel_lock, 'missing wheel content hash'
+    import importlib.util
+    validator_spec = importlib.util.spec_from_file_location('native_wheel_lock', Path(__file__).with_name('wheel_lock.py'))
+    validator = importlib.util.module_from_spec(validator_spec)
+    validator_spec.loader.exec_module(validator)
+    validator.validate(root)
     workflow = (root / ".github/workflows/macos-candidate.yml").read_text()
     import yaml
     document = yaml.safe_load(workflow)
     assert document['permissions'] == {'contents': 'read'}, 'excess workflow permissions'
     job = document['jobs']['candidate']
     assert job['env'].get('CSC_FOR_PULL_REQUEST') == 'true', 'PR ad-hoc sealing must not be skipped'
+    assert job['env'].get('CASSQUERY_SOFTWARE_GL') == '1', 'hosted runner rendering must be explicit, not an implicit GPU fallback'
     assert job['env'].get('CSC_IDENTITY_AUTO_DISCOVERY') == 'false', 'candidate must not discover owner signing identity'
-    assert job.get('continue-on-error', False) is False, 'candidate can ignore failure'
+    assert job.get('continue-on-error', False) is False and 'if' not in job, 'candidate job can bypass gates'
+    assert job.get('permissions', document['permissions']) == {'contents': 'read'}, 'candidate permissions exceed read-only'
     entries = job['strategy']['matrix']['include']
     assert {(x['runner'], x['arch']) for x in entries} == {('macos-15', 'arm64'), ('macos-15-intel', 'x64')}
-    required = [
-        'Locked dependencies', 'Cheap fail-fast preflight', 'Native worker freeze',
-        'Frozen real-CAD build, watcher and failure retention',
-        'Assemble native app without publishing', 'Render the actual bundled application',
-        'Package checked app', 'Verify and launch the final DMG', 'Candidate identity and hashes',
-    ]
+    required = list(REQUIRED_COMMANDS)
     steps = job['steps']
     python_steps = [step for step in steps if step.get('uses', '').startswith('actions/setup-python@')]
     assert len(python_steps) == 1, 'exactly one native Python setup is required'
@@ -82,14 +118,18 @@ uname -m >> evidence/runner-context.txt'''
     assert len(setups) == 2 and all(names.index('Record runner context') < steps.index(step) for step in setups), 'diagnostics must precede both tool setup actions'
     uploads = [step for step in steps if step.get('uses', '').startswith('actions/upload-artifact@')]
     assert len(uploads) == 1 and uploads[0].get('if') == 'always()', 'diagnostics must survive failed setup'
-    assert 'evidence/' in uploads[0]['with']['path'] and uploads[0]['with']['if-no-files-found'] == 'error'
+    assert uploads[0]['with']['path'] == 'dist/candidate-${{ matrix.arch }}/' and uploads[0]['with']['if-no-files-found'] == 'error', 'candidate artifact root must match verified staging'
+    diagnostic = [step for step in steps if step.get('name') == 'Retain failure diagnostics']
+    assert len(diagnostic) == 1 and diagnostic[0].get('if') == 'always()', 'early failures must retain nonqualifying diagnostics'
+    checkouts = [step for step in steps if step.get('uses', '').startswith('actions/checkout@')]
+    assert len(checkouts) == 1 and checkouts[0].get('with') == {'ref': '${{ github.sha }}', 'persist-credentials': False}, 'candidate must checkout exact CI SHA without persisted credentials'
     positions = []
     for name in required:
         assert names.count(name) == 1, f'missing/duplicate gate: {name}'
         step = steps[names.index(name)]
         assert 'if' not in step, f'gate can be skipped: {name}'
         assert step.get('continue-on-error', False) is False, f'gate failure ignored: {name}'
-        assert step.get('run', '').strip(), f'gate has no command: {name}'
+        assert step.get('run', '').strip() == REQUIRED_COMMANDS[name], f'gate command was changed or replaced: {name}'
         positions.append(names.index(name))
     assert positions == sorted(positions), 'release gates out of order'
     used = dict(re.findall(r"uses:\s*([\w/-]+)@([0-9a-f]{40})", workflow))

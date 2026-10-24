@@ -314,7 +314,7 @@ async function setVariant(name) {
     return false;
   } finally {
     const line = document.getElementById("buildline");
-    if (loading && model === value && request === variantRequest && line.textContent.trim() === loadingText)
+    if (model === value && request === variantRequest && line.textContent.trim().startsWith("loading "))
       line.textContent = "";
   }
 }

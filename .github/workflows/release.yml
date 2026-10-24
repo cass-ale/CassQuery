@@ -1,0 +1,104 @@
+name: Protected candidate publication
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Successful main-push candidate run at this exact source SHA
+        required: true
+        type: string
+      tag:
+        description: Existing annotated vMAJOR.MINOR.PATCH tag at this exact source SHA
+        required: true
+        type: string
+      mode:
+        description: Draft only unless publication is explicitly selected
+        required: true
+        type: choice
+        options: [draft, publish]
+        default: draft
+      allow_ad_hoc:
+        description: Explicitly accept ad-hoc/non-hardened distribution (not Developer ID)
+        required: true
+        type: boolean
+        default: false
+permissions: {}
+concurrency:
+  group: cassquery-publication
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.repository == 'cass-ale/CassQuery' && github.ref == format('refs/tags/{0}', inputs.tag) && startsWith(github.ref, 'refs/tags/v') && github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify candidate and protection
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          EXISTING_TAG: ${{ inputs.tag }}
+          ALLOW_AD_HOC: ${{ inputs.allow_ad_hoc }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          flags=()
+          if [ "$ALLOW_AD_HOC" = true ]; then flags+=(--allow-ad-hoc); fi
+          python3 tools/release_publish.py --candidate-run-id "$CANDIDATE_RUN_ID" --tag "$EXISTING_TAG" --source-sha "$GITHUB_SHA" "${flags[@]}"
+  approve:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # prepare fails before this reference can auto-create an absent/unprotected env.
+    # The owner must configure required reviewers, prevent-self-review and v* tags only.
+    environment: releases
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Recheck protected approval boundary
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          EXISTING_TAG: ${{ inputs.tag }}
+          ALLOW_AD_HOC: ${{ inputs.allow_ad_hoc }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          flags=()
+          if [ "$ALLOW_AD_HOC" = true ]; then flags+=(--allow-ad-hoc); fi
+          python3 tools/release_publish.py --candidate-run-id "$CANDIDATE_RUN_ID" --tag "$EXISTING_TAG" --source-sha "$GITHUB_SHA" "${flags[@]}"
+  publish:
+    needs: [prepare, approve]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Promote exact candidate bytes
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_run_id }}
+          EXISTING_TAG: ${{ inputs.tag }}
+          ALLOW_AD_HOC: ${{ inputs.allow_ad_hoc }}
+          RELEASE_MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          flags=()
+          if [ "$ALLOW_AD_HOC" = true ]; then flags+=(--allow-ad-hoc); fi
+          python3 tools/release_publish.py --candidate-run-id "$CANDIDATE_RUN_ID" --tag "$EXISTING_TAG" --source-sha "$GITHUB_SHA" --mode "$RELEASE_MODE" --execute "${flags[@]}"

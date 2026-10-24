@@ -1233,6 +1233,7 @@ def bind_servers(start):
         try:
             http = ThreadingHTTPServer(("127.0.0.1", port), Handler)
             ws = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            ws.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             ws.bind(("127.0.0.1", port + 1000))
             ws.listen()
             return http, ws

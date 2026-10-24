@@ -124,6 +124,14 @@ v1 is built and verified: both tiers live, all eight certified gates exercised (
 
 Working on this repo — human or agent? Read [AGENTS.md](AGENTS.md) first: it carries the depth standard and the verification laws this codebase is held to.
 
+## Test and release gates
+
+The first release target is **v0.1.0**. Complete the separate
+[pre-push checklist](docs/PRE_PUSH.md), [pre-release checklist](docs/PRE_RELEASE.md)
+and [test-method guide](docs/TESTING.md). A passing source test suite is not
+permission to tag or publish; exact-SHA native/package evidence and protected
+approval remain required.
+
 ## Visual identity
 
 The Counterform identity, app icons, adaptive README banner, palette, typography,

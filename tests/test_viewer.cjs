@@ -272,6 +272,19 @@ test('step variants are deduplicated and only latest A-B-A transition changes vi
   assert.equal(h.eval('model.variants.get("B").group.visible'), false);
 });
 
+test('cached latest variant clears a superseded in-flight loading message', async () => {
+  const h = harness(); await h.prepare(fixture('TESTPLATE', 'certified', 0, ['neutral', 'B']));
+  const pending = deferred(), text = h.routes.get('/payload/TESTPLATE-certified-B.json');
+  h.routes.set('/payload/TESTPLATE-certified-B.json', pending.promise);
+  const loading = h.eval('setVariant("B")'); await flush();
+  assert.match(h.node('buildline').textContent, /loading B view/);
+  await h.eval('setVariant("neutral")');
+  assert.equal(h.node('buildline').textContent, '');
+  pending.resolve(text); await loading;
+  assert.equal(h.eval('model.activeName'), 'neutral');
+  assert.equal(h.node('buildline').textContent, '');
+});
+
 test('missing variant restores step and does not apply camera, xray or explode', async () => {
   const h = harness(); await h.prepare();
   h.eval('manifest.steps.push({ id: "bad", label: "Bad", caption: "Bad", variant: "missing", explode: 1, xray: true })');

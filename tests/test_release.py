@@ -19,6 +19,8 @@ class ReleaseContractTests(unittest.TestCase):
             root = Path(directory)
             for filename in ('package.json', 'package-lock.json',
                              'packaging/electron-builder.json', 'packaging/python-runtime.json',
+                             'packaging/wheel-manifest.json', 'packaging/requirements-macos.lock',
+                             'requirements-build.txt',
                              '.github/workflows/macos-candidate.yml',
                              'viewer/vendor/three.core.js', 'assets/icons/cassquery.icns'):
                 target = root / filename
@@ -97,6 +99,22 @@ class ReleaseContractTests(unittest.TestCase):
 
     def test_failed_setup_cannot_skip_diagnostic_upload(self):
         self.mutation('        if: always()', '        if: success()')
+
+    def test_each_gate_rejects_noop_command(self):
+        workflow = (ROOT / '.github/workflows/macos-candidate.yml').read_text()
+        for name in module.REQUIRED_COMMANDS:
+            start = workflow.index('        run:', workflow.index('name: ' + name))
+            end = workflow.find('      - ', start)
+            if end == -1:
+                end = len(workflow)
+            with self.subTest(gate=name):
+                self.mutation(workflow[start:end], '        run: echo green\n')
+
+    def test_job_level_skip_is_rejected(self):
+        self.mutation('  candidate:\n', '  candidate:\n    if: false\n')
+
+    def test_moving_checkout_ref_is_rejected(self):
+        self.mutation('ref: ${{ github.sha }}', 'ref: main')
 
     def test_missing_freeze_is_not_green(self):
         self.mutation('name: Native worker freeze', 'name: optional freeze')

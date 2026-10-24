@@ -26,9 +26,17 @@ outreach are authorized by that source push.
 
 ## Checked
 
-- Full `npm run preflight` on equipped macOS: **130 tests pass (44 Node, 86 Python),
-  zero skips**, plus semantic release contracts and all 42 brand exports. Native
-  icon pixel checks and real CAD/WebSocket tests are included.
+- Full `npm run preflight` on equipped macOS: **237 tests pass, zero skips**,
+  with source fingerprints unchanged before/after, hashed stage logs, semantic
+  release contracts and all 42 brand exports. Native icon and real CAD/WebSocket
+  checks are included. This is verified dirty-worktree source evidence, not a
+  clean committed release candidate.
+- Real Linux production-path integration: four scenarios and 21 observed
+  invariants pass with real CadQuery/OCP, HTTP/WebSocket, save watcher and
+  explicitly sandbox-enabled Chromium. Eight required screenshots are hash-bound.
+  A deliberately broken HTTP boundary is caught both as a normal-run witness and
+  as an exact-suite CLI negative, not an unrelated startup failure. The run exposed
+  and repaired real restart-port reuse and stale loading-state defects.
 - Real source and frozen-worker subprocesses: all eight CAD gates, occupied HTTP
   and WS pair scanning, actual save -> preview -> certified rebuild, deliberate
   failed units gate retaining the prior certified index and geometry.
@@ -83,6 +91,40 @@ platform-dependent harness assumptions and green-tests-but-rendered-clipping
 failures. Its observed macOS build was ad-hoc/notarization skipped. Its text-only
 workflow/cache checks had independently reproduced gaps; CassQuery does not copy
 those weaknesses. Details and action links: `docs/MACOS_RELEASE.md`.
+
+## Current assurance chain
+
+The stronger source/evidence/package/protected-publication gates are specified in
+[RELEASE_ASSURANCE.md](RELEASE_ASSURANCE.md) and [RELEASE.md](RELEASE.md). They bind
+clean source snapshots, exact native CI steps, all final package/image/log hashes,
+strict wheel locks and SBOM inventories. Do not confuse their implementation and
+negative tests with a completed native run or authorization to publish.
+
+The earlier candidate `40122566011` completed Apple Silicon successfully but Intel
+failed initializing EGL/GPU before geometry appeared. The new candidate explicitly
+requests hosted-runner SwiftShader and records that request; ordinary desktops keep
+their normal GPU path. The expanded native matrix still must run on the new source.
+
+The live GitHub environment is `releases`, restricted to tag pattern `v*`; required
+reviewers are not yet configured. Publication refuses to write until approval
+protections exist and an existing annotated version tag matches the exact passing
+main-push candidate. No tag, draft or release is created by a source push.
+
+## v0.1 source push — release remains on hold
+
+The first-release target is **0.1.0 / v0.1.0**. After reviewing the readiness hold,
+the owner explicitly authorized pushing these source changes. That authorization
+does not create a version tag, dispatch publication or approve a binary release.
+The local ARM64 app builds at 0.1.0 and passes source/icon/version/seal and every
+embedded Mach-O architecture check. Its frozen worker passes the real eight CAD
+checks, live save/failure retention and runtime/shutdown proof. The ARM64 ZIP builds
+and validates CRC/path/inventory. ZIP/DMG native launch proof, Intel execution,
+new exact-source CI and independent protected release approval remain required.
+Therefore the release is **HOLD / NOT READY**, not a promised first-try success.
+The authorized source push enables exact-source Actions validation; local sandbox
+restrictions are not bypassed. Complete [PRE_PUSH.md](PRE_PUSH.md),
+[PRE_RELEASE.md](PRE_RELEASE.md) and [TESTING.md](TESTING.md), preserving every
+checked/not-checked distinction.
 
 ## Review boundary
 

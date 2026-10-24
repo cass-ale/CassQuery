@@ -252,6 +252,36 @@ class NativeConformanceTests(unittest.TestCase):
                 self.assertGreaterEqual(width, 450)
                 self.assertEqual(height, 700)
 
+    def test_actual_producer_canonical_json_preserves_complete_package_inventory(self):
+        from macos_smoke import write_report
+        for suffix, first in (('zip', 'extracted'), ('dmg', 'mounted')):
+            name = f'evidence/{suffix}-arm64/package.json'
+            report = self.report(name)
+            # Producer executes first then copied, but write_report sorts object keys.
+            report['launches'] = {label: report['launches'][label] for label in (first, 'copied')}
+            original_images = copy.deepcopy(report['images'])
+            write_report(self.root / name, report)
+            stored = self.report(name)
+            self.assertEqual(list(stored['launches']), ['copied', first])
+            self.assertEqual(stored['images'], original_images)
+            self.assertTrue(stored['images'][0]['path'].startswith(first + '/'))
+            self.refresh()
+            self.verify()
+
+    def test_canonical_package_inventory_still_rejects_duplicate_missing_and_tampered_records(self):
+        from macos_smoke import write_report
+        name = 'evidence/zip-arm64/package.json'
+        for mutation in (lambda r: r['images'].append(copy.deepcopy(r['images'][0])),
+                         lambda r: r['images'].pop(),
+                         lambda r: r['images'][0].update(width=r['images'][0]['width'] + 1)):
+            self.reset()
+            report = self.report(name)
+            mutation(report)
+            write_report(self.root / name, report)
+            self.refresh()
+            with self.assertRaises(ValueError):
+                self.verify()
+
     def test_actual_raw_contract_is_shared_and_portable(self):
         report = self.report('evidence/mac-arm64/renderer.json')
         report.update(started=report['renderer_started'], finished=report['renderer_finished'], checkpoints=report['renderer_checkpoints'])

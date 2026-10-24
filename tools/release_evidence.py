@@ -602,7 +602,9 @@ def verify_candidate(root, manifest=None, *, expected_sha, expected_run_id, expe
                         == images_identity(root, native_path, native['images'], records, image_cache), 'package launch images contradict native child evidence')
                 require(launch.get('bundle') == native.get('bundle') and native['bundle']['bundle_sha256'] == native_bundle_sha,
                         'package native bundle differs from checked prepackaged app')
-            require(images_identity(root, required_path, report.get('images'), records, image_cache) == child_images,
+            # JSON object key order is not launch order; compare the complete verified inventory.
+            require(sorted(images_identity(root, required_path, report.get('images'), records, image_cache), key=lambda image: image['path'])
+                    == sorted(child_images, key=lambda image: image['path']),
                     'package aggregate images contradict native child evidence')
             _, checked = linked_json(root, required_path, report.get('checked_inventory'), records)
             _, packaged = linked_json(root, required_path, report.get('bundle_inventory'), records)

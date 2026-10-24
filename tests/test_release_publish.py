@@ -74,7 +74,7 @@ def candidate_bytes(arch, mutate=None, extra=None):
         files[f"dist/mac-app/CassQuery-{VERSION}-mac-{arch}.{suffix}"] = f"original-{arch}-{suffix}".encode()
 
     def put(name, value):
-        files[name] = json.dumps(value).encode()
+        files[name] = json.dumps(value, sort_keys=True).encode()
         return record(name, files[name])
 
     def linked(name, report_dir):

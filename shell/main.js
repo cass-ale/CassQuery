@@ -104,6 +104,7 @@ async function createWindow() {
   const up = workerPort !== null || await ensureWorker();
   if (quitting) return;
   const win = new BrowserWindow({ width: 1320, height: 880, title: 'CassQuery',
+    enableLargerThanScreen: !!process.env.CASSQUERY_SMOKE_DIR,
     webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true } });
   window = win;
   win.on('closed', () => { window = null; });

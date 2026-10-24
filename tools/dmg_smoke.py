@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -23,6 +24,21 @@ def check_launch(app, output, arch, version, baseline):
     require(inventory(app) == baseline, 'Package launch mutated bundle')
     return {'bundle': identity, 'native_report': file_evidence(output / 'renderer.json'),
             'images': report['images'], 'matrix': report['matrix'], 'checked': report['checked']}
+
+
+def mounted_device(attached, mount):
+    """Select only the device reported for this exact, physically owned mount."""
+    entities = plistlib.loads(attached).get('system-entities', [])
+    require(isinstance(entities, list) and all(isinstance(entity, dict) for entity in entities), 'Invalid attach device inventory')
+    owned = Path(mount)
+    require(owned.is_absolute() and not owned.is_symlink() and owned.resolve() == owned,
+            'Owned mount path was redirected after attach')
+    matches = [entity for entity in entities if isinstance(entity.get('mount-point'), str)
+               and Path(entity['mount-point']).is_absolute() and Path(entity['mount-point']).resolve() == owned]
+    require(len(matches) == 1, 'Attach did not report exactly one requested owned mount')
+    device = matches[0].get('dev-entry')
+    require(isinstance(device, str) and re.fullmatch(r'/dev/disk\d+(?:s\d+)*', device), 'Attach owned mount is missing a valid device')
+    return device
 
 
 def run_package(dmg, output, arch, *, checked_app, checked_inventory):
@@ -45,21 +61,21 @@ def run_package(dmg, output, arch, *, checked_app, checked_inventory):
         report['asset'] = file_evidence(dmg)
         baseline, report['checked_inventory'] = checked_bundle_inventory(checked_app, checked_inventory, output)
         report['checked_bundle_sha256'] = baseline['sha256']
-        scratch = Path(tempfile.mkdtemp(prefix='cq-dmg-'))
+        # mkdtemp may spell the Mac /var alias while hdiutil reports /private/var.
+        # Bind the physical owned root before creating/passing its mount path.
+        scratch = Path(tempfile.mkdtemp(prefix='cq-dmg-')).resolve()
         subprocess.run(['hdiutil', 'verify', str(dmg)], check=True, timeout=120)
+        require(not scratch.is_symlink() and scratch.resolve() == scratch, 'Owned scratch root redirected before mount creation')
         mount = scratch / 'mounted'
         mount.mkdir()
+        require(not mount.is_symlink() and mount.resolve() == mount, 'Owned mount path redirected before attach')
         # Parse exact device identity; detach this mount, never another volume.
         attached = subprocess.check_output(['hdiutil', 'attach', '-readonly', '-nobrowse', '-plist',
                                             '-mountpoint', str(mount), str(dmg)], timeout=120)
         (output / 'attach.plist').write_bytes(attached)
-        data = plistlib.loads(attached)
-        entities = data.get('system-entities', [])
-        device = next((e.get('dev-entry') for e in entities if e.get('mount-point') == str(mount)), None)
-        # Keep cleanup ownership even if a malformed attach reply omits its mount point.
-        fallback_device = next((e.get('dev-entry') for e in entities if e.get('dev-entry')), None)
-        device = device or fallback_device
-        require(device and any(e.get('mount-point') == str(mount) for e in entities), 'Attach did not report the requested owned mount/device')
+        # Never borrow a container/foreign device when the owned entity is absent.
+        # On parse/identity failure cleanup falls back only to our owned mount path.
+        device = mounted_device(attached, mount)
         report['mount'] = {'path': str(mount), 'device': device, 'read_only_requested': True,
                            'attach_evidence': file_evidence(output / 'attach.plist')}
         disk = subprocess.check_output(['diskutil', 'info', '-plist', str(mount)], timeout=30)
@@ -94,7 +110,8 @@ def run_package(dmg, output, arch, *, checked_app, checked_inventory):
         if mount is not None:
             report['detach_attempted'] = True
             try:
-                # No force/alternate mounting route: host denial remains a failed gate.
+                # No force/alternate route or cleanup through a retargeted link.
+                require(not mount.is_symlink() and mount.resolve() == mount, 'Owned mount path redirected; refusing detach')
                 subprocess.run(['hdiutil', 'detach', device or str(mount)], check=True, timeout=60)
                 report['detach_completed'] = True
                 report['checked'].append('owned DMG detached before pass commit')
@@ -105,6 +122,7 @@ def run_package(dmg, output, arch, *, checked_app, checked_inventory):
             # Never traverse/delete a volume whose detach failed; retain its exact
             # owned mount path for the operator rather than attempting a bypass.
             if scratch is not None and (mount is None or report['detach_completed']):
+                require(not scratch.is_symlink() and scratch.resolve() == scratch, 'Owned scratch root redirected; refusing cleanup')
                 shutil.rmtree(scratch)
             report['temp_root_removed'] = scratch is None or not scratch.exists()
             if scratch is not None and scratch.exists():
@@ -112,6 +130,8 @@ def run_package(dmg, output, arch, *, checked_app, checked_inventory):
         except Exception as exc:
             error = '; '.join(filter(None, [error, f'Cleanup failed: {exc}']))
             report['temp_root_removed'] = False
+            if scratch is not None:
+                report['retained_temp_root'] = str(scratch)
         if not report.get('temp_root_removed'):
             error = '; '.join(filter(None, [error, 'Temporary root still exists']))
         report['pass'] = error is None and report['detach_completed'] and set(report['launches']) == {'mounted', 'copied'}

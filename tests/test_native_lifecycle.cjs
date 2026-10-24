@@ -36,13 +36,16 @@ test('capture timeouts/failures release only owned debugger attachment',async()=
  }
 });
 
-async function mainFixture({closeMode='pending',failSmoke=false,lateError=false,shutdownError=false}={}){
+async function mainFixture({closeMode='pending',failSmoke=false,lateError=false,shutdownError=false,assurance=true}={}){
  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'cq-lifecycle-unit-'));
  const app=new EventEmitter(),windows=[];let context,doneResolve;const done=new Promise(r=>{doneResolve=r;});
  Object.assign(app,{commandLine:{appendSwitch(){}},isPackaged:true,getVersion:()=> '0.1.0',getPath:()=>directory,requestSingleInstanceLock:()=>true,whenReady:()=>new Promise(()=>{}),getGPUInfo:async()=>({auxAttributes:{glRenderer:'synthetic'}}),exit:()=>doneResolve()});
  app.quit=()=>{if(lateError)windows[0].webContents.emit('console-message',{level:'error',message:'old page diagnostic'});app.emit('before-quit',{preventDefault(){}});if(vm.runInContext('shutdownComplete',context))doneResolve();};
  class Win extends EventEmitter{
-  constructor(){super();this.dead=false;windows.push(this);this.webContents=new EventEmitter();Object.assign(this.webContents,{setWindowOpenHandler(){},session:{setPermissionRequestHandler(){}},executeJavaScript:async source=>source==='__cq.model.hash'?'a'.repeat(16):source.includes('readRendererContext')?{context:'webgl2',is_context_lost:false}:true});}
+  constructor(options){super();this.dead=false;this.options=options;this.contentSize=[0,0];windows.push(this);this.webContents=new EventEmitter();Object.assign(this.webContents,{setWindowOpenHandler(){},session:{setPermissionRequestHandler(){}},executeJavaScript:async source=>source==='[innerWidth,innerHeight]'?this.contentSize.slice():source==='__cq.model.hash'?'a'.repeat(16):source.includes('readRendererContext')?{context:'webgl2',is_context_lost:false}:true});}
+  // Explicit Mac work-area clamp model (1024x684 minus28px title bar), not native proof.
+  setContentSize(width,height){this.contentSize=this.options.enableLargerThanScreen?[width,height]:[Math.min(width,1024),Math.min(height,656)];}
+  getContentSize(){return this.contentSize.slice();}
   isDestroyed(){return this.dead;}getBounds(){return{x:0,y:0,width:1320,height:880};}show(){}focus(){}loadURL(){return Promise.resolve();}
   close(){if(closeMode==='veto')return;const closed=()=>{this.dead=true;this.emit('closed');};if(closeMode==='pending')setTimeout(closed,5);else closed();}
   destroy(){throw Error('destroy forbidden');}
@@ -56,9 +59,9 @@ async function mainFixture({closeMode='pending',failSmoke=false,lateError=false,
   if(name==='node:child_process')return{spawn:()=>{const secondary=Object.assign(new EventEmitter(),{pid:101,kill(){}});setImmediate(()=>{app.emit('second-instance');secondary.emit('exit',0);});return secondary;}};
   return require(name);
  };
- context=vm.createContext({require:req,console:{error(){}},AbortController,setTimeout,clearTimeout,process:{env:{CASSQUERY_SMOKE_DIR:directory},platform:process.platform,arch:process.arch,versions:process.versions,pid:99,resourcesPath:'/synthetic',execPath:'/synthetic/app',hrtime:process.hrtime},__dirname:path.join(__dirname,'../shell')});
+ context=vm.createContext({require:req,console:{error(){}},AbortController,setTimeout,clearTimeout,process:{env:assurance?{CASSQUERY_SMOKE_DIR:directory}:{},platform:process.platform,arch:process.arch,versions:process.versions,pid:99,resourcesPath:'/synthetic',execPath:'/synthetic/app',hrtime:process.hrtime},__dirname:path.join(__dirname,'../shell')});
  vm.runInContext(fs.readFileSync(path.join(__dirname,'../shell/main.js'),'utf8')+'\nglobalThis.audit={runNativeSmoke,openWindow,getWindow:()=>window,setWorker:w=>{worker=w;workerPort=3939;smokeStarted=true;tried.python="/synthetic/worker/cassquery-worker";}};',context);
- try{context.audit.setWorker(worker);await context.audit.openWindow();await context.audit.runNativeSmoke(context.audit.getWindow());await done;const report=JSON.parse(fs.readFileSync(path.join(directory,'renderer-raw.json'),'utf8'));return{report,windows};}
+ try{context.audit.setWorker(worker);await context.audit.openWindow();if(!assurance)return{report:null,windows};await context.audit.runNativeSmoke(context.audit.getWindow());await done;const report=JSON.parse(fs.readFileSync(path.join(directory,'renderer-raw.json'),'utf8'));return{report,windows};}
  finally{fs.rmSync(directory,{recursive:true,force:true});}
 }
 test('capture uses one absolute budget across dimensions and native CDP phases',async()=>{
@@ -110,6 +113,19 @@ test('renderer readiness waits actual stage/canvas dimensions and camera aspect,
   if(mode==='transient'){await api.waitRendererLayout(win,250);assert.equal(reads,2);}
   else await assert.rejects(api.waitRendererLayout(win,20),/(?:layout timed out|exceeded its deadline).*1024/);
  }
+});
+
+test('executed constructor enables larger-than-screen only for explicit assurance, including reopen',async()=>{
+ const{windows}=await mainFixture();assert.equal(windows.length,2);
+ for(const win of windows){assert.equal(win.options.enableLargerThanScreen,true);assert.equal(win.options.webPreferences.sandbox,true);assert.equal(win.options.webPreferences.contextIsolation,true);assert.equal(win.options.webPreferences.nodeIntegration,false);}
+ const normal=await mainFixture({assurance:false});assert.equal(normal.windows.length,1);assert.equal(normal.windows[0].options.enableLargerThanScreen,false);
+});
+test('Mac work-area model preserves actual requested matrix content sizes without viewport reduction',async()=>{
+ const normal=await mainFixture({assurance:false}),clamped=normal.windows[0];clamped.setContentSize(450,700);
+ assert.deepEqual(clamped.getContentSize(),[450,656]);assert.deepEqual(await clamped.webContents.executeJavaScript('[innerWidth,innerHeight]'),[450,656]);
+ assert.throws(()=>assert.deepEqual(clamped.getContentSize(),[450,700]),'original clamp must remain a failed700px gate');
+ const{windows}=await mainFixture();
+ for(const win of windows)for(const width of [450,700,1000,1320]){win.setContentSize(width,700);assert.deepEqual(win.getContentSize(),[width,700]);assert.deepEqual(await win.webContents.executeJavaScript('[innerWidth,innerHeight]'),[width,700]);}
 });
 
 test('executed main waits delayed close and activates a new window with the same worker',async()=>{

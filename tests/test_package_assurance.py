@@ -1,5 +1,6 @@
 """Package trust boundaries, cleanup and stale-pass regressions (no OS mounts)."""
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,42 @@ import macos_smoke as native
 import dmg_smoke as dmg
 import zip_smoke as zipped
 import worker_smoke as worker
+
+# Exact Intel CI attach reply at 8006753, not a fabricated mount response.
+INTEL_ATTACH_PLIST = b'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+\t<key>system-entities</key>
+\t<array>
+\t\t<dict>
+\t\t\t<key>content-hint</key>
+\t\t\t<string>Apple_HFS</string>
+\t\t\t<key>dev-entry</key>
+\t\t\t<string>/dev/disk2s1</string>
+\t\t\t<key>mount-point</key>
+\t\t\t<string>/private/var/folders/20/jp1_0n3n7kndh6rnbqb5344m0000gn/T/cq-dmg-2kizoopy/mounted</string>
+\t\t\t<key>potentially-mountable</key>
+\t\t\t<true/>
+\t\t\t<key>unmapped-content-hint</key>
+\t\t\t<string>48465300-0000-11AA-AA11-00306543ECAC</string>
+\t\t\t<key>volume-kind</key>
+\t\t\t<string>hfs</string>
+\t\t</dict>
+\t\t<dict>
+\t\t\t<key>content-hint</key>
+\t\t\t<string>GUID_partition_scheme</string>
+\t\t\t<key>dev-entry</key>
+\t\t\t<string>/dev/disk2</string>
+\t\t\t<key>potentially-mountable</key>
+\t\t\t<false/>
+\t\t\t<key>unmapped-content-hint</key>
+\t\t\t<string>GUID_partition_scheme</string>
+\t\t</dict>
+\t</array>
+</dict>
+</plist>
+'''
 
 
 class PackageAssuranceTests(unittest.TestCase):
@@ -312,21 +349,94 @@ class PackageAssuranceTests(unittest.TestCase):
             worker.run_smoke(self.root / 'missing-worker', output)
         self.assertIs(json.loads(output.read_text())['pass'], False)
 
-    def exercise_dmg(self, detach_error=False, launch_error=False, cancelled=False):
+    def test_actual_intel_attach_plist_selects_same_unique_canonical_entity(self):
+        self.assertEqual(hashlib.sha256(INTEL_ATTACH_PLIST).hexdigest(),
+                         '1304fa7f824af2e4263793df595d0981f807dd72a5e2cf258d796b94616d9cd8')
+        data = plistlib.loads(INTEL_ATTACH_PLIST)
+        canonical = Path(data['system-entities'][0]['mount-point']).resolve()
+        self.assertEqual(dmg.mounted_device(INTEL_ATTACH_PLIST, canonical), '/dev/disk2s1')
+        if sys.platform == 'darwin':
+            reported_alias = INTEL_ATTACH_PLIST.replace(b'/private/var/', b'/var/', 1)
+            self.assertEqual(dmg.mounted_device(reported_alias, canonical), '/dev/disk2s1')
+        for case in ('foreign', 'missing-device', 'duplicate', 'invalid-device'):
+            bad = copy.deepcopy(data)
+            if case == 'foreign':
+                bad['system-entities'][0]['mount-point'] += '-foreign'
+            elif case == 'missing-device':
+                bad['system-entities'][0].pop('dev-entry')
+                bad['system-entities'][1]['dev-entry'] = '/dev/disk999'
+            elif case == 'duplicate':
+                bad['system-entities'].append(copy.deepcopy(bad['system-entities'][0]))
+            else:
+                bad['system-entities'][0]['dev-entry'] = '/dev/disk../bad'
+            with self.subTest(case=case), self.assertRaises(RuntimeError):
+                dmg.mounted_device(plistlib.dumps(bad), canonical)
+
+    def test_attach_selector_rejects_expected_mount_retarget(self):
+        mount, foreign = self.root.resolve() / 'owned-mount', self.root.resolve() / 'foreign'
+        mount.mkdir(); foreign.mkdir()
+        mount.rmdir(); mount.symlink_to(foreign, target_is_directory=True)
+        data = plistlib.loads(INTEL_ATTACH_PLIST)
+        data['system-entities'][0]['mount-point'] = str(foreign)
+        with self.assertRaisesRegex(RuntimeError, 'redirected'):
+            dmg.mounted_device(plistlib.dumps(data), mount)
+
+    def exercise_dmg(self, detach_error=False, launch_error=False, cancelled=False, attach_case=None):
         file = self.root / 'candidate.dmg'; file.write_bytes(b'final exact dmg bytes')
         output = self.root / 'dmg'; output.mkdir()
         (output / 'package.json').write_text('{"schema":1,"pass":true}')
         baseline = self.baseline
         order = []
+        self.dmg_commands = []
+        physical = self.root.resolve() / 'physical'
+        physical.mkdir(exist_ok=True)
+        owned = physical / 'scratch'; owned.mkdir()
+        logical = self.root / 'logical'
+        if not logical.is_symlink(): logical.symlink_to(physical, target_is_directory=True)
         def run(command, **_kwargs):
+            self.dmg_commands.append(command)
             order.append(command[0] + ':' + command[1])
+            if command[:2] == ['hdiutil', 'verify'] and attach_case == 'root-before-attach':
+                foreign = self.root.resolve() / 'foreign'; foreign.mkdir(exist_ok=True)
+                (foreign / 'keep').write_bytes(b'public negative fixture')
+                owned.rename(physical / 'banked-scratch')
+                owned.symlink_to(foreign, target_is_directory=True)
             if command[:2] == ['hdiutil', 'detach'] and detach_error:
                 raise RuntimeError('host detach denied')
+        real_mkdir = Path.mkdir
+        def mkdir(path, *args, **kwargs):
+            real_mkdir(path, *args, **kwargs)
+            if path == owned / 'mounted' and attach_case == 'mount-before-attach':
+                foreign = self.root.resolve() / 'foreign'; real_mkdir(foreign, exist_ok=True)
+                (foreign / 'keep').write_bytes(b'public negative fixture')
+                path.rename(owned / 'banked-mount')
+                path.symlink_to(foreign, target_is_directory=True)
         def capture(command, **_kwargs):
+            self.dmg_commands.append(command)
             if command[0] == 'diskutil':
                 return plistlib.dumps({'ReadOnlyVolume': True})
-            mount = command[command.index('-mountpoint') + 1]
-            return plistlib.dumps({'system-entities': [{'dev-entry': '/dev/fake-owned', 'mount-point': mount}]})
+            mount = Path(command[command.index('-mountpoint') + 1])
+            self.assertEqual(mount, owned / 'mounted')  # Canonical before OS call, not an echoed alias.
+            data = plistlib.loads(INTEL_ATTACH_PLIST)
+            data['system-entities'][0]['mount-point'] = str(mount)
+            if attach_case == 'foreign':
+                data['system-entities'][0]['mount-point'] = str(self.root.resolve() / 'foreign')
+                data['system-entities'][0]['dev-entry'] = '/dev/disk999'
+            elif attach_case == 'missing-device':
+                data['system-entities'][0].pop('dev-entry')
+                data['system-entities'][1]['dev-entry'] = '/dev/disk999'
+            elif attach_case == 'duplicate':
+                data['system-entities'].append(copy.deepcopy(data['system-entities'][0]))
+            elif attach_case == 'retarget':
+                foreign = self.root.resolve() / 'foreign'; foreign.mkdir()
+                (foreign / 'keep').write_bytes(b'public negative fixture')
+                mount.rmdir(); mount.symlink_to(foreign, target_is_directory=True)
+                data['system-entities'][0]['mount-point'] = str(foreign)
+                data['system-entities'][0]['dev-entry'] = '/dev/disk999'
+            return plistlib.dumps(data)
+        def verify(*_args):
+            order.append('bundle-verification')
+            return {}, baseline
         def launch(_app, directory, _arch, _version, _baseline):
             self.assertIs(json.loads((output / 'package.json').read_text())['pass'], False)
             order.append('launch:' + directory.name)
@@ -335,18 +445,62 @@ class PackageAssuranceTests(unittest.TestCase):
             if launch_error:
                 raise RuntimeError('native failure')
             return {'native_report': {'path': str(directory / 'renderer.json'), 'sha256': 'a' * 64, 'bytes': 1}, 'images': [], 'matrix': [], 'checked': []}
-        with patch.object(dmg.subprocess, 'run', side_effect=run), patch.object(dmg.subprocess, 'check_output', side_effect=capture), \
-             patch.object(dmg, 'verify_bundle', return_value=({}, baseline)), patch.object(dmg, 'inventory', return_value=baseline), \
+        with patch.object(dmg.tempfile, 'mkdtemp', return_value=str(logical / 'scratch')), \
+             patch.object(Path, 'mkdir', new=mkdir), \
+             patch.object(dmg.subprocess, 'run', side_effect=run), patch.object(dmg.subprocess, 'check_output', side_effect=capture), \
+             patch.object(dmg, 'verify_bundle', side_effect=verify), patch.object(dmg, 'inventory', return_value=baseline), \
              patch.object(dmg, 'check_launch', side_effect=launch):
-            if detach_error or launch_error or cancelled:
+            if detach_error or launch_error or cancelled or attach_case:
                 with self.assertRaises(RuntimeError):
                     dmg.run_package(file, output, 'arm64', **self.checked)
             else:
                 dmg.run_package(file, output, 'arm64', **self.checked)
         report = json.loads((output / 'package.json').read_text())
         if report.get('retained_temp_root'):
-            shutil.rmtree(report['retained_temp_root'])  # Mock mount only, never a real volume.
+            retained = Path(report['retained_temp_root'])
+            if retained.is_symlink(): retained.unlink()
+            else: shutil.rmtree(retained)  # Mock mount only, never a real volume.
+        elif owned.is_symlink():
+            owned.unlink()  # Mock pre-attach root retarget, no real mount was attempted.
         return report, order
+
+    def test_foreign_missing_duplicate_attach_never_detach_an_unproven_device(self):
+        for case in ('foreign', 'missing-device', 'duplicate'):
+            with self.subTest(case=case):
+                report, order = self.exercise_dmg(attach_case=case)
+                self.assertIs(report['pass'], False)
+                self.assertNotIn('bundle-verification', order)
+                self.assertFalse(any(item.startswith('launch:') for item in order))
+                attached = next(c for c in self.dmg_commands if c[:2] == ['hdiutil', 'attach'])
+                owned = attached[attached.index('-mountpoint') + 1]
+                detached = [c for c in self.dmg_commands if c[:2] == ['hdiutil', 'detach']]
+                self.assertEqual(detached, [['hdiutil', 'detach', owned]])
+                self.assertFalse(any('/dev/disk999' in c for c in self.dmg_commands))
+                self.assertIs(report['detach_completed'], True)  # Mock OS result, never a real mount.
+                shutil.rmtree(self.root / 'dmg')
+
+    def test_attach_retarget_refuses_detach_and_retains_owned_scratch(self):
+        report, order = self.exercise_dmg(attach_case='retarget')
+        self.assertIs(report['pass'], False)
+        self.assertNotIn('bundle-verification', order)
+        self.assertFalse(any(c[:2] == ['hdiutil', 'detach'] for c in self.dmg_commands))
+        self.assertIs(report['detach_completed'], False)
+        self.assertIs(report['temp_root_removed'], False)
+        self.assertEqual((self.root / 'foreign/keep').read_bytes(), b'public negative fixture')
+
+    def test_pre_attach_retarget_stops_before_mkdir_or_unowned_attach(self):
+        for case in ('root-before-attach', 'mount-before-attach'):
+            with self.subTest(case=case):
+                report, order = self.exercise_dmg(attach_case=case)
+                self.assertIs(report['pass'], False)
+                self.assertNotIn('bundle-verification', order)
+                self.assertFalse(any(c[:2] == ['hdiutil', 'attach'] for c in self.dmg_commands))
+                self.assertFalse(any(c[:2] == ['hdiutil', 'detach'] for c in self.dmg_commands))
+                self.assertFalse((self.root / 'foreign/mounted').exists())
+                self.assertEqual((self.root / 'foreign/keep').read_bytes(), b'public negative fixture')
+                self.assertIs(report['temp_root_removed'], False)
+                self.assertEqual(report['retained_temp_root'], str(self.root.resolve() / 'physical/scratch'))
+                shutil.rmtree(self.root / 'dmg')
 
     def test_dmg_pass_commits_only_after_detach_with_exact_asset_hash(self):
         report, order = self.exercise_dmg()

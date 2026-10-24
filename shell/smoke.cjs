@@ -19,6 +19,7 @@ async function waitFor(win, expression, timeoutMs = 60000) {
   const deadline = performance.now() + timeoutMs;
   while (performance.now() < deadline) {
     if (win.isDestroyed()) throw new Error('Window closed during smoke test');
+    if (win.cassqueryRendererErrors?.length) throw new Error(`Renderer diagnostics: ${win.cassqueryRendererErrors.join('; ')}`);
     if (await win.webContents.executeJavaScript(expression)) return;
     await delay(100);
   }
@@ -212,6 +213,12 @@ async function matrix(win, directory, nativeTheme, errors, records = []) {
   } finally { nativeTheme.themeSource = previousTheme; }
 }
 
+function certifiedRebuildComplete(model, before) {
+  return !!(model && model.tier === 'certified' && model.gates?.pass === true
+    && model.index?.project === before.project && model.hash === before.hash
+    && Number.isFinite(model.index.built_at) && model.index.built_at > before.built_at);
+}
+
 async function productionControls(win) {
   await click(win, '#steps button:first-child'); await delay(700);
   await click(win, '#next'); await waitFor(win, 'document.getElementById("explodeval").textContent === "100%"');
@@ -250,9 +257,10 @@ async function productionControls(win) {
   await click(win, '#selshow');
   assert.ok(await win.webContents.executeJavaScript(`(() => {let n=0;__cq.model.group.traverseVisible(o=>{if(o.isMesh)n++;});return n>1;})()`));
   await click(win, '#resetview'); await delay(700);
-  const gen = await win.webContents.executeJavaScript('__cq.model.index.gen');
+  const beforeBuild = await win.webContents.executeJavaScript('({project:__cq.model.index.project, hash:__cq.model.hash, built_at:__cq.model.index.built_at})');
+  assert.ok(Number.isFinite(beforeBuild.built_at), 'missing original certified build time');
   await click(win, '#buildbtn');
-  await waitFor(win, `__cq.model?.tier === 'certified' && __cq.model.index.gen > ${gen}`);
+  await waitFor(win, `(${certifiedRebuildComplete.toString()})(window.__cq?.model, ${JSON.stringify(beforeBuild)})`);
   await waitFor(win, 'document.getElementById("diag").textContent === ""');
   return ['next/previous', 'xray rendered material', 'range keyboard input', 'mesh pointer selection',
     'isolate/hide/show all', 'reset view', 'rebuild certified button'];
@@ -316,4 +324,4 @@ async function smoke(win, directory, { nativeTheme, errors = [], evidence = {} }
   Object.assign(evidence, report);
   return report;
 }
-module.exports = { smoke, waitFor, checkpoint, click, measureFrame, validateMatrix, WIDTHS, THEMES, STATES, CHECKS };
+module.exports = { smoke, waitFor, checkpoint, click, measureFrame, validateMatrix, certifiedRebuildComplete, WIDTHS, THEMES, STATES, CHECKS };

@@ -110,6 +110,9 @@ class ReleaseContractTests(unittest.TestCase):
             with self.subTest(gate=name):
                 self.mutation(workflow[start:end], '        run: echo green\n')
 
+    def test_forced_swiftshader_cannot_replace_native_metal(self):
+        self.mutation("CASSQUERY_ANGLE: 'metal'", "CASSQUERY_SOFTWARE_GL: '1'")
+
     def test_job_level_skip_is_rejected(self):
         self.mutation('  candidate:\n', '  candidate:\n    if: false\n')
 

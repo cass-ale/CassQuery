@@ -26,7 +26,8 @@ publish or create a version tag. The first public version is **0.1.0**, tagged
 - [ ] Post-save and failed-gate renders prove the displayed geometry and camera are correct.
 - [ ] Independently inspect every required frame; nonempty PNG files do not approve visuals.
 - [ ] Bundle identity, every native architecture, resources/icon/source hashes and seal
-  agree before/after tests. Explicit CI SwiftShader proof is not hardware-GPU proof.
+  agree before/after tests. Explicit CI Metal selection is recorded; passing one
+  host/backend is not evidence for every GPU/display configuration.
 - [ ] **Final ZIP** extracts/copies/launches correctly with exact byte and mode parity.
 - [ ] **Final DMG** verifies, mounts read-only, launches mounted/copied, detaches and
   cleans up before committing success. No sandbox/mount/permission bypasses.

@@ -89,7 +89,7 @@ def check(root=ROOT, python_manifest=None):
     assert document['permissions'] == {'contents': 'read'}, 'excess workflow permissions'
     job = document['jobs']['candidate']
     assert job['env'].get('CSC_FOR_PULL_REQUEST') == 'true', 'PR ad-hoc sealing must not be skipped'
-    assert job['env'].get('CASSQUERY_SOFTWARE_GL') == '1', 'hosted runner rendering must be explicit, not an implicit GPU fallback'
+    assert job['env'].get('CASSQUERY_ANGLE') == 'metal' and 'CASSQUERY_SOFTWARE_GL' not in job['env'], 'macOS CI must use explicit ANGLE Metal, not forced Vulkan SwiftShader'
     assert job['env'].get('CSC_IDENTITY_AUTO_DISCOVERY') == 'false', 'candidate must not discover owner signing identity'
     assert job.get('continue-on-error', False) is False and 'if' not in job, 'candidate job can bypass gates'
     assert job.get('permissions', document['permissions']) == {'contents': 'read'}, 'candidate permissions exceed read-only'

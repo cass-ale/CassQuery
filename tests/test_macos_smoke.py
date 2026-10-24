@@ -179,15 +179,20 @@ raise SystemExit(1)
                     os.kill(pid, 9)
                     self.fail('failed native launch left its child running')
 
-    def test_software_renderer_is_explicit_not_desktop_fallback(self):
-        with patch.dict(os.environ, {'CASSQUERY_SOFTWARE_GL': '1'}, clear=True):
+    def test_native_renderer_is_explicit_metal_not_vulkan_fallback(self):
+        with patch.dict(os.environ, {'CASSQUERY_ANGLE': 'metal'}, clear=True):
             env, backend = module.renderer_environment({'PATH': '/usr/bin:/bin'})
-            self.assertEqual(env['CASSQUERY_SOFTWARE_GL'], '1')
-            self.assertEqual(backend, 'swiftshader-requested')
-        with patch.dict(os.environ, {}, clear=True):
-            env, backend = module.renderer_environment({'CASSQUERY_SOFTWARE_GL': '1'})
+            self.assertEqual(env['CASSQUERY_ANGLE'], 'metal')
             self.assertNotIn('CASSQUERY_SOFTWARE_GL', env)
+            self.assertEqual(backend, 'metal-requested')
+        with patch.dict(os.environ, {}, clear=True):
+            env, backend = module.renderer_environment({'CASSQUERY_SOFTWARE_GL': '1', 'CASSQUERY_ANGLE': 'metal'})
+            self.assertNotIn('CASSQUERY_SOFTWARE_GL', env)
+            self.assertNotIn('CASSQUERY_ANGLE', env)
             self.assertEqual(backend, 'desktop-default')
+        for values in ({'CASSQUERY_SOFTWARE_GL': '1'}, {'CASSQUERY_ANGLE': 'swiftshader'}, {'CASSQUERY_ANGLE': 'vulkan'}):
+            with self.subTest(values=values), patch.dict(os.environ, values, clear=True), self.assertRaises(RuntimeError):
+                module.renderer_environment({})
 
     def test_native_failure_overwrites_stale_pass(self):
         file = self.output / 'renderer.json'

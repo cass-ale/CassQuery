@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { test } = require('node:test');
-const { validateMatrix, click, measureFrame, WIDTHS, THEMES, STATES } = require('../shell/smoke.cjs');
+const { validateMatrix, click, measureFrame, certifiedRebuildComplete, WIDTHS, THEMES, STATES } = require('../shell/smoke.cjs');
 
 function validMatrix() {
   return THEMES.flatMap((theme) => WIDTHS.flatMap((width) => STATES.map((state) => ({
@@ -62,6 +62,18 @@ test('controls send native mouse input, not synthetic DOM or semantic control ca
   await click(win, '#next');
   assert.deepEqual(events.map((e) => e.type), ['mouseMove', 'mouseDown', 'mouseUp']);
   assert.equal(events[1].button, 'left'); assert.equal(events[2].x, 50);
+});
+
+test('same-source certified rebuild needs a new build time, not a changed generation', () => {
+  const before = { project: 'TESTPLATE', hash: 'a'.repeat(16), built_at: 10 };
+  const model = { tier: 'certified', hash: before.hash, gates: { pass: true },
+    index: { project: before.project, built_at: 11, gen: 0 } };
+  assert.equal(certifiedRebuildComplete(model, before), true);
+  for (const mutation of [
+    { index: { ...model.index, built_at: 10 } }, { index: { ...model.index, built_at: '11' } },
+    { tier: 'preview' }, { gates: { pass: false } }, { hash: 'b'.repeat(16) },
+    { index: { ...model.index, project: 'OTHER' } },
+  ]) assert.equal(certifiedRebuildComplete({ ...model, ...mutation }, before), false);
 });
 
 test('projection uses every actual visible world-space vertex, excluding hidden ancestors', async () => {

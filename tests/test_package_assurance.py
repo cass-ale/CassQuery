@@ -55,7 +55,7 @@ class PackageAssuranceTests(unittest.TestCase):
 
     def fake_bundle(self):
         repo = self.root / 'repo'; repo.mkdir()
-        for name in ('assets/icons/cassquery.icns', 'worker.py', 'shell/main.js', 'shell/runtime.cjs', 'shell/smoke.cjs'):
+        for name in ('assets/icons/cassquery.icns', 'worker.py', 'shell/main.js', 'shell/runtime.cjs', 'shell/smoke.cjs', 'shell/renderer_config.cjs'):
             file = repo / name; file.parent.mkdir(parents=True, exist_ok=True); file.write_bytes(name.encode())
         app = self.root / 'CassQuery.app'
         resources = app / 'Contents/Resources'; resources.mkdir(parents=True)
@@ -67,7 +67,7 @@ class PackageAssuranceTests(unittest.TestCase):
         for name in ('Contents/MacOS/CassQuery', 'Contents/Resources/worker/cassquery-worker', 'Contents/Resources/worker/_internal/lazy-extension.so'):
             file = app / name; file.parent.mkdir(parents=True, exist_ok=True); file.write_bytes(bytes.fromhex('cffaedfe') + b'native'); file.chmod(0o755)
         packed = {'package.json': json.dumps({'version': VERSION}).encode()}
-        packed.update({name: (repo / name).read_bytes() for name in ('shell/main.js', 'shell/runtime.cjs', 'shell/smoke.cjs')})
+        packed.update({name: (repo / name).read_bytes() for name in ('shell/main.js', 'shell/runtime.cjs', 'shell/smoke.cjs', 'shell/renderer_config.cjs')})
         return repo, app, packed
 
     def test_all_macho_including_lazy_dependency_architecture_is_checked(self):

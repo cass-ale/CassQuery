@@ -1,9 +1,6 @@
 const { app, BrowserWindow, Menu, nativeTheme } = require('electron');
-// Software rendering is opt-in for headless tests, never forced on a real Mac.
-if (process.env.CASSQUERY_SOFTWARE_GL === '1') {
-  app.commandLine.appendSwitch('use-angle', 'swiftshader');
-  app.commandLine.appendSwitch('enable-unsafe-swiftshader');
-}
+const { configureRenderer } = require('./renderer_config.cjs');
+const renderBackendRequested = configureRenderer(app.commandLine, process.platform, process.env);
 const fs = require('fs');
 const path = require('path');
 const { startingPort, workerCommand, startWorker, stopWorker } = require('./runtime.cjs');
@@ -117,8 +114,9 @@ async function createWindow() {
   });
   win.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   if (process.env.CASSQUERY_SMOKE_DIR) {
-    win.webContents.on('console-message', (_event, details) => {
-      if (details?.level === 'error' || details?.level === 3) rendererErrors.push(details.message);
+    win.cassqueryRendererErrors = rendererErrors;
+    win.webContents.on('console-message', (event) => {
+      require('./renderer_config.cjs').recordRendererConsole(rendererErrors, event);
     });
     win.webContents.on('render-process-gone', (_event, details) => rendererErrors.push(`renderer gone: ${details.reason}`));
     win.webContents.on('did-fail-load', (_event, code, description) => rendererErrors.push(`load ${code}: ${description}`));
@@ -199,6 +197,7 @@ async function runNativeSmoke(win) {
   report.version = app.getVersion();
   report.architecture = process.arch;
   report.source_sha = process.env.GITHUB_SHA || null;
+  report.render_backend_requested = renderBackendRequested;
   report.started = smokeStartedAt;
   report.errors = [...rendererErrors];
   // Exercise normal before-quit shutdown. Successful smoke never calls app.exit.

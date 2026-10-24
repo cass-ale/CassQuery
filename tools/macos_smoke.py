@@ -159,7 +159,7 @@ def verify_bundle(app, arch, version):
     worker_source = resources / 'source/worker.py'
     require(sha256(worker_source) == sha256(ROOT / 'worker.py'), 'Packaged worker source mismatch')
     source.append(file_evidence(ROOT / 'worker.py'))
-    packed_names = ['package.json', 'shell/main.js', 'shell/runtime.cjs', 'shell/smoke.cjs']
+    packed_names = ['package.json', 'shell/main.js', 'shell/runtime.cjs', 'shell/smoke.cjs', 'shell/renderer_config.cjs']
     packed = asar_contents(resources / 'app.asar', packed_names)
     require(json.loads(packed['package.json'])['version'] == version, 'Packed package version differs')
     for name in packed_names[1:]:
@@ -369,11 +369,14 @@ def launch(app, output, env, version, arch, *, bundled):
 
 def renderer_environment(base):
     result = dict(base)
-    if os.environ.get('CASSQUERY_SOFTWARE_GL') == '1':
-        result['CASSQUERY_SOFTWARE_GL'] = '1'
-    else:
-        result.pop('CASSQUERY_SOFTWARE_GL', None)
-    return result, ('swiftshader-requested' if result.get('CASSQUERY_SOFTWARE_GL') == '1' else 'desktop-default')
+    result.pop('CASSQUERY_SOFTWARE_GL', None)
+    result.pop('CASSQUERY_ANGLE', None)
+    requested = os.environ.get('CASSQUERY_ANGLE', '')
+    require(not os.environ.get('CASSQUERY_SOFTWARE_GL'), 'Native macOS smoke must not force Vulkan SwiftShader')
+    require(requested in ('', 'metal'), 'Unsupported native macOS ANGLE backend')
+    if requested:
+        result['CASSQUERY_ANGLE'] = requested
+    return result, ('metal-requested' if requested else 'desktop-default')
 
 
 def run_smoke(app, output, arch, signed=False):
@@ -406,7 +409,7 @@ def run_smoke(app, output, arch, signed=False):
                         'CASSQUERY_DATA_DIR': str(Path(scratch) / 'worker'),
                         'HOME': scratch, 'PATH': '/usr/bin:/bin:/usr/sbin:/sbin'})
             env, report['render_backend_requested'] = renderer_environment(env)
-            report['not_checked'].append('desktop hardware GPU when hosted-runner SwiftShader is requested')
+            report['not_checked'].append('hardware/display coverage beyond this explicit native backend and host')
             bundled = launch(app, output / 'bundled', env, version, arch, bundled=True)
             write_report(output / 'bundled/renderer.json', bundled)
             report['bundled_report'] = file_evidence(output / 'bundled/renderer.json')

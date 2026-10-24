@@ -101,9 +101,14 @@ strict wheel locks and SBOM inventories. Do not confuse their implementation and
 negative tests with a completed native run or authorization to publish.
 
 The earlier candidate `40122566011` completed Apple Silicon successfully but Intel
-failed initializing EGL/GPU before geometry appeared. The new candidate explicitly
-requests hosted-runner SwiftShader and records that request; ordinary desktops keep
-their normal GPU path. The expanded native matrix still must run on the new source.
+failed initializing EGL/GPU before geometry appeared. The follow-up `40127666104`
+forced SwiftShader and both architectures failed its Vulkan initialization. The
+repair explicitly selects ANGLE Metal, Chromium 156.0.8078.48's primary/default
+macOS backend, and records the request; ordinary desktops keep their default path.
+Renderer console errors are retained using Electron 45's current event signature
+and stop readiness immediately. Same-source Rebuild is proved by a new certified
+build timestamp, not a source-generation increment. These are source-reviewed
+repairs; successful native Metal execution remains required on the new commit.
 
 The live GitHub environment is `releases`, restricted to tag pattern `v*`; required
 reviewers are not yet configured. Publication refuses to write until approval

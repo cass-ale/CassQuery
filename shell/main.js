@@ -75,17 +75,47 @@ function errorPage() {
   const exit = tried.exit !== null && tried.exit !== undefined
     ? `<p>The worker exited with code ${tried.exit} before answering.</p>` : '';
   const stderr = tried.stderr
-    ? `<p>Last of its stderr:</p><pre style="white-space:pre-wrap">${esc(tried.stderr)}</pre>` : '';
+    ? `<p>Last of its stderr:</p><pre>${esc(tried.stderr)}</pre>` : '';
+  // Same tokens as viewer/index.html, declared here because this page is a
+  // self-contained data URL with no stylesheet of its own.
   const html = `<!doctype html><meta charset="utf-8"><title>CassQuery — worker did not start</title>
-<body style="font-family:system-ui;background:#131315;color:#f0ede6;margin:48px;line-height:1.55">
-<h1 style="font-size:20px">The CassQuery worker did not start</h1>
-<p>Tried Python: <code>${tried.python}</code><br>Worker: <code>${tried.worker}</code></p>
+<style>
+  :root {
+    --bg: #131315; --panel: #1c1c1f; --panel-2: #232327; --ink: #f0ede6;
+    --muted: #a7a49a; --accent: #c9a86a; --line: #2e2e33; --radius: 10px;
+    --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-display: "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--ink); font-family: var(--font-ui);
+    line-height: 1.55; padding: 48px 24px;
+  }
+  main { max-width: 640px; margin: 0 auto; display: flex; flex-direction: column; gap: 12px; }
+  h1 { font-family: var(--font-display); font-weight: 600; font-size: 22px; margin: 0; }
+  p { margin: 0; }
+  ul { margin: 0; padding-left: 20px; }
+  code {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+    padding: 1px 6px; font-size: 13px; overflow-wrap: break-word;
+  }
+  pre {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 12px; font-size: 12px; white-space: pre-wrap; overflow-wrap: break-word; margin: 0;
+  }
+  .muted { color: var(--muted); }
+</style>
+<body><main>
+<h1>The CassQuery worker did not start</h1>
+<p class="muted">Tried Python: <code>${esc(tried.python)}</code><br>Worker: <code>${esc(tried.worker)}</code></p>
 ${exit}${stderr}
 <p>Fix it one of two ways:</p>
 <ul>
 <li>Set <code>CASSQUERY_PYTHON</code> to a Python with CadQuery 2.5+ and websockets installed, then relaunch.</li>
-<li>Start the worker yourself in a terminal — <code>${tried.python} ${tried.worker}</code> — then relaunch.</li>
-</ul></body>`;
+<li>Start the worker yourself in a terminal — <code>${esc(tried.python)} ${esc(tried.worker)}</code> — then relaunch.</li>
+</ul>
+</main></body>`;
   return 'data:text/html;charset=utf-8,' + encodeURIComponent(html);
 }
 

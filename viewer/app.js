@@ -4,6 +4,8 @@ import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 
 const stage = document.getElementById("stage");
 const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.domElement.setAttribute("role", "img");
+renderer.domElement.setAttribute("aria-label", "3D model viewport");
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
@@ -60,10 +62,15 @@ function b64positions(s) {
   for (let i = 0; i < q.length; i++) out[i] = s.qoffset[i % 3] + q[i] * s.qscale;
   return out;
 }
+function fitDist(radius) {
+  // distance that fits the bounding sphere inside the smaller of the
+  // vertical/horizontal fov (portrait stages are width-bound), +2% margin
+  const v = THREE.MathUtils.degToRad(camera.fov / 2);
+  const h = Math.atan(Math.tan(v) * camera.aspect);
+  return radius / Math.sin(Math.min(v, h)) * 1.02;
+}
 function frameCamera(center, radius, dir = new THREE.Vector3(0.95, -1.35, 0.62)) {
-  // distance that fits the bounding sphere inside the vertical fov, +2% margin
-  const fit = radius / Math.sin(THREE.MathUtils.degToRad(camera.fov / 2)) * 1.02;
-  const d = dir.clone().normalize().multiplyScalar(fit);
+  const d = dir.clone().normalize().multiplyScalar(fitDist(radius));
   camera.position.copy(center).add(d);
   controls.target.copy(center);
   camera.near = Math.max(0.1, radius / 50);
@@ -71,20 +78,16 @@ function frameCamera(center, radius, dir = new THREE.Vector3(0.95, -1.35, 0.62))
   camera.updateProjectionMatrix();
   controls.update();
 }
-function tweenCamera(pos, target, dist) {
+function tweenCamera(pos, target) {
   if (reduced) {
     if (pos) camera.position.copy(pos);
     if (target) controls.target.copy(target);
-    if (dist !== undefined) {
-      const dir = camera.position.clone().sub(controls.target).normalize();
-      camera.position.copy(controls.target).add(dir.multiplyScalar(dist));
-    }
     controls.update();
     return;
   }
   camAnim = { p0: camera.position.clone(), t0: controls.target.clone(),
               p1: pos ? pos.clone() : null, t1: target ? target.clone() : null,
-              dist, start: performance.now(), dur: 550 };
+              start: performance.now(), dur: 550 };
 }
 
 // ---------- model ----------
@@ -153,6 +156,10 @@ function activeVariant() {
 }
 async function setVariant(name) {
   if (!model) return;
+  // An uncached variant is a real fetch: say so, so a step click never
+  // looks like a freeze while the view is on its way.
+  const loading = !model.variants.has(name);
+  if (loading) setStale(`loading ${name} view`);
   try {
     const entry = await loadVariant(name);
     if (!entry || !model) return;
@@ -163,6 +170,9 @@ async function setVariant(name) {
   } catch (e) {
     document.getElementById("diag").textContent =
       `Could not load the ${name} view: ${e.message || e}`;
+  } finally {
+    const line = document.getElementById("buildline");
+    if (loading && line.textContent.startsWith("loading")) line.textContent = "";
   }
 }
 function applyExplode(amt, hard = false) {
@@ -202,8 +212,13 @@ function renderSteps() {
     b.addEventListener("click", () => goStep(i, true));
     nav.appendChild(b);
   });
-  document.getElementById("chips").innerHTML =
-    manifest.chips.map((c) => `<li>${c}</li>`).join("");
+  const chips = document.getElementById("chips");
+  chips.innerHTML = "";
+  for (const c of manifest.chips) {
+    const li = document.createElement("li");
+    li.textContent = c;
+    chips.append(li);
+  }
 }
 function goStep(i, animate) {
   if (!manifest || i < 0 || i >= manifest.steps.length) return;
@@ -310,7 +325,7 @@ async function fetchPayload(name, tier, hash) {
     hideStageMsg();
     if (keepDir.lengthSq() > 0) {
       const b = model.bounds;
-      const dist = 2.5 * b.radius;
+      const dist = fitDist(b.radius);
       const dir = keepDir.normalize();
       controls.target.set(...b.center);
       camera.position.copy(controls.target).add(dir.multiplyScalar(dist));
@@ -357,8 +372,17 @@ function hideStageMsg() {
 // ---------- picking ----------
 const ray = new THREE.Raycaster();
 let selected = null;
+let downAt = null;
+// Pick on release, and only when the pointer barely moved: a press that
+// turns into an orbit drag must not also select (or deselect) a part.
 renderer.domElement.addEventListener("pointerdown", (e) => {
-  if (!model) return;
+  downAt = [e.clientX, e.clientY];
+});
+renderer.domElement.addEventListener("pointerup", (e) => {
+  if (!downAt) return;
+  const moved = Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]);
+  downAt = null;
+  if (moved > 6 || !model) return;
   const r = renderer.domElement.getBoundingClientRect();
   const nd = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1,
                                -((e.clientY - r.top) / r.height) * 2 + 1);
@@ -402,10 +426,32 @@ document.getElementById("explode").addEventListener("input", (e) => {
 document.getElementById("xraybtn").addEventListener("click", () => applyXray(!xrayOn));
 document.getElementById("prev").addEventListener("click", () => goStep(currentStep - 1, true));
 document.getElementById("next").addEventListener("click", () => goStep(currentStep + 1, true));
-document.getElementById("buildbtn").addEventListener("click", async () => {
+document.getElementById("buildbtn").addEventListener("click", async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
   setStale("rebuild queued");
-  await fetch("/api/rebuild", { method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ project: current, tier: manifest.on_demand ? "certified" : "both" }) });
+  try {
+    const r = await fetch("/api/rebuild", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project: current, tier: manifest.on_demand ? "certified" : "both" }) });
+    if (!r.ok) throw new Error(`worker returned ${r.status}`);
+  } catch (err) {
+    document.getElementById("diag").textContent =
+      `Could not queue a rebuild: ${err.message || err}`;
+    document.getElementById("buildline").textContent = "";
+  } finally {
+    btn.disabled = false;
+  }
+});
+document.getElementById("resetview").addEventListener("click", () => {
+  if (!model || !model.bounds) return;
+  const b = model.bounds;
+  const center = new THREE.Vector3(...b.center);
+  const pos = center.clone().add(new THREE.Vector3(0.95, -1.35, 0.62)
+    .normalize().multiplyScalar(fitDist(b.radius)));
+  camera.near = Math.max(0.1, b.radius / 50);
+  camera.far = b.radius * 40;
+  camera.updateProjectionMatrix();
+  tweenCamera(pos, center);
 });
 window.addEventListener("keydown", (e) => {
   if (e.target.closest("input, textarea, select, [contenteditable]")) return;
@@ -447,11 +493,16 @@ function connectWS() {
       document.getElementById("diag").textContent = "Build error: " + (m.detail || m.error);
       setStale("build failed");
     } else if (m.type === "manifest" && m.project === current) {
-      manifest = await api(`/api/manifest?project=${current}`);
-      renderSteps();
-      const keep = currentStep;
-      currentStep = -1;
-      goStep(keep < 0 ? 0 : keep, false);
+      try {
+        manifest = await api(`/api/manifest?project=${current}`);
+        renderSteps();
+        const keep = currentStep;
+        currentStep = -1;
+        goStep(keep < 0 ? 0 : keep, false);
+      } catch (e) {
+        document.getElementById("diag").textContent =
+          `Could not reload ${current}: ${e.message || e}`;
+      }
     } else if (m.type === "command" && (!m.project || m.project === current)) {
       if (m.step !== undefined && manifest) {
         const i = manifest.steps.findIndex((s) => s.id === m.step);

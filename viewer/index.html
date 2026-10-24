@@ -104,13 +104,13 @@
   <h1>CassQuery</h1>
   <nav class="projects" id="projects" aria-label="Projects"></nav>
   <div class="state">
-    <span id="buildline"></span>
+    <span id="buildline" aria-live="polite"></span>
     <span class="badge" id="tierbadge">no model</span>
   </div>
 </header>
 <main>
   <div id="stage">
-    <div id="stage-msg" role="status" hidden></div>
+    <div id="stage-msg" role="status"><strong>Loading</strong>Fetching projects from the worker.</div>
     <div id="selection"><span class="name" id="selname"></span>
       <button id="selisolate" type="button">Isolate</button>
       <button id="selhide" type="button">Hide</button>
@@ -129,6 +129,7 @@
       <input type="range" id="explode" min="0" max="100" value="0">
       <button id="xraybtn" type="button" aria-pressed="false">X-ray</button>
       <button id="buildbtn" type="button">Rebuild certified</button>
+      <button id="resetview" type="button">Reset view</button>
       <pre id="diag"></pre>
     </div>
     <ul class="chips" id="chips"></ul>

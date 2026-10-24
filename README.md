@@ -4,6 +4,10 @@ A local desktop viewer for CadQuery projects: edit the source, and the model in 
 
 CassQuery was built for parametric jewelry design, where one project is a chain of interdependent parts and the honest way to check a change is to *look at it*: posed, sectioned, X-rayed, measured. It is a personal tool, built in the open.
 
+![The CassQuery viewer showing the bundled TESTPLATE demo project — a certified build, its authored steps, and the tool panel](docs/viewer.png)
+
+*The viewer running the bundled demo project (`testpart/`): a certified build with its gates passed, the project's authored steps, and the badge that always says which tier — preview or certified — is on screen.*
+
 ## Why it exists
 
 The standard CadQuery viewers get their "live" feel from re-executing your script and re-sending the model. On a real project that re-execution *is* the product's own build chain — session verification, STEP exports, nested runs — and it costs tens of seconds per edit. The viewer isn't slow; the round trip is.
@@ -22,6 +26,15 @@ CassQuery splits the round trip in two:
 - **Finishes per part.** Brushed, polished, per material — assigned in the project manifest, applied in the payload.
 - **An agent protocol on loopback.** The same worker serves a small local API — rebuild, status, gate results as data, body list, set step/camera, screenshot — so an AI assistant can drive the viewer and verify its own work against the gates instead of admiring a render.
 
+## Viewer controls
+
+- **Orbit, pan, zoom** — drag, right-drag, and scroll (or pinch) on the stage. **Reset view** reframes the whole model, on wide and portrait stages alike.
+- **Steps** — the step list, the Previous / Next buttons, or the **←** / **→** arrow keys walk the project's authored steps.
+- **Click a part** to name it, then **Isolate**, **Hide**, or **Show all**. A click that turns into an orbit drag selects nothing.
+- **Explode** — a slider that separates the parts along the project's declared explode vectors.
+- **X-ray** — ghosts the parts the manifest marks as X-ray parts, so internals read through the shell.
+- **Rebuild certified** — queues a full gated build. The badge and build line report progress, failure, and gate results; the tier on screen is never ambiguous.
+
 ## Architecture
 
 ```
@@ -36,6 +49,7 @@ CadQuery project ──► worker.py ──► semantic payload ──► viewer
 - `shell/` — a thin Electron shell that spawns the worker and hosts the viewer. The viewer also runs in any modern browser against the worker directly.
 - `testpart/` — a trivial public demo project (a plate with holes and a boss) with its manifest, used to prove the loop end to end.
 - `payloads/` — generated payloads. The TESTPLATE payloads are committed as a fixture; other projects' payloads are generated locally and are not committed.
+- `docs/` — the screenshot at the top of this README: the viewer running the demo project.
 
 ## Agent protocol
 
@@ -43,6 +57,7 @@ The worker serves a small HTTP API on loopback, plus a websocket on the HTTP por
 
 - `GET /api/projects` — an array of project statuses.
 - `GET /api/status` — `{api_version, projects, load_errors}`: every project's status, plus the projects skipped at startup and why. `GET /api/status?project=NAME` returns that project's status alone.
+- `GET /api/manifest?project=NAME` — the project's `viewer.json` manifest, as the viewer loads it.
 - `GET /api/gates?project=NAME` — the latest certified gate results as data.
 - `GET /api/parts?project=NAME` — per-part volumes, solid counts, centres, and bounding boxes.
 - `POST /api/rebuild` with `{project, tier}` — queue a preview or certified build.
@@ -98,7 +113,7 @@ Then open the viewer at the URL the worker prints. The port is **3939** unless i
 
 ## Status
 
-v1 is built and verified: both tiers live, all eight certified gates exercised (including a deliberate gate-failure run where the last certified model stayed on screen), the save → preview → certified loop proven end to end with render-checked screenshots, and the agent protocol driven headlessly against the running worker. Windows and macOS are the target desktops; it runs unpackaged in dev mode — no installers, signing, or onboarding, by design. The design projects it was built for are private; their models and payloads are not in this repository. The demo project (`testpart/`) and its payloads are the public proof of the loop.
+v1 is built and verified: both tiers live, all eight certified gates exercised (including a deliberate gate-failure run where the last certified model stayed on screen), the save → preview → certified loop proven end to end with render-checked screenshots, and the agent protocol driven headlessly against the running worker. The post-v1 passes are in: the zero-config demo boot, per-project load isolation, and the versioned status API above, plus a viewer polish pass — reset view with aspect-aware framing, click-vs-drag picking, loading and error states that always land somewhere visible, and every failure path in the viewer and the shell exercised live. Windows and macOS are the target desktops; it runs unpackaged in dev mode — no installers, signing, or onboarding, by design. The design projects it was built for are private; their models and payloads are not in this repository. The demo project (`testpart/`) and its payloads are the public proof of the loop.
 
 Working on this repo — human or agent? Read [AGENTS.md](AGENTS.md) first: it carries the depth standard and the verification laws this codebase is held to.
 

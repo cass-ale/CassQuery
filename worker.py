@@ -672,7 +672,10 @@ class Handler(BaseHTTPRequestHandler):
             if name:
                 p = self._project(name)
                 return p and self._send(200, p.status())
-            return self._send(200, {"projects": [p.status() for p in PROJECTS.values()],
+            # api_version marks this shape: v1 returned a bare list here;
+            # the object (with load_errors) is version 2.
+            return self._send(200, {"api_version": 2,
+                                    "projects": [p.status() for p in PROJECTS.values()],
                                     "load_errors": LOAD_ERRORS})
         if u.path == "/api/manifest":
             p = self._project((q.get("project") or [""])[0])
@@ -798,6 +801,14 @@ def main(argv=None):
         except Exception as e:
             # One bad project must not take the whole worker down.
             reason = f"{type(e).__name__}: {e}"
+            LOAD_ERRORS.append({"path": r, "error": reason})
+            print(f"CassQuery: skipping project {r}: {reason}", flush=True)
+            continue
+        if p.name in PROJECTS:
+            # A second project with the same name must not silently
+            # replace the first in PROJECTS.
+            reason = (f"duplicate project name '{p.name}': {r} skipped; "
+                      f"already serving {PROJECTS[p.name].root}")
             LOAD_ERRORS.append({"path": r, "error": reason})
             print(f"CassQuery: skipping project {r}: {reason}", flush=True)
             continue

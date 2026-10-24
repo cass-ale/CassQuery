@@ -153,12 +153,17 @@ function activeVariant() {
 }
 async function setVariant(name) {
   if (!model) return;
-  const entry = await loadVariant(name);
-  if (!entry || !model) return;
-  model.activeName = name;
-  for (const [n, v] of model.variants) v.group.visible = n === name;
-  applyExplode(explodeAmt, true);
-  applyXray(xrayOn);
+  try {
+    const entry = await loadVariant(name);
+    if (!entry || !model) return;
+    model.activeName = name;
+    for (const [n, v] of model.variants) v.group.visible = n === name;
+    applyExplode(explodeAmt, true);
+    applyXray(xrayOn);
+  } catch (e) {
+    document.getElementById("diag").textContent =
+      `Could not load the ${name} view: ${e.message || e}`;
+  }
 }
 function applyExplode(amt, hard = false) {
   explodeAmt = amt;
@@ -238,6 +243,9 @@ function goStep(i, animate) {
                                    b.max[1] - b.min[1] + hi[1] - lo[1],
                                    b.max[2] - b.min[2] + hi[2] - lo[2]);
     frameCamera(center, size.length() / 2);
+  }).catch((e) => {
+    document.getElementById("diag").textContent =
+      `Could not show this step: ${e.message || e}`;
   });
   explodeTarget = s.explode || 0;
   if (reduced) applyExplode(explodeTarget, true);
@@ -254,66 +262,74 @@ async function loadProject(name) {
       `Could not load ${name}: ${e.message || e}`;
     return;
   }
-  hideStageMsg();
-  document.querySelectorAll("#projects button").forEach((b) =>
-    b.setAttribute("aria-pressed", String(b.dataset.name === name)));
-  renderSteps();
-  const st = projects.find((p) => p.name === name) || {};
-  const tier = st.hashes && st.hashes.certified ? "certified" : "preview";
-  if (st.hashes && st.hashes[tier]) {
-    try {
+  try {
+    hideStageMsg();
+    document.querySelectorAll("#projects button").forEach((b) =>
+      b.setAttribute("aria-pressed", String(b.dataset.name === name)));
+    renderSteps();
+    const st = projects.find((p) => p.name === name) || {};
+    const tier = st.hashes && st.hashes.certified ? "certified" : "preview";
+    if (st.hashes && st.hashes[tier]) {
       await fetchPayload(name, tier, st.hashes[tier]);
-    } catch (e) {
-      document.getElementById("diag").textContent =
-        `Could not load the ${tier} model for ${name}: ${e.message || e}`;
-    }
-    if (st.state && st.state.startsWith("building")) setStale(st.state.replace("-", " "));
-  } else {
-    disposeModel();
-    // Reflect the project's real state instead of a bare "no model" while
-    // the first build is already running.
-    if (st.state && st.state.startsWith("building")) {
-      setBadge(null, "building…");
-      setStale(st.state.replace("-", " "));
-    } else if (st.state === "error") {
-      setBadge(null, "build failed");
-      const err = (st.history || []).filter((h) => h.event === "error").pop();
-      if (err) document.getElementById("diag").textContent = "Build error: " + err.detail;
+      if (st.state && st.state.startsWith("building")) setStale(st.state.replace("-", " "));
     } else {
-      setBadge(null, "no model yet");
+      disposeModel();
+      // Reflect the project's real state instead of a bare "no model" while
+      // the first build is already running.
+      if (st.state && st.state.startsWith("building")) {
+        setBadge(null, "building…");
+        setStale(st.state.replace("-", " "));
+      } else if (st.state === "error") {
+        setBadge(null, "build failed");
+        const err = (st.history || []).filter((h) => h.event === "error").pop();
+        if (err) document.getElementById("diag").textContent = "Build error: " + err.detail;
+      } else {
+        setBadge(null, "no model yet");
+      }
+      document.getElementById("caption").textContent =
+        "No build yet. Use Rebuild certified to build this project.";
     }
-    document.getElementById("caption").textContent =
-      "No build yet. Use Rebuild certified to build this project.";
+  } catch (e) {
+    document.getElementById("diag").textContent =
+      `Could not load ${name}: ${e.message || e}`;
+    return;
   }
   goStep(0, false);
 }
 
 async function fetchPayload(name, tier, hash) {
   if (shownHashes[name] && shownHashes[name][tier] === hash && model && model.tier === tier) return;
-  const payload = await api(`/payload/${name}-${tier}.json`);
-  if (payload.hash !== hash) return; // stale fetch
-  shownHashes[name] = { ...(shownHashes[name] || {}), [tier]: hash };
-  const keepDir = camera.position.clone().sub(controls.target);
-  await buildModel(payload);
-  hideStageMsg();
-  if (keepDir.lengthSq() > 0) {
-    const b = model.bounds;
-    const dist = 2.5 * b.radius;
-    const dir = keepDir.normalize();
-    controls.target.set(...b.center);
-    camera.position.copy(controls.target).add(dir.multiplyScalar(dist));
-    camera.near = Math.max(0.1, b.radius / 50);
-    camera.far = b.radius * 40;
-    camera.updateProjectionMatrix();
-    controls.update();
-  }
-  setBadge(tier, tier === "certified"
-    ? `certified · gates ${payload.gates && payload.gates.pass ? "passed" : "FAILED"} · ${hash.slice(0, 8)}`
-    : `preview · not gate-checked · ${hash.slice(0, 8)}`);
-  if (currentStep >= 0) {
-    const keep = currentStep;
-    currentStep = -1;
-    goStep(keep, false);
+  // Never rejects: a malformed payload (not just a failed fetch) lands on
+  // the diag line, never as an unhandled rejection with a half-set stage.
+  try {
+    const payload = await api(`/payload/${name}-${tier}.json`);
+    if (payload.hash !== hash) return; // stale fetch
+    shownHashes[name] = { ...(shownHashes[name] || {}), [tier]: hash };
+    const keepDir = camera.position.clone().sub(controls.target);
+    await buildModel(payload);
+    hideStageMsg();
+    if (keepDir.lengthSq() > 0) {
+      const b = model.bounds;
+      const dist = 2.5 * b.radius;
+      const dir = keepDir.normalize();
+      controls.target.set(...b.center);
+      camera.position.copy(controls.target).add(dir.multiplyScalar(dist));
+      camera.near = Math.max(0.1, b.radius / 50);
+      camera.far = b.radius * 40;
+      camera.updateProjectionMatrix();
+      controls.update();
+    }
+    setBadge(tier, tier === "certified"
+      ? `certified · gates ${payload.gates && payload.gates.pass ? "passed" : "FAILED"} · ${hash.slice(0, 8)}`
+      : `preview · not gate-checked · ${hash.slice(0, 8)}`);
+    if (currentStep >= 0) {
+      const keep = currentStep;
+      currentStep = -1;
+      goStep(keep, false);
+    }
+  } catch (e) {
+    document.getElementById("diag").textContent =
+      `Could not load the ${tier} model for ${name}: ${e.message || e}`;
   }
 }
 

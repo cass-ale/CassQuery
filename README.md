@@ -37,6 +37,20 @@ CadQuery project ──► worker.py ──► semantic payload ──► viewer
 - `testpart/` — a trivial public demo project (a plate with holes and a boss) with its manifest, used to prove the loop end to end.
 - `payloads/` — generated payloads. The TESTPLATE payloads are committed as a fixture; other projects' payloads are generated locally and are not committed.
 
+## Agent protocol
+
+The worker serves a small HTTP API on loopback, plus a websocket on the HTTP port + 1000 that announces new payloads and state changes:
+
+- `GET /api/projects` — an array of project statuses.
+- `GET /api/status` — `{api_version, projects, load_errors}`: every project's status, plus the projects skipped at startup and why. `GET /api/status?project=NAME` returns that project's status alone.
+- `GET /api/gates?project=NAME` — the latest certified gate results as data.
+- `GET /api/parts?project=NAME` — per-part volumes, solid counts, centres, and bounding boxes.
+- `POST /api/rebuild` with `{project, tier}` — queue a preview or certified build.
+- `POST /api/view` — drive the open viewer: step, camera, variant, explode, X-ray.
+- `POST /api/screenshot` — ask the open viewer for a PNG of the stage.
+
+**Status shape change:** in v1, `GET /api/status` with no `project` returned a bare array of project statuses. It now returns the object above, so `load_errors` travels with the statuses. The `api_version` field (currently `2`) marks the shape — check it rather than guessing from the payload.
+
 ## Projects
 
 A project is any directory with:

@@ -12,7 +12,7 @@ const HOME = os.homedir();
 const REPO = path.join(__dirname, '..');
 const WORKER = path.join(REPO, 'worker.py');
 let worker = null;
-let tried = { python: null, worker: WORKER };
+let tried = { python: null, worker: WORKER, exit: null, stderr: '' };
 
 function findPython() {
   if (process.env.CASSQUERY_PYTHON) return process.env.CASSQUERY_PYTHON;
@@ -46,25 +46,41 @@ function checkStatus(port, timeoutMs = 1500) {
 async function ensureWorker(port) {
   if (await checkStatus(port)) return true;
   const python = findPython();
-  tried = { python, worker: WORKER };
+  tried = { python, worker: WORKER, exit: null, stderr: '' };
   const env = { ...process.env };
   if (!env.CASSQUERY_PROJECTS) env.CASSQUERY_PROJECTS = path.join(REPO, 'testpart');
   let spawnFailed = false;
-  worker = spawn(python, [WORKER], { env, detached: false, stdio: 'inherit' });
+  worker = spawn(python, [WORKER], { env, detached: false, stdio: ['ignore', 'pipe', 'pipe'] });
+  worker.stdout.on('data', (d) => process.stdout.write(d));
+  worker.stderr.on('data', (d) => {
+    process.stderr.write(d);
+    tried.stderr = (tried.stderr + d).slice(-2000);
+  });
   worker.on('error', () => { spawnFailed = true; worker = null; });
+  // A worker that exits at once (e.g. the dependency preflight) must not
+  // leave the shell waiting out the full deadline for a port that will
+  // never answer.
+  worker.on('exit', (code) => { tried.exit = code; });
   const deadline = Date.now() + 30000;
-  while (Date.now() < deadline && !spawnFailed) {
+  while (Date.now() < deadline && !spawnFailed && tried.exit === null) {
     if (await checkStatus(port)) return true;
     await new Promise((r) => setTimeout(r, 500));
   }
+  if (spawnFailed || tried.exit !== null) return false;
   return checkStatus(port);
 }
 
 function errorPage() {
+  const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const exit = tried.exit !== null && tried.exit !== undefined
+    ? `<p>The worker exited with code ${tried.exit} before answering.</p>` : '';
+  const stderr = tried.stderr
+    ? `<p>Last of its stderr:</p><pre style="white-space:pre-wrap">${esc(tried.stderr)}</pre>` : '';
   const html = `<!doctype html><meta charset="utf-8"><title>CassQuery — worker did not start</title>
 <body style="font-family:system-ui;background:#131315;color:#f0ede6;margin:48px;line-height:1.55">
 <h1 style="font-size:20px">The CassQuery worker did not start</h1>
 <p>Tried Python: <code>${tried.python}</code><br>Worker: <code>${tried.worker}</code></p>
+${exit}${stderr}
 <p>Fix it one of two ways:</p>
 <ul>
 <li>Set <code>CASSQUERY_PYTHON</code> to a Python with CadQuery 2.5+ and websockets installed, then relaunch.</li>

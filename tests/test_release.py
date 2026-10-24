@@ -18,7 +18,7 @@ class ReleaseContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for filename in ('package.json', 'package-lock.json',
-                             'packaging/electron-builder.json',
+                             'packaging/electron-builder.json', 'packaging/python-runtime.json',
                              '.github/workflows/macos-candidate.yml',
                              'viewer/vendor/three.core.js', 'assets/icons/cassquery.icns'):
                 target = root / filename
@@ -48,6 +48,55 @@ class ReleaseContractTests(unittest.TestCase):
 
     def test_pr_signing_cannot_be_silently_skipped(self):
         self.mutation("CSC_FOR_PULL_REQUEST: 'true'", "CSC_FOR_PULL_REQUEST: 'false'")
+
+    def test_unavailable_python_pin_is_rejected(self):
+        self.mutation("python-version: '3.12.10'", "python-version: '3.12.13'")
+
+    def test_native_python_provider_requires_both_architectures(self):
+        import json
+        manifest = json.loads((ROOT / 'packaging/python-runtime.json').read_text())
+        module.check_python_runtime('3.12.10', {'arm64', 'x64'}, manifest)
+        manifest[0]['files'] = [file for file in manifest[0]['files'] if file['arch'] == 'arm64']
+        with self.assertRaisesRegex(AssertionError, 'macOS x64'):
+            module.check_python_runtime('3.12.10', {'arm64', 'x64'}, manifest)
+
+    def test_floating_python_pin_is_rejected(self):
+        self.mutation("python-version: '3.12.10'", "python-version: '3.12'")
+
+    def test_python_setup_cannot_be_skipped(self):
+        self.mutation('      - uses: actions/setup-python@',
+                      '      - if: false\n        uses: actions/setup-python@')
+
+    def test_python_setup_failure_cannot_be_ignored(self):
+        self.mutation('      - uses: actions/setup-python@',
+                      '      - continue-on-error: true\n        uses: actions/setup-python@')
+
+    def test_wrong_python_architecture_is_rejected(self):
+        self.mutation("          python-version: '3.12.10'",
+                      "          architecture: x64\n          python-version: '3.12.10'")
+
+    def test_noop_runner_context_is_rejected(self):
+        source = (ROOT / '.github/workflows/macos-candidate.yml').read_text()
+        start = source.index('        run: |', source.index('name: Record runner context'))
+        end = source.index('      - uses: actions/setup-node@', start)
+        self.mutation(source[start:end], '        run: |\n          : # evidence/runner-context.txt\n')
+
+    def test_context_must_precede_node_setup(self):
+        source = (ROOT / '.github/workflows/macos-candidate.yml').read_text()
+        start = source.index('      - name: Record runner context')
+        end = source.index('      - uses: actions/setup-node@', start)
+        node_end = source.index('      - uses: actions/setup-python@', end)
+        self.mutation(source[start:node_end], source[end:node_end] + source[start:end])
+
+    def test_early_diagnostics_cannot_be_removed(self):
+        self.mutation('name: Record runner context', 'name: Optional diagnostics')
+
+    def test_early_diagnostics_cannot_be_skipped(self):
+        self.mutation('      - name: Record runner context\n',
+                      '      - name: Record runner context\n        if: false\n')
+
+    def test_failed_setup_cannot_skip_diagnostic_upload(self):
+        self.mutation('        if: always()', '        if: success()')
 
     def test_missing_freeze_is_not_green(self):
         self.mutation('name: Native worker freeze', 'name: optional freeze')

@@ -1,0 +1,20 @@
+[
+  {
+    "version": "3.12.10",
+    "stable": true,
+    "files": [
+      {
+        "filename": "python-3.12.10-darwin-arm64.tar.gz",
+        "arch": "arm64",
+        "platform": "darwin",
+        "download_url": "https://github.com/actions/python-versions/releases/download/3.12.10-14343898437/python-3.12.10-darwin-arm64.tar.gz"
+      },
+      {
+        "filename": "python-3.12.10-darwin-x64.tar.gz",
+        "arch": "x64",
+        "platform": "darwin",
+        "download_url": "https://github.com/actions/python-versions/releases/download/3.12.10-14343898437/python-3.12.10-darwin-x64.tar.gz"
+      }
+    ]
+  }
+]

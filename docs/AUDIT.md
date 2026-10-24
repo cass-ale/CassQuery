@@ -57,9 +57,13 @@ outreach are authorized by that source push.
   fixture renders are NOT substituted as proof of native packaged launch.
 - **Final DMG create/mount/copy:** local `hdiutil create` returns `Operation not
   permitted`. The final-package smoke is authored but not executed here.
-- **Intel runtime and GitHub Actions:** dependencies resolve as native Intel wheels,
-  but the Intel app/CI jobs were not run at the initial review. The authorized source
-  push triggers the candidate workflow; its actual result must be checked separately.
+- **Intel runtime and GitHub Actions:** the initial candidate run
+  [40119847501](https://github.com/cass-ale/CassQuery/actions/runs/40119847501)
+  failed on both architectures before dependencies or app tests ran: setup-python
+  has no macOS 3.12.13 binary. The repaired workflow pins the provider's stable
+  3.12.10 native release, checks availability for both architectures, and records
+  nonempty runner diagnostics before setup. A passing replacement CI run remains
+  required; verified wheel availability is not an Intel runtime result.
 - **Developer ID, notarization, Gatekeeper, clean quarantined Finder launch and
   minimum macOS device:** not verified. Ad-hoc seal integrity does not prove these.
 - **Hallmark lint:** required tool could not be found; not replaced with a different

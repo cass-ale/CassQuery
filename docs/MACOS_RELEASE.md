@@ -7,8 +7,29 @@ universal bundle. The target is not evidence of a clean-machine or minimum-OS te
 
 ## Build and check
 
-Use Node 22.23.4 and a standalone CPython 3.12.13 (with a discoverable shared
-library), then from this repository:
+Use Node 22.23.4 and a standalone CPython 3.12 (with a discoverable shared
+library), then from this repository. CI pins **3.12.10**, the stable
+`actions/setup-python` release verified to have native macOS ARM64 and x64 binaries;
+the initial local build used standalone 3.12.13 from a different provider. Keeping
+the same Python minor preserves the locked cp312 wheel ABI.
+
+Before changing the CI Python pin, check the live provider catalog, not whether
+the version exists for Linux or another installer:
+
+```sh
+curl --fail --location --max-time 60 https://raw.githubusercontent.com/actions/python-versions/main/versions-manifest.json -o /tmp/python-versions.json
+python tools/check_release.py --python-manifest /tmp/python-versions.json
+```
+
+`packaging/python-runtime.json` is the reviewed native subset of that catalog,
+verified on October 24, 2026 (full catalog SHA-256
+`cd09353c884196ca2d33f2273cce58a2950e39f558890e82ab19f1c5ebeb2072`);
+both listed release archives returned HTTP 200. The snapshot records availability,
+not archive content hashes. Update it only after verifying the chosen exact
+release and both download assets.
+Ordinary offline preflight validates against the checked-in subset.
+
+From the repository:
 
 ```sh
 python3 -m venv .venv

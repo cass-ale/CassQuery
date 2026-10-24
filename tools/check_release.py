@@ -14,7 +14,22 @@ ACTION_PINS = {
 }
 
 
-def check(root=ROOT):
+def check_python_runtime(version, arches, manifest):
+    """Reject a provider pin without a native download for every advertised arch."""
+    assert re.fullmatch(r"3\.12\.\d+", version), "review Python ABI changes with the native dependency graph"
+    release = next((entry for entry in manifest if entry.get("version") == version), None)
+    assert release and release.get("stable") is True, f"Python {version} has no reviewed stable provider release"
+    files = release.get("files", [])
+    for arch in arches:
+        expected = f"python-{version}-darwin-{arch}.tar.gz"
+        assert any(file.get("platform") == "darwin" and file.get("arch") == arch
+                   and file.get("filename") == expected
+                   and file.get("download_url", "").startswith("https://github.com/actions/python-versions/releases/download/")
+                   and file["download_url"].endswith("/" + expected)
+                   for file in files), f"Python {version} has no macOS {arch} provider binary"
+
+
+def check(root=ROOT, python_manifest=None):
     package = json.loads((root / "package.json").read_text())
     lock = json.loads((root / "package-lock.json").read_text())
     assert re.fullmatch(r"\d+\.\d+\.\d+", package["version"]), "invalid release version"
@@ -46,7 +61,28 @@ def check(root=ROOT):
         'Package checked app', 'Verify and launch the final DMG', 'Candidate identity and hashes',
     ]
     steps = job['steps']
+    python_steps = [step for step in steps if step.get('uses', '').startswith('actions/setup-python@')]
+    assert len(python_steps) == 1, 'exactly one native Python setup is required'
+    python_step = python_steps[0]
+    assert 'if' not in python_step and not python_step.get('continue-on-error', False), 'Python setup cannot be bypassed'
+    assert python_step['with'].get('architecture', '${{ matrix.arch }}') == '${{ matrix.arch }}', 'Python architecture must match the native matrix'
+    if python_manifest is None:
+        python_manifest = json.loads((root / 'packaging/python-runtime.json').read_text())
+    check_python_runtime(python_step['with']['python-version'], {entry['arch'] for entry in entries}, python_manifest)
     names = [step.get('name') for step in steps]
+    assert names.count('Record runner context') == 1, 'early failure diagnostics are required'
+    context = steps[names.index('Record runner context')]
+    assert 'if' not in context and not context.get('continue-on-error', False), 'runner context cannot be skipped'
+    context_script = '''mkdir -p evidence
+printf 'commit=%s\\nrunner=%s\\narch=%s\\nrun=%s\\n' "$GITHUB_SHA" '${{ matrix.runner }}' '${{ matrix.arch }}' "$GITHUB_RUN_ID" > evidence/runner-context.txt
+sw_vers >> evidence/runner-context.txt
+uname -m >> evidence/runner-context.txt'''
+    assert context.get('run', '').strip() == context_script, 'runner diagnostics must execute the reviewed output-producing commands'
+    setups = [step for step in steps if step.get('uses', '').startswith(('actions/setup-python@', 'actions/setup-node@'))]
+    assert len(setups) == 2 and all(names.index('Record runner context') < steps.index(step) for step in setups), 'diagnostics must precede both tool setup actions'
+    uploads = [step for step in steps if step.get('uses', '').startswith('actions/upload-artifact@')]
+    assert len(uploads) == 1 and uploads[0].get('if') == 'always()', 'diagnostics must survive failed setup'
+    assert 'evidence/' in uploads[0]['with']['path'] and uploads[0]['with']['if-no-files-found'] == 'error'
     positions = []
     for name in required:
         assert names.count(name) == 1, f'missing/duplicate gate: {name}'
@@ -68,13 +104,20 @@ def check(root=ROOT):
     assert re.search(r"REVISION\s*=\s*['\"]186['\"]", core), "vendored renderer revision changed"
     return {"pass": True, "version": package["version"], "checks": [
         "version/lock parity", "exact build tools", "reviewed action pins",
-        "two native macOS architectures", "frozen worker and real renderer smoke gates",
+        "two native macOS architectures", "native Python provider availability",
+        "early failure diagnostics", "frozen worker and real renderer smoke gates",
         "no publish permission", "bundle allowlist", "vendored renderer revision"]}
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--python-manifest', type=Path,
+                        help='fresh actions/python-versions manifest; default is the reviewed native snapshot')
+    args = parser.parse_args()
     try:
-        print(json.dumps(check(), indent=2))
+        manifest = json.loads(args.python_manifest.read_text()) if args.python_manifest else None
+        print(json.dumps(check(python_manifest=manifest), indent=2))
     except (AssertionError, KeyError, ValueError, OSError) as error:
         print(f"Release preflight failed: {error}", file=sys.stderr)
         raise SystemExit(1)

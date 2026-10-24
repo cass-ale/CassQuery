@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="CassQuery: a local viewer for live CadQuery builds, with authored steps and gate-checked certified models.">
+<title>CassQuery</title>
+<style>
+  /* Hallmark · shape: app screen · genre: atmospheric · theme: studio dark
+   * posture: restrained · tokens at :root · focus-visible everywhere interactive */
+  :root {
+    --bg: #131315;
+    --panel: #1c1c1f;
+    --panel-2: #232327;
+    --ink: #f0ede6;
+    --muted: #a7a49a;
+    --accent: #c9a86a;
+    --on-accent: #17130a;
+    --line: #2e2e33;
+    --bad: #e07a5f;
+    --ok: #9db98a;
+    --radius: 10px;
+    --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-display: "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; overflow-x: clip; }
+  body {
+    background: var(--bg); color: var(--ink); font-family: var(--font-ui);
+    display: flex; flex-direction: column; height: 100vh; overflow: clip;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 16px 20px 12px; border-bottom: 1px solid var(--line);
+  }
+  h1 { font-family: var(--font-display); font-weight: 600; font-size: 22px; margin: 0; text-wrap: balance; }
+  .projects { display: flex; gap: 8px; flex-wrap: wrap; }
+  button {
+    font: inherit; font-size: 13px; color: var(--ink); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 999px; padding: 8px 16px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:active { transform: translateY(1px); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+  button:disabled { background: var(--panel); color: var(--muted); border-color: var(--line); cursor: not-allowed; }
+  .state { margin-left: auto; display: flex; align-items: center; gap: 12px; font-size: 13px; color: var(--muted); }
+  .badge {
+    border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px;
+    font-size: 12px; letter-spacing: 0.02em; color: var(--ink); background: var(--panel);
+  }
+  .badge.preview { border-color: var(--accent); color: var(--accent); }
+  .badge.bad { border-color: var(--bad); color: var(--bad); }
+  .badge.ok { border-color: var(--ok); color: var(--ok); }
+  main { flex: 1; display: flex; min-height: 0; }
+  #stage { position: relative; flex: 1; min-width: 0; background: var(--panel); }
+  #stage canvas { display: block; }
+  #selection {
+    position: absolute; left: 14px; bottom: 12px; display: none; align-items: center; gap: 8px;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius);
+    padding: 8px; font-size: 13px;
+  }
+  #selection .name { font-weight: 600; }
+  #selection button { padding: 4px 12px; font-size: 12px; }
+  aside {
+    width: 264px; flex: none; border-left: 1px solid var(--line);
+    padding: 16px; display: flex; flex-direction: column; gap: 12px; overflow-y: auto;
+  }
+  .caption { font-size: 15px; line-height: 1.45; margin: 0; min-height: 2.9em; }
+  .steps { display: flex; flex-direction: column; gap: 8px; }
+  .steps button { text-align: left; border-radius: var(--radius); padding: 8px 12px; }
+  .navrow { display: flex; gap: 8px; }
+  .navrow button { flex: 1; border-radius: var(--radius); }
+  .tools { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--line); padding-top: 12px; }
+  .tools label { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
+  input[type="range"] { width: 100%; accent-color: var(--accent); }
+  input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; margin: 0; padding: 12px 0 0; border-top: 1px solid var(--line); }
+  .chips li { font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; }
+  #diag { font-size: 12px; color: var(--bad); white-space: pre-wrap; margin: 0; }
+  .spin { display: inline-block; width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--line); border-top-color: var(--accent); animation: rot 0.9s linear infinite; }
+  @keyframes rot { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>CassQuery</h1>
+  <nav class="projects" id="projects" aria-label="Projects"></nav>
+  <div class="state">
+    <span id="buildline"></span>
+    <span class="badge" id="tierbadge">no model</span>
+  </div>
+</header>
+<main>
+  <div id="stage">
+    <div id="selection"><span class="name" id="selname"></span>
+      <button id="selisolate" type="button">Isolate</button>
+      <button id="selhide" type="button">Hide</button>
+      <button id="selshow" type="button">Show all</button>
+    </div>
+  </div>
+  <aside>
+    <p class="caption" id="caption"></p>
+    <nav class="steps" id="steps" aria-label="Steps"></nav>
+    <div class="navrow">
+      <button id="prev" type="button">Previous</button>
+      <button id="next" type="button">Next</button>
+    </div>
+    <div class="tools">
+      <label for="explode">Explode <span id="explodeval">0%</span></label>
+      <input type="range" id="explode" min="0" max="100" value="0">
+      <button id="xraybtn" type="button" aria-pressed="false">X-ray</button>
+      <button id="buildbtn" type="button">Rebuild certified</button>
+      <pre id="diag"></pre>
+    </div>
+    <ul class="chips" id="chips"></ul>
+  </aside>
+</main>
+<script type="importmap">
+{ "imports": {
+  "three": "./vendor/three.module.js",
+  "three/addons/": "./vendor/addons/"
+} }
+</script>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

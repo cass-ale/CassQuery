@@ -1,73 +1,43 @@
-const { app, BrowserWindow } = require('electron');
-// software GL where no GPU exists (headless VMs); harmless on real hardware
-app.commandLine.appendSwitch('use-angle', 'swiftshader');
-app.commandLine.appendSwitch('enable-unsafe-swiftshader');
+const { app, BrowserWindow, Menu } = require('electron');
+// Software rendering is opt-in for headless tests, never forced on a real Mac.
+if (process.env.CASSQUERY_SOFTWARE_GL === '1') {
+  app.commandLine.appendSwitch('use-angle', 'swiftshader');
+  app.commandLine.appendSwitch('enable-unsafe-swiftshader');
+}
 const fs = require('fs');
-const http = require('http');
-const os = require('os');
 const path = require('path');
-const { spawn } = require('child_process');
+const { startingPort, workerCommand, startWorker, stopWorker } = require('./runtime.cjs');
 
-const HOME = os.homedir();
 const REPO = path.join(__dirname, '..');
-const WORKER = path.join(REPO, 'worker.py');
 let worker = null;
-let tried = { python: null, worker: WORKER, exit: null, stderr: '' };
+let window = null;
+let workerPort = null;
+let tried = { python: null, worker: null, exit: null, stderr: '' };
+let opening = null;
+let quitting = false;
+let shutdownComplete = false;
+const startup = new AbortController();
 
-function findPython() {
-  if (process.env.CASSQUERY_PYTHON) return process.env.CASSQUERY_PYTHON;
-  const venv = process.platform === 'win32'
-    ? path.join(REPO, '.venv', 'Scripts', 'python.exe')
-    : path.join(REPO, '.venv', 'bin', 'python');
-  if (fs.existsSync(venv)) return venv;
-  return process.platform === 'win32' ? 'python' : 'python3';
-}
-
-function getPort() {
-  if (process.env.CASSQUERY_PORT) return parseInt(process.env.CASSQUERY_PORT, 10);
-  try {
-    const reg = JSON.parse(fs.readFileSync(path.join(HOME, '.cassquery.json'), 'utf8'));
-    if (reg.port) return parseInt(reg.port, 10);
-  } catch {}
-  return 3939;
-}
-
-function checkStatus(port, timeoutMs = 1500) {
-  return new Promise((resolve) => {
-    const req = http.get(`http://127.0.0.1:${port}/api/status`, (res) => {
-      res.resume();
-      resolve(res.statusCode === 200);
-    });
-    req.setTimeout(timeoutMs, () => { req.destroy(); resolve(false); });
-    req.on('error', () => resolve(false));
-  });
-}
-
-async function ensureWorker(port) {
-  if (await checkStatus(port)) return true;
-  const python = findPython();
-  tried = { python, worker: WORKER, exit: null, stderr: '' };
-  const env = { ...process.env };
-  if (!env.CASSQUERY_PROJECTS) env.CASSQUERY_PROJECTS = path.join(REPO, 'testpart');
-  let spawnFailed = false;
-  worker = spawn(python, [WORKER], { env, detached: false, stdio: ['ignore', 'pipe', 'pipe'] });
-  worker.stdout.on('data', (d) => process.stdout.write(d));
-  worker.stderr.on('data', (d) => {
-    process.stderr.write(d);
-    tried.stderr = (tried.stderr + d).slice(-2000);
-  });
-  worker.on('error', () => { spawnFailed = true; worker = null; });
-  // A worker that exits at once (e.g. the dependency preflight) must not
-  // leave the shell waiting out the full deadline for a port that will
-  // never answer.
-  worker.on('exit', (code) => { tried.exit = code; });
-  const deadline = Date.now() + 30000;
-  while (Date.now() < deadline && !spawnFailed && tried.exit === null) {
-    if (await checkStatus(port)) return true;
-    await new Promise((r) => setTimeout(r, 500));
+async function ensureWorker() {
+  const port = startingPort(process.env.CASSQUERY_PORT);
+  const command = workerCommand({ packaged: app.isPackaged, resources: process.resourcesPath,
+    repo: REPO, platform: process.platform, env: process.env });
+  const result = await startWorker({ command, port,
+    dataDir: process.env.CASSQUERY_DATA_DIR || path.join(app.getPath('userData'), 'worker'),
+    signal: startup.signal });
+  if (quitting) {
+    await stopWorker(result.child);
+    return false;
   }
-  if (spawnFailed || tried.exit !== null) return false;
-  return checkStatus(port);
+  worker = result.child;
+  workerPort = result.port;
+  tried = result.diagnostic;
+  if (worker) worker.on('exit', () => {
+    worker = null;
+    workerPort = null;
+    if (!quitting && window && !window.isDestroyed()) window.loadURL(errorPage()).catch(console.error);
+  });
+  return workerPort !== null;
 }
 
 function errorPage() {
@@ -107,22 +77,56 @@ function errorPage() {
   .muted { color: var(--muted); }
 </style>
 <body><main>
-<h1>The CassQuery worker did not start</h1>
+  <h1>The CassQuery worker did not start</h1>
 <p class="muted">Tried Python: <code>${esc(tried.python)}</code><br>Worker: <code>${esc(tried.worker)}</code></p>
 ${exit}${stderr}
 <p>Fix it one of two ways:</p>
 <ul>
-<li>Set <code>CASSQUERY_PYTHON</code> to a Python with CadQuery 2.5+ and websockets installed, then relaunch.</li>
-<li>Start the worker yourself in a terminal — <code>${esc(tried.python)} ${esc(tried.worker)}</code> — then relaunch.</li>
+<li>Set <code>CASSQUERY_PYTHON</code> to a Python with CadQuery 2.5+ and websockets 13+ installed, then relaunch.</li>
+<li>Check that the packaged app is complete, or run <code>npm run app</code> from a development checkout with its virtualenv.</li>
 </ul>
 </main></body>`;
   return 'data:text/html;charset=utf-8,' + encodeURIComponent(html);
 }
 
-app.whenReady().then(async () => {
-  const port = getPort();
-  const up = await ensureWorker(port);
-  const win = new BrowserWindow({ width: 1320, height: 880 });
+function openWindow() {
+  if (opening) return opening;
+  opening = createWindow().finally(() => { opening = null; });
+  return opening;
+}
+
+async function createWindow() {
+  if (window && !window.isDestroyed()) { window.show(); return; }
+  if (quitting) return;
+  const up = workerPort !== null || await ensureWorker();
+  if (quitting) return;
+  const win = new BrowserWindow({ width: 1320, height: 880, title: 'CassQuery',
+    webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true } });
+  window = win;
+  win.on('closed', () => { window = null; });
+  const origin = `http://127.0.0.1:${workerPort}`;
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  win.webContents.on('will-navigate', (event, url) => {
+    if (!url.startsWith(`${origin}/`)) event.preventDefault();
+  });
+  win.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  if (process.env.CASSQUERY_SMOKE_DIR) {
+    win.webContents.once('did-finish-load', async () => {
+      const output = process.env.CASSQUERY_SMOKE_DIR;
+      let report;
+      try { report = await require('./smoke.cjs').smoke(win, output); }
+      catch (error) { report = { pass: false, error: error.stack || String(error) }; }
+      fs.mkdirSync(output, { recursive: true });
+      report.worker_pid = worker?.pid;
+      report.app_pid = process.pid;
+      report.challenge = process.env.CASSQUERY_SMOKE_CHALLENGE;
+      fs.writeFileSync(path.join(output, 'renderer.json'), JSON.stringify(report, null, 2));
+      quitting = true;
+      startup.abort();
+      await stopWorker(worker);
+      app.exit(report.pass ? 0 : 1);
+    });
+  }
   const shot = process.env.CASSQUERY_SHOT;
   if (shot) {
     let scheduled = false;
@@ -144,9 +148,39 @@ app.whenReady().then(async () => {
     win.webContents.once('did-fail-load', schedule);
     setTimeout(schedule, 15000); // shortcut: error pages may fire neither reliably, screenshot whatever is shown
   }
-  win.loadURL(up ? `http://127.0.0.1:${port}/` : errorPage()).catch(() => {});
-});
+  win.loadURL(up ? `${origin}/` : errorPage()).catch((error) => {
+    tried.stderr = error.message;
+    win.loadURL(errorPage()).catch(console.error);
+  });
+}
 
-app.on('will-quit', () => {
-  if (worker) { try { worker.kill(); } catch {} worker = null; }
+if (process.env.CASSQUERY_USER_DATA) app.setPath('userData', process.env.CASSQUERY_USER_DATA);
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => { if (window) { window.show(); window.focus(); } });
+  app.whenReady().then(() => {
+    Menu.setApplicationMenu(Menu.buildFromTemplate([
+      ...(process.platform === 'darwin' ? [{ role: 'appMenu' }] : []),
+      { role: 'editMenu' }, { role: 'viewMenu' }, { role: 'windowMenu' },
+    ]));
+    return openWindow();
+  }).catch((error) => {
+    tried.stderr = error.message;
+    console.error(error);
+    app.quit();
+  });
+  app.on('activate', () => openWindow().catch(console.error));
+}
+app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('before-quit', (event) => {
+  if (shutdownComplete) return;
+  event.preventDefault();
+  if (quitting) return;
+  quitting = true;
+  startup.abort();
+  Promise.resolve(opening).then(() => stopWorker(worker)).then(() => {
+    shutdownComplete = true;
+    app.quit();
+  }).catch((error) => { console.error(error); app.exit(1); });
 });

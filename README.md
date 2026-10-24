@@ -1,12 +1,17 @@
 # CassQuery
 
+<picture>
+  <source media="(prefers-color-scheme: light)" srcset="branding/readme-light.svg">
+  <img src="branding/readme-dark.svg" alt="CassQuery — a precision workspace for parametric design" width="1280">
+</picture>
+
 A local desktop viewer for CadQuery projects: edit the source, and the model in front of you updates — no export, no re-import, no twenty-second wait to find out what a fillet did.
 
 CassQuery was built for parametric jewelry design, where one project is a chain of interdependent parts and the honest way to check a change is to *look at it*: posed, sectioned, X-rayed, measured. It is a personal tool, built in the open.
 
-![The CassQuery viewer showing the bundled TESTPLATE demo project — a certified build, its authored steps, and the tool panel](docs/viewer.png)
+![CassQuery's Counterform interface showing the public TESTPLATE fixture](docs/viewer.png)
 
-*The viewer running the bundled demo project (`testpart/`): a certified build with its gates passed, the project's authored steps, and the badge that always says which tier — preview or certified — is on screen.*
+*The actual browser renderer with the public TESTPLATE fixture: three parts, authored steps and certified-state labels. This screenshot uses a disconnected fixture server; it is not evidence of a connected live CAD loop or native macOS launch.*
 
 ## Why it exists
 
@@ -75,7 +80,9 @@ A project is any directory with:
 
 ## Run it
 
-Requirements: Python with CadQuery 2.5+ and websockets available, Node.js 22+.
+Requirements for development: Python with CadQuery 2.5+ and websockets 13+, Node.js 22+.
+The native macOS candidate bundles its own Python/CadQuery runtime; see
+[macOS build and release gates](docs/MACOS_RELEASE.md).
 
 ### Try the demo
 
@@ -88,7 +95,7 @@ npm install
 npm run app
 ```
 
-The shell opens on the bundled demo project (`testpart/`, a plate with holes and a boss) with zero configuration: it finds the repo-local `.venv`, spawns the worker with the demo as the only project, and the first certified build runs on its own. `CASSQUERY_PYTHON` overrides the Python the shell looks for; `CASSQUERY_PROJECTS` (os.pathsep-separated — `;` on Windows, `:` elsewhere) replaces the demo with your own projects.
+The shell opens on the bundled demo project (`testpart/`, a plate with holes and a boss) with zero configuration: it finds the repo-local `.venv` in development, or the bundled worker inside the macOS app, and the first certified build runs on its own. `CASSQUERY_PYTHON` explicitly overrides the interpreter; `CASSQUERY_PROJECTS` (os.pathsep-separated — `;` on Windows, `:` elsewhere) replaces the demo with your own projects. The shell owns its worker process, follows its private PID-bound readiness registry to the actual selected port, and shuts it down on Quit. On macOS, closing the window keeps the app running; its Dock icon reopens the viewer.
 
 ### Run the worker directly
 
@@ -113,9 +120,16 @@ Then open the viewer at the URL the worker prints. The port is **3939** unless i
 
 ## Status
 
-v1 is built and verified: both tiers live, all eight certified gates exercised (including a deliberate gate-failure run where the last certified model stayed on screen), the save → preview → certified loop proven end to end with render-checked screenshots, and the agent protocol driven headlessly against the running worker. The post-v1 passes are in: the zero-config demo boot, per-project load isolation, and the versioned status API above, plus a viewer polish pass — reset view with aspect-aware framing, click-vs-drag picking, loading and error states that always land somewhere visible, and every failure path in the viewer and the shell exercised live. Windows and macOS are the target desktops; it runs unpackaged in dev mode — no installers, signing, or onboarding, by design. The design projects it was built for are private; their models and payloads are not in this repository. The demo project (`testpart/`) and its payloads are the public proof of the loop.
+v1 is built and verified: both tiers live, all eight certified gates exercised (including a deliberate gate-failure run where the last certified model stayed on screen), the save → preview → certified loop proven end to end with render-checked screenshots, and the agent protocol driven headlessly against the running worker. The post-v1 passes are in: the zero-config demo boot, per-project load isolation, and the versioned status API above, plus a viewer polish pass — reset view with aspect-aware framing, click-vs-drag picking, loading and error states that always land somewhere visible, and every failure path in the viewer and the shell exercised live. Windows and macOS are the target desktops. The macOS development candidate now has an Electron `.app` build with bundled CadQuery and automated native worker/render/package gates for Apple Silicon and Intel. It is an ad-hoc-signed candidate, **not a published or notarized release**; see [the checked/not-checked release boundary](docs/MACOS_RELEASE.md). Windows packaging, onboarding and automatic updates remain unimplemented. The design projects it was built for are private; their models and payloads are not in this repository. The demo project (`testpart/`) and its payloads are the public proof of the loop.
 
 Working on this repo — human or agent? Read [AGENTS.md](AGENTS.md) first: it carries the depth standard and the verification laws this codebase is held to.
+
+## Visual identity
+
+The Counterform identity, app icons, adaptive README banner, palette, typography,
+state semantics and export rules live in [the brand guide](docs/BRAND.md).
+All shipped visual assets are generated from one checked-in vector source;
+`python tools/make_brand_assets.py --check` detects export drift.
 
 ## License
 

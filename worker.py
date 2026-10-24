@@ -12,8 +12,16 @@ Run:  python worker.py [project_dir ...] [--port N]
       (or CASSQUERY_PROJECTS=/path/projA:/path/projB python worker.py;
       with neither, the bundled testpart demo is served)
 """
-import asyncio, base64, hashlib, importlib, importlib.util, json, os, sys, threading, time, traceback
+import asyncio, base64, copy, hashlib, importlib, importlib.machinery, importlib.util, json, math, os, re, sys, tempfile, threading, time, traceback, uuid
+from contextlib import contextmanager
+from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import parse_qs, quote, unquote, urlsplit
+
+try:
+    import numpy as np
+except ImportError:
+    np = None  # HTTP/manifest tests need no geometry runtime; main fails preflight.
 
 
 def _preflight():
@@ -21,7 +29,7 @@ def _preflight():
     # websockets used to kill the announce thread silently, and a missing
     # cadquery only surfaced as an opaque per-build error.
     missing = []
-    for name in ("numpy", "cadquery", "OCP", "websockets"):
+    for name in ("numpy", "cadquery", "OCP", "websockets.asyncio.server"):
         try:
             importlib.import_module(name)
         except Exception:
@@ -35,15 +43,37 @@ def _preflight():
         raise SystemExit(1)
 
 
-_preflight()
-import numpy as np
+def _data_dir():
+    if os.environ.get("CASSQUERY_DATA_DIR"):
+        return os.path.abspath(os.path.expanduser(os.environ["CASSQUERY_DATA_DIR"]))
+    if not getattr(sys, "frozen", False):
+        return HERE
+    if sys.platform == "darwin":
+        return os.path.expanduser("~/Library/Application Support/CassQuery")
+    if sys.platform == "win32":
+        return os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "CassQuery")
+    return os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "CassQuery")
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+
+HERE = os.path.abspath(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))))
 VIEWER_DIR = os.path.join(HERE, "viewer")
-PAYLOAD_DIR = os.path.join(HERE, "payloads")
-SHOT_DIR = os.path.join(HERE, "evidence", "shots")
-os.makedirs(PAYLOAD_DIR, exist_ok=True)
-os.makedirs(SHOT_DIR, exist_ok=True)
+DATA_DIR = _data_dir()
+PAYLOAD_DIR = os.path.join(DATA_DIR, "payloads")
+SHOT_DIR = os.path.join(DATA_DIR, "evidence", "shots")
+
+
+def _atomic_write(path, data, before_replace=None):
+    # Unique sibling temporary files avoid collisions between simultaneous writes.
+    fd, tmp = tempfile.mkstemp(prefix=".cq-", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        if before_replace is not None:
+            before_replace()
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 # finish table: (material, finish) -> renderer PBR (pilot values for 316L)
 FINISH = {
@@ -97,10 +127,22 @@ def _tessellate_solid(shape, tol, ang):
             np.asarray(tris, np.int64).reshape(-1, 3), missing)
 
 
+def _validate_mesh(verts, tris):
+    if (verts.ndim != 2 or verts.shape[1] != 3 or tris.ndim != 2 or tris.shape[1] != 3 or
+            not len(verts) or not len(tris) or not np.isfinite(verts).all() or
+            not np.issubdtype(tris.dtype, np.integer) or tris.min() < 0 or tris.max() >= len(verts) or
+            np.any(tris[:, 0] == tris[:, 1]) or np.any(tris[:, 1] == tris[:, 2]) or
+            np.any(tris[:, 2] == tris[:, 0])):
+        raise ValueError("empty, non-finite or invalid triangle mesh")
+
+
 def _weld(verts, tris, tol=1e-4):
     if len(verts) == 0:
         return verts, tris
-    _, idx, inv = np.unique(np.round(verts / tol).astype(np.int64), axis=0,
+    grid = np.round(verts / tol)
+    if not np.isfinite(grid).all() or (np.abs(grid) >= np.iinfo(np.int64).max).any():
+        raise ValueError("mesh coordinates exceed welding range")
+    _, idx, inv = np.unique(grid.astype(np.int64), axis=0,
                             return_index=True, return_inverse=True)
     return verts[idx], inv[tris]
 
@@ -123,100 +165,111 @@ def _mesh_area(verts, tris):
     return float(0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1).sum())
 
 
-def _closure_check(verts, tris, eps, brep_area=None, brep_closed=False):
-    """Watertight verdict for one solid's mesh. Returns (ok, method, detail).
+def _capsule_intervals(p, q, a, b, eps):
+    """Parameter intervals of p+t(q-p) within eps of segment ab (no sampling)."""
+    dot = lambda x, y: sum(u * v for u, v in zip(x, y))
+    d = tuple(v - u for u, v in zip(p, q))
+    c = tuple(v - u for u, v in zip(a, b))
+    r = tuple(v - u for u, v in zip(a, p))
 
-    'exact': every edge of the welded mesh is shared by exactly two
-    triangles (native CadQuery solids meet this directly).
-    'brep-closed+area': for patchwork STEP solids (thousands of faces that
-    sample shared edges independently, so edge pairing measures
-    tessellation bookkeeping, not closure) closure is proven by the source
-    solid being a valid closed shell, the mesh reproducing the BREP surface
-    area within 1% (no dropped or doubled face), and every boundary edge
-    lying within eps of another mesh vertex (no true hole). A dropped face
-    or a real opening fails this on area and gap distance alike."""
+    def interval(x, v):
+        aa, bb, cc = dot(v, v), dot(x, v), dot(x, x) - eps * eps
+        if aa <= 1e-30:
+            return (0.0, 1.0) if cc <= 0 else None
+        disc = bb * bb - aa * cc
+        if disc < 0:
+            return None
+        radius = math.sqrt(disc)
+        return ((-bb - radius) / aa, (-bb + radius) / aa)
+
+    intervals = [interval(r, d), interval(tuple(v - u for u, v in zip(b, p)), d)]
+    length2 = dot(c, c)
+    if length2 > 1e-30:
+        u0, u1 = dot(r, c) / length2, dot(d, c) / length2
+        x = tuple(v - u0 * w for v, w in zip(r, c))
+        v = tuple(v - u1 * w for v, w in zip(d, c))
+        inside = interval(x, v)
+        if abs(u1) <= 1e-30:
+            projection = (0.0, 1.0) if 0 <= u0 <= 1 else None
+        else:
+            projection = tuple(sorted((-u0 / u1, (1 - u0) / u1)))
+        if inside and projection:
+            intervals.append((max(inside[0], projection[0]), min(inside[1], projection[1])))
+    return [(max(0.0, lo), min(1.0, hi)) for item in intervals if item
+            for lo, hi in [item] if max(0.0, lo) <= min(1.0, hi)]
+
+
+def _edge_covered(p, q, segments, eps):
+    intervals = sorted(i for a, b in segments for i in _capsule_intervals(p, q, a, b, eps))
+    end = 0.0
+    for lo, hi in intervals:
+        if lo > end + 1e-12:
+            return False
+        end = max(end, hi)
+        if end >= 1.0:
+            return True
+    return False
+
+
+def _closure_check(verts, tris, eps, brep_area=None, brep_closed=False):
+    """Exact edge pairing, or closed BREP + 1% area + full seam coverage."""
+    if not len(verts) or not len(tris) or not np.isfinite(verts).all():
+        return False, "exact", {"note": "empty or non-finite mesh"}
     wv, wt = _weld(verts, tris)
     uniq, counts = _edge_counts(wt)
     nbad = int((counts != 2).sum())
+    if (counts > 2).any():
+        return False, "exact", {"note": "non-manifold edges", "boundary_edges": nbad}
     if nbad == 0:
+        directed = np.concatenate([wt[:, [0, 1]], wt[:, [1, 2]], wt[:, [2, 0]]])
+        _, inverse = np.unique(np.sort(directed, axis=1), axis=0, return_inverse=True)
+        winding = np.bincount(inverse, weights=np.where(directed[:, 0] < directed[:, 1], 1, -1))
+        if np.any(winding != 0):
+            return False, "exact", {"note": "inconsistent triangle winding"}
         return True, "exact", {}
     if not eps or not brep_closed or not brep_area:
         return False, "exact", {"boundary_edges": nbad}
     area_ratio = _mesh_area(wv, wt) / brep_area
     if not (0.99 <= area_ratio <= 1.01):
-        return False, "brep-closed+area", {"boundary_edges": nbad,
-                                           "area_ratio": round(area_ratio, 4)}
+        return False, "brep-closed+area", {"boundary_edges": nbad, "area_ratio": round(area_ratio, 4)}
     if nbad > 0.02 * len(uniq):
-        return False, "brep-closed+area", {"boundary_edges": nbad,
-                                           "area_ratio": round(area_ratio, 4),
+        return False, "brep-closed+area", {"boundary_edges": nbad, "area_ratio": round(area_ratio, 4),
                                            "note": "boundary fraction > 2%"}
-    # every boundary edge must lie within eps of another mesh edge
-    # (segment-to-segment): the two sides of a tessellation seam sample the
-    # shared curve independently, so coverage is polyline-to-polyline
+    # Minimum segment distance was zero for adjacent edges of any hole. Prove
+    # coverage of the ENTIRE edge by other boundary-edge epsilon capsules.
     from collections import defaultdict
-
-    def seg_seg(p1, q1, p2, q2):
-        d1, d2, r = q1 - p1, q2 - p2, p1 - p2
-        a, e = float(d1 @ d1), float(d2 @ d2)
-        if a <= 1e-30 and e <= 1e-30:
-            return float(np.linalg.norm(r))
-        f, c = float(d2 @ r), float(d1 @ r)
-        if a <= 1e-30:
-            s, t = 0.0, min(1.0, max(0.0, f / e))
-        elif e <= 1e-30:
-            t, s = 0.0, min(1.0, max(0.0, -c / a))
-        else:
-            b = float(d1 @ d2)
-            den = a * e - b * b
-            s = min(1.0, max(0.0, (b * f - c * e) / den)) if den > 1e-30 else 0.0
-            t = (b * s + f) / e
-            if t < 0.0:
-                t, s = 0.0, min(1.0, max(0.0, -c / a))
-            elif t > 1.0:
-                t, s = 1.0, min(1.0, max(0.0, (b - c) / a))
-        return float(np.linalg.norm((p1 + d1 * s) - (p2 + d2 * t)))
-
-    sample = uniq[: min(len(uniq), 500)]
+    sample = uniq[:min(len(uniq), 500)]
     med = float(np.median(np.linalg.norm(wv[sample[:, 1]] - wv[sample[:, 0]], axis=1)))
     cell = max(eps, med)
-    vgrid = defaultdict(list)
-    for i, p in enumerate(wv):
-        vgrid[tuple(np.floor(p / cell).astype(int))].append(i)
-    vedges = defaultdict(list)
-    for ei, (a2, b2) in enumerate(uniq):
-        vedges[a2].append(ei)
-        vedges[b2].append(ei)
     bad_edges = uniq[counts != 2]
-    max_gap = 0.0
-    for u, v in bad_edges:
-        lo = np.minimum(wv[u], wv[v]) - eps
-        hi = np.maximum(wv[u], wv[v]) + eps
-        cand_rows = set()
-        for cx in range(int(np.floor(lo[0] / cell)), int(np.floor(hi[0] / cell)) + 1):
-            for cy in range(int(np.floor(lo[1] / cell)), int(np.floor(hi[1] / cell)) + 1):
-                for cz in range(int(np.floor(lo[2] / cell)), int(np.floor(hi[2] / cell)) + 1):
-                    for j in vgrid.get((cx, cy, cz), ()):
-                        cand_rows.update(vedges[j])
-        best = 1e18
-        for ei in cand_rows:
-            a2, b2 = uniq[ei]
-            if (a2, b2) == (u, v):
-                continue
-            best = min(best, seg_seg(wv[u], wv[v], wv[a2], wv[b2]))
-            if best <= 1e-9:
-                break
-        max_gap = max(max_gap, best)
-        if best > eps:
-            return False, "brep-closed+area", {"boundary_edges": nbad,
-                                               "area_ratio": round(area_ratio, 4),
-                                               "max_gap_mm": round(best, 3)}
-    return True, "brep-closed+area", {"boundary_edges": nbad,
-                                      "area_ratio": round(area_ratio, 4),
-                                      "max_gap_mm": round(max_gap, 3)}
+    grid = defaultdict(set)
+
+    def cells(lo, hi):
+        low, high = np.floor(lo / cell).astype(int), np.floor(hi / cell).astype(int)
+        for x in range(low[0], high[0] + 1):
+            for y in range(low[1], high[1] + 1):
+                for z in range(low[2], high[2] + 1):
+                    yield x, y, z
+
+    for i, (a, b) in enumerate(bad_edges):
+        for key in cells(np.minimum(wv[a], wv[b]), np.maximum(wv[a], wv[b])):
+            grid[key].add(i)
+    for i, (u, v) in enumerate(bad_edges):
+        candidates = set()
+        for key in cells(np.minimum(wv[u], wv[v]) - eps, np.maximum(wv[u], wv[v]) + eps):
+            candidates.update(grid.get(key, ()))
+        segments = [(wv[a], wv[b]) for j in candidates if j != i for a, b in [bad_edges[j]]]
+        if not _edge_covered(wv[u], wv[v], segments, eps):
+            return False, "brep-closed+area", {"boundary_edges": nbad, "area_ratio": round(area_ratio, 4),
+                                               "note": "uncovered boundary edge"}
+    return True, "brep-closed+area", {"boundary_edges": nbad, "area_ratio": round(area_ratio, 4),
+                                      "max_gap_mm": eps}
 
 
 def _mesh_volume(verts, tris):
-    a, b, c = verts[tris[:, 0]], verts[tris[:, 1]], verts[tris[:, 2]]
+    # Translation removes cancellation on geometry far from the world origin.
+    shifted = verts - verts.mean(axis=0) if len(verts) else verts
+    a, b, c = shifted[tris[:, 0]], shifted[tris[:, 1]], shifted[tris[:, 2]]
     return float(np.einsum("ij,ij->i", a, np.cross(b, c)).sum() / 6.0)
 
 
@@ -232,41 +285,147 @@ def _pack_solid(wv, wt):
     axis and folded the geometry; caught by the IFRIT step screenshots,
     2026-10-24, and now covered by the payload-roundtrip gate check.)"""
     if len(wv) == 0:
-        return {"positions": "", "indices": "", "qoffset": [0, 0, 0], "qscale": 1.0}
+        return {"positions": "", "indices": "", "itype": "u16", "qoffset": [0, 0, 0], "qscale": 1.0}
+    _validate_mesh(wv, wt)
     lo = wv.min(axis=0)
     ext = float((wv.max(axis=0) - lo).max()) or 1.0
     scale = ext / 65535.0
-    q = np.round((wv - lo) / scale).astype(np.uint16)
+    q = np.round((wv - lo) / scale).astype("<u2")
     u16 = len(wv) <= 65535
     return {"positions": _b64(q),
-            "indices": _b64(wt.astype(np.uint16 if u16 else np.uint32)),
+            "indices": _b64(wt.astype("<u2" if u16 else "<u4")),
             "itype": "u16" if u16 else "u32",
             "qoffset": [float(x) for x in lo], "qscale": scale}
 
 
 def _scale_shape(shape, k):
-    from OCP.BRepBuilderAPI import BRepBuilderAPI_GTransform
-    from OCP.gp import gp_GTrsf, gp_Pnt, gp_Trsf
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+    from OCP.gp import gp_Pnt, gp_Trsf
     import cadquery as cq
     tr = gp_Trsf()
     tr.SetScale(gp_Pnt(0, 0, 0), k)
-    return cq.Shape.cast(BRepBuilderAPI_GTransform(shape.wrapped, gp_GTrsf(tr), True).Shape())
+    # Uniform scale is a gp_Trsf, not a general transform: GTransform may
+    # invalidate analytic faces (e.g. the demo's cylindrical holes).
+    return cq.Shape.cast(BRepBuilderAPI_Transform(shape.wrapped, tr, True).Shape())
 
 
 # ---------- projects ----------
+def _component(value, label):
+    # Components become filenames and URL segments, never paths or query strings.
+    if (not isinstance(value, str) or not value or len(value.encode("utf-8")) > 100 or
+            value in (".", "..") or value[-1] in " ." or
+            any(ord(c) < 32 or c in '/\\\\:?#%<>|\"' for c in value)):
+        raise ValueError(f"invalid {label}: expected a safe filename component")
+    return value
+
+
+def _inside(root, path):
+    try:
+        return os.path.commonpath((os.path.realpath(root), os.path.realpath(path))) == os.path.realpath(root)
+    except ValueError:
+        return False
+
+
+def _source_path(root, filename):
+    if not isinstance(filename, str) or not filename.endswith(".py"):
+        raise ValueError("entry/poses must name a Python source file")
+    path = os.path.realpath(os.path.join(root, filename))
+    if not _inside(root, path):
+        raise ValueError("entry/poses must stay inside the project directory")
+    if not os.path.isfile(path):
+        raise ValueError(f"entry/poses source does not exist: {filename}")
+    return path
+
+
+def _finite_number(value):
+    try:
+        return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _number(value, label, positive=False):
+    if not _finite_number(value) or (value <= 0 if positive else value < 0):
+        raise ValueError(f"invalid {label}")
+    return value
+
+
+def _vector(value, label):
+    if (not isinstance(value, (list, tuple)) or len(value) != 3 or
+            any(not _finite_number(x) for x in value)):
+        raise ValueError(f"invalid {label}: expected three finite numbers")
+
+
+def _read_manifest(root, expected_name=None):
+    with open(os.path.join(root, "viewer.json"), encoding="utf-8") as fh:
+        m = json.load(fh)
+    if not isinstance(m, dict):
+        raise ValueError("viewer.json must be an object")
+    json.dumps(m, allow_nan=False)  # Unknown metadata must also be valid JSON on the wire.
+    for key in ("name", "entry"):
+        if key not in m:
+            raise ValueError(f"viewer.json is missing required key '{key}'")
+    name = _component(m["name"], "project name")
+    if expected_name is not None and name != expected_name:
+        raise ValueError("renaming a running project requires a worker restart")
+    if not isinstance(m["entry"], str):
+        raise ValueError("entry must be a file:function string")
+    entry, _, fn = m["entry"].partition(":")
+    _source_path(root, entry)
+    if fn and not fn.isidentifier():
+        raise ValueError("entry function must be a Python identifier")
+    if m.get("poses"):
+        _source_path(root, m["poses"])
+    for key in ("live", "on_demand"):
+        if key in m and not isinstance(m[key], bool):
+            raise ValueError(f"{key} must be boolean")
+    _number(m.get("unit_scale", 1.0), "unit_scale", positive=True)
+    _number(m.get("weld_epsilon", 0.0), "weld_epsilon")
+    for key in ("materials", "explode", "tessellation"):
+        if not isinstance(m.get(key, {}), dict):
+            raise ValueError(f"{key} must be an object")
+    for values in m.get("materials", {}).values():
+        if not isinstance(values, dict):
+            raise ValueError("each material must be an object")
+        if any(k in values and not isinstance(values[k], str) for k in ("material", "finish", "xray")):
+            raise ValueError("material/finish/xray must be strings")
+    for vec in m.get("explode", {}).values():
+        _vector(vec, "explode vector")
+    for values in m.get("tessellation", {}).values():
+        if not isinstance(values, (list, tuple)) or len(values) != 2:
+            raise ValueError("tessellation settings must be [linear, angular]")
+        for x in values:
+            _number(x, "tessellation tolerance", positive=True)
+    for key in ("steps", "chips"):
+        if key in m and not isinstance(m[key], list):
+            raise ValueError(f"{key} must be an array")
+    for step in m.get("steps", []):
+        if not isinstance(step, dict):
+            raise ValueError("each step must be an object")
+        if "camera" in step:
+            camera = step["camera"]
+            if not isinstance(camera, dict):
+                raise ValueError("step camera must be an object")
+            for key in ("position", "target"):
+                _vector(camera.get(key), "step camera " + key)
+    return m
+
+
+class StaleBuild(Exception):
+    pass
+
+
 class Project:
     def __init__(self, root):
-        self.root = root
-        self.manifest = json.load(open(os.path.join(root, "viewer.json")))
-        for key in ("name", "entry"):
-            if key not in self.manifest:
-                raise ValueError(f"viewer.json is missing required key '{key}'")
+        self.root = os.path.realpath(os.path.expanduser(root))
+        self.manifest = _read_manifest(self.root)
+        self.manifest_error = None
         self.name = self.manifest["name"]
         self.gen = 0
         self.state = "idle"
         self.preview_dirty = False
         self.certified_due = False
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.hashes = {}
         self.gates = None
         self.truth = None
@@ -275,47 +434,76 @@ class Project:
         self._mod_counter = 0
 
     def log(self, event, detail=""):
-        self.history.append({"t": time.time(), "event": event, "detail": detail})
-        self.history = self.history[-20:]
+        with self.lock:
+            self.history.append({"t": time.time(), "event": event, "detail": detail})
+            self.history = self.history[-20:]
 
     def load_module(self, filename):
         self._mod_counter += 1
-        path = os.path.join(self.root, filename)
+        path = _source_path(self.root, filename)
         spec = importlib.util.spec_from_file_location(
             f"cq_{self.name}_{self._mod_counter}", path)
         mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
+        # Read source, not timestamp-based pyc: rapid same-sized saves must build anew.
+        with open(path, "rb") as fh:
+            code = compile(fh.read(), path, "exec")
+        sys.modules[spec.name] = mod  # dataclasses and other decorators require this.
+        try:
+            exec(code, mod.__dict__)
+        except BaseException:
+            sys.modules.pop(spec.name, None)
+            raise
         return mod
 
-    # ----- one full build at one tier; returns (payload_hash, summary) -----
+    # ----- prepare one full build at one tier; publication is in run_build -----
     def build(self, tier):
-        gen = self.gen
+        if tier not in ("preview", "certified"):
+            raise ValueError("unknown build tier")
+        with self.lock:
+            try:
+                latest = _read_manifest(self.root, expected_name=self.name)
+            except Exception as e:
+                self.manifest_error = f"viewer.json: {type(e).__name__}: {e}"
+                raise ValueError(self.manifest_error) from e
+            if latest != self.manifest:
+                self.manifest = latest
+                self.gen += 1
+                broadcast({"type": "manifest", "project": self.name})
+            self.manifest_error = None
+            gen, manifest = self.gen, copy.deepcopy(self.manifest)
+        sources = snapshot([self.root])
         t0 = time.time()
-        entry_file, _, fn_name = self.manifest["entry"].partition(":")
+        entry_file, _, fn_name = manifest["entry"].partition(":")
         entry = self.load_module(entry_file)
         result = getattr(entry, fn_name or "build")()
-        scale = float(self.manifest.get("unit_scale", 1.0))
-        names = result["names"]
+        scale = float(manifest.get("unit_scale", 1.0))
+        if not isinstance(result, dict) or not isinstance(result.get("parts"), dict):
+            raise ValueError("build() must return {names, parts}")
+        names = result.get("names")
+        if (not isinstance(names, (list, tuple)) or not names or
+                any(not isinstance(n, str) or not n for n in names) or
+                len(set(names)) != len(names) or set(names) != set(result["parts"])):
+            raise ValueError("build names must uniquely identify every returned part")
 
-        # BREP truth from the UNSCALED source shapes
+        # Source BREP is the nominal-mm gate reference. unit_scale changes the
+        # mesh, not this truth; a deliberate scale mismatch must fail closed.
         from OCP.BRepGProp import BRepGProp
         from OCP.GProp import GProp_GProps
-        from OCP.TopAbs import TopAbs_SHELL
-        from OCP.TopExp import TopExp_Explorer
 
         def _solid_facts(s):
             props = GProp_GProps()
             BRepGProp.SurfaceProperties_s(s.wrapped, props)
-            # a solid with inner (void) shells is still closed; validity +
-            # positive volume is the BREP-side closure fact — the mesh-side
-            # proof is the area ratio + boundary gap test in _closure_check
-            return {"area": props.Mass(),
-                    "closed": bool(s.isValid() and s.Volume() > 0)}
+            volume, area = s.Volume(), props.Mass()
+            if not s.isValid() or not math.isfinite(volume) or volume <= 0 or not math.isfinite(area) or area <= 0:
+                raise ValueError("source must contain valid positive-volume solids")
+            return {"area": area, "closed": True}
 
         truth = {}
         for n in names:
             shp = result["parts"][n]
             solids = shp.Solids()
+            if not solids or not shp.isValid():
+                raise ValueError(f"part {n} has no valid solids")
             bb = shp.BoundingBox()
             facts = [_solid_facts(s) for s in solids]
             truth[n] = {"volume": shp.Volume(), "solids": len(solids),
@@ -326,19 +514,25 @@ class Project:
                         "solid_areas": [f["area"] for f in facts],
                         "solid_closed": [f["closed"] for f in facts],
                         "bbox": [bb.xmin, bb.ymin, bb.zmin, bb.xmax, bb.ymax, bb.zmax]}
-        self.truth = truth
-
         # variants: neutral + poses
         variants_src = {"neutral": result["parts"]}
-        if self.manifest.get("poses"):
-            poses = self.load_module(self.manifest["poses"])
+        if manifest.get("poses"):
+            poses = self.load_module(manifest["poses"])
+            if not isinstance(poses.POSES, dict):
+                raise ValueError("POSES must be an object of named callables")
             for pname, fn in poses.POSES.items():
-                variants_src[pname] = fn(result)
+                _component(pname, "pose name")
+                if pname == "neutral":
+                    raise ValueError("poses cannot replace neutral")
+                vparts = fn(result)
+                if not isinstance(vparts, dict) or set(vparts) != set(names):
+                    raise ValueError(f"pose {pname} must return all named parts")
+                variants_src[pname] = vparts
 
-        tess = self.manifest.get("tessellation", {})
+        tess = manifest.get("tessellation", {})
         tol, ang = tess.get("coarse" if tier == "preview" else "fine",
                             COARSE if tier == "preview" else FINE)
-        weld_eps = float(self.manifest.get("weld_epsilon", 0.0))
+        weld_eps = float(manifest.get("weld_epsilon", 0.0))
         closure_methods = []
         variants_out, gate_checks, diag = {}, [], []
         variant_tris = {}
@@ -350,11 +544,14 @@ class Project:
                 shp = vparts[n]
                 if scale != 1.0:
                     shp = _scale_shape(shp, scale)
-                mat = self.manifest.get("materials", {}).get(n, {})
+                mat = manifest.get("materials", {}).get(n, {})
                 fin = FINISH.get((mat.get("material"), mat.get("finish")), FINISH_DEFAULT)
                 solids_out, part_tris = [], 0
                 part_mesh_vol = 0.0
-                for si, solid in enumerate(shp.Solids()):
+                solids = shp.Solids()
+                if not solids or not shp.isValid():
+                    raise ValueError(f"pose {vname}/{n} has no valid solids")
+                for si, solid in enumerate(solids):
                     # relative deflection cap: a solid is never tessellated
                     # coarser than 5% of its smallest dimension (small parts
                     # keep fine absolute detail under coarse project settings)
@@ -365,17 +562,19 @@ class Project:
                     # (sphere deficit ~ 3a^2/8), so they get a finer angle
                     sang = ang * 0.35 if max(sb.xlen, sb.ylen, sb.zlen) <= 4.0 else ang
                     verts, tris, missing = _tessellate_solid(solid, stol, sang)
+                    _validate_mesh(verts, tris)
                     wv, wt = _weld(verts, tris)
+                    _validate_mesh(wv, wt)
                     part_tris += len(wt)
                     vol = abs(_mesh_volume(wv, wt))
                     part_mesh_vol += vol
                     if tier == "certified":
                         if missing:
                             diag.append(f"{vname}/{n}/solid{si}: {missing} face(s) without triangulation")
+                        facts = _solid_facts(solid)
                         ok, method, det = _closure_check(
                             verts, tris, weld_eps,
-                            brep_area=truth[n]["solid_areas"][si],
-                            brep_closed=truth[n]["solid_closed"][si])
+                            brep_area=facts["area"], brep_closed=facts["closed"])
                         closure_methods.append(method if ok else f"FAILED {det}")
                         if not ok:
                             diag.append(f"{vname}/{n}/solid{si}: mesh not watertight ({method}, {det})")
@@ -389,12 +588,15 @@ class Project:
                         # payload roundtrip: the packed bytes must decode
                         # back to the gated mesh (catches encoding bugs the
                         # geometry gates cannot see — they run pre-pack)
-                        q = np.frombuffer(base64.b64decode(packed["positions"]),
-                                          dtype=np.uint16).astype(np.float64)
-                        dec = q.reshape(-1, 3) * packed["qscale"] + np.array(packed["qoffset"])
+                        q = np.frombuffer(base64.b64decode(packed["positions"], validate=True),
+                                          dtype="<u2").astype(np.float64)
+                        dec = (q.reshape(-1, 3) * packed["qscale"] + np.array(packed["qoffset"])).astype(np.float32).astype(np.float64)
                         err = float(np.abs(dec - wv).max()) if len(dec) == len(wv) else 1e9
-                        if err > 2 * packed["qscale"]:
-                            diag.append(f"{vname}/{n}/solid{si}: payload roundtrip error {err:.4f} mm")
+                        decoded_indices = np.frombuffer(base64.b64decode(packed["indices"], validate=True),
+                                                        dtype="<u2" if packed["itype"] == "u16" else "<u4")
+                        if (not math.isfinite(err) or err > 2 * packed["qscale"] or
+                                not np.array_equal(decoded_indices, wt.ravel())):
+                            diag.append(f"{vname}/{n}/solid{si}: payload roundtrip error {err:.4f} mm or index mismatch")
                     solids_out.append(packed)
                     if len(wv):
                         lo, hi = wv.min(axis=0), wv.max(axis=0)
@@ -409,8 +611,8 @@ class Project:
                 variant_tris[vname] = variant_tris.get(vname, 0) + part_tris
                 parts_out.append({
                     "name": n, "finish": fin, "xray": mat.get("xray", "opaque"),
-                    "explode": self.manifest.get("explode", {}).get(n, [0, 0, 0]),
-                    "center": truth[n]["center"], "solids": solids_out})
+                    "explode": manifest.get("explode", {}).get(n, [0, 0, 0]),
+                    "center": [shp.Center().x, shp.Center().y, shp.Center().z], "solids": solids_out})
             ext = [mesh_extent[3 + k] - mesh_extent[k] for k in range(3)]
             if vname == "neutral":
                 tt = [truth[n]["bbox"] for n in names]
@@ -433,10 +635,10 @@ class Project:
         # unchanged model keeps its hash across rebuilds.
         variant_files = {}
         for vname, vdata in variants_out.items():
-            vraw = json.dumps(vdata, separators=(",", ":")).encode()
+            vraw = json.dumps(vdata, separators=(",", ":"), allow_nan=False).encode()
             vh = hashlib.sha256(vraw).hexdigest()[:16]
             variant_files[vname] = {"hash": vh, "raw": vraw,
-                                    "url": f"/payload/{self.name}-{tier}-{vname}.json",
+                                    "url": "/payload/" + quote(f"{self.name}-{tier}-{vname}-{vh}.json"),
                                     "tris": variant_tris.get(vname, 0),
                                     "bytes": len(vraw)}
         h = hashlib.sha256("".join(variant_files[v]["hash"] for v in sorted(variant_files)).encode()).hexdigest()[:16]
@@ -467,26 +669,43 @@ class Project:
                  "variants": {v: {k: f[k] for k in ("hash", "url", "tris", "bytes")}
                               for v, f in variant_files.items()}}
 
-        def _write(fname, data):
-            tmp = os.path.join(PAYLOAD_DIR, f".{fname}.tmp")
-            with open(tmp, "wb") as fh:
-                fh.write(data)
-            os.replace(tmp, os.path.join(PAYLOAD_DIR, fname))
-
-        if not failed:
-            for vname, f in variant_files.items():
-                _write(f"{self.name}-{tier}-{vname}.json", f["raw"])
-        _write(f"{self.name}-certified-failed.json" if failed else f"{self.name}-{tier}.json",
-               json.dumps(index, separators=(",", ":")).encode())
         return h, {"seconds": round(time.time() - t0, 2), "tris": worst_tris,
-                   "bytes": worst_bytes, "gates": gates}
+                   "bytes": worst_bytes, "gates": gates, "index": index,
+                   "variant_files": variant_files, "truth": truth, "sources": sources, "manifest": manifest}
+
+    def publish(self, tier, summary):
+        # Caller holds lock through publication, state update and announcement.
+        index = summary["index"]
+        def current():
+            return (self.gen == index["gen"] and not self.manifest_error and
+                    _read_manifest(self.root, expected_name=self.name) == summary["manifest"] and
+                    snapshot([self.root]) == summary["sources"])
+        if not current():
+            raise StaleBuild("source changed while building")
+        failed = tier == "certified" and not summary["gates"]["pass"]
+        if not failed:
+            for f in summary["variant_files"].values():
+                fname = unquote(f["url"].rsplit("/", 1)[-1])
+                _atomic_write(os.path.join(PAYLOAD_DIR, fname), f["raw"])
+        if not current():
+            raise StaleBuild("source changed while writing payloads")
+        fname = f"{self.name}-certified-failed.json" if failed else f"{self.name}-{tier}.json"
+        def check_commit():
+            if not current():
+                raise StaleBuild("source changed before index commit")
+        _atomic_write(os.path.join(PAYLOAD_DIR, fname),
+                      json.dumps(index, separators=(",", ":"), allow_nan=False).encode(),
+                      before_replace=check_commit)
+        if not failed:
+            self.truth = summary["truth"]
 
     def status(self):
-        return {"name": self.name, "root": self.root, "state": self.state,
-                "live": self.manifest.get("live", False),
-                "on_demand": self.manifest.get("on_demand", False),
-                "hashes": self.hashes, "gates_pass": (self.gates or {}).get("pass"),
-                "history": self.history[-8:]}
+        with self.lock:
+            return {"name": self.name, "root": self.root, "state": self.state,
+                    "live": self.manifest.get("live", False),
+                    "on_demand": self.manifest.get("on_demand", False),
+                    "hashes": self.hashes.copy(), "gates_pass": (self.gates or {}).get("pass"),
+                    "history": copy.deepcopy(self.history[-8:])}
 
 
 PROJECTS = {}
@@ -494,39 +713,105 @@ LOAD_ERRORS = []
 WS_CLIENTS = set()
 WS_LOOP = None
 SHOTS_PENDING = {}
+SHOTS_LOCK = threading.Lock()
+
+
+@contextmanager
+def _project_imports(root):
+    class SourceLoader(importlib.machinery.SourceFileLoader):
+        def get_code(self, fullname):
+            return compile(self.get_data(self.path), self.path, "exec")
+
+    class Finder:
+        def find_spec(self, fullname, path=None, target=None):
+            spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+            if spec and spec.origin and spec.origin.endswith(".py") and _inside(root, spec.origin):
+                spec.loader = SourceLoader(fullname, spec.origin)
+                return spec
+            return None
+
+    def purge():
+        for name, mod in list(sys.modules.items()):
+            path = getattr(mod, "__file__", None)
+            if isinstance(path, str) and _inside(root, path):
+                sys.modules.pop(name, None)
+
+    finder = Finder()
+    purge()
+    importlib.invalidate_caches()
+    sys.path.insert(0, root)
+    sys.meta_path.insert(0, finder)
+    try:
+        yield
+    finally:
+        sys.meta_path.remove(finder)
+        sys.path.remove(root)
+        purge()
 
 
 def broadcast(msg):
-    if WS_LOOP is None:
+    # Only the event-loop thread touches clients or sends; futures observe errors.
+    loop = WS_LOOP
+    if loop is None or loop.is_closed() or not loop.is_running():
         return
-    dead = []
-    for ws in list(WS_CLIENTS):
-        try:
-            asyncio.run_coroutine_threadsafe(ws.send(json.dumps(msg)), WS_LOOP)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        WS_CLIENTS.discard(ws)
+    raw = json.dumps(msg, allow_nan=False)
+    async def send_all():
+        for ws in list(WS_CLIENTS):
+            try:
+                await asyncio.wait_for(ws.send(raw), timeout=5)
+            except Exception:
+                WS_CLIENTS.discard(ws)
+    future = asyncio.run_coroutine_threadsafe(send_all(), loop)
+    def done(f):
+        if not f.cancelled() and f.exception() is not None:
+            print(f"CassQuery websocket send failed: {f.exception()}", file=sys.stderr)
+    future.add_done_callback(done)
 
 
 def set_state(p, state, detail=""):
-    p.state = state
-    p.log(state, detail)
-    broadcast({"type": "status", "project": p.name, "state": state, "detail": detail,
-               "hashes": p.hashes, "gates_pass": (p.gates or {}).get("pass")})
+    with p.lock:
+        p.state = state
+        p.log(state, detail)
+        broadcast({"type": "status", "project": p.name, "state": state, "detail": detail,
+                   "hashes": p.hashes.copy(), "gates_pass": (p.gates or {}).get("pass")})
 
 
 def run_build(p, tier):
     set_state(p, "building-" + tier)
     try:
-        h, summary = p.build(tier)
-    except Exception:
+        with _project_imports(p.root):
+            h, summary = p.build(tier)
+        with p.lock:
+            p.publish(tier, summary)
+            if tier == "certified":
+                p.gates = summary["gates"]
+                if not p.gates["pass"]:
+                    p.hashes["certified_failed"] = h
+                    set_state(p, "gate-failed", "; ".join(p.gates["diagnostics"][:4]))
+                    broadcast({"type": "gate_failed", "project": p.name, "hash": h,
+                               "gates": p.gates,
+                               "url": "/payload/" + quote(f"{p.name}-certified-failed.json")})
+                    return False
+            p.hashes[tier] = h
+            set_state(p, tier, f"{summary['seconds']}s, {summary['tris']} tris")
+            broadcast({"type": "announce", "project": p.name, "tier": tier, "hash": h,
+                       "url": "/payload/" + quote(f"{p.name}-{tier}.json"),
+                       "gates_pass": (summary["gates"] or {}).get("pass")})
+            return True
+    except StaleBuild as e:
+        with p.lock:
+            if p.manifest.get("live"):
+                p.preview_dirty = True
+            else:
+                p.certified_due = True
+            set_state(p, "stale", str(e))
+        return False
+    except BaseException:
+        # Project entry code may raise SystemExit/KeyboardInterrupt; neither may
+        # silently terminate the sole build thread. Ctrl-C in main still exits.
         tb = traceback.format_exc()
         last = tb.strip().splitlines()[-1] if tb.strip() else "build failed"
-        # Point at the deepest frame inside the project's own files: that is
-        # where the user's code failed, not the worker's tessellation stack.
-        own = [f for f in traceback.extract_tb(sys.exc_info()[2])
-               if os.path.abspath(f.filename).startswith(os.path.abspath(p.root) + os.sep)]
+        own = [f for f in traceback.extract_tb(sys.exc_info()[2]) if _inside(p.root, f.filename)]
         detail = (f"{os.path.basename(own[-1].filename)}:{own[-1].lineno}: {last}"
                   if own else last)
         set_state(p, "error", detail)
@@ -534,80 +819,99 @@ def run_build(p, tier):
         broadcast({"type": "build_failed", "project": p.name, "tier": tier,
                    "error": last, "detail": detail})
         return False
-    if tier == "certified":
-        p.gates = summary["gates"]
-        if not summary["gates"]["pass"]:
-            p.hashes["certified_failed"] = h
-            set_state(p, "gate-failed", "; ".join(summary["gates"]["diagnostics"][:4]))
-            broadcast({"type": "gate_failed", "project": p.name, "hash": h,
-                       "gates": summary["gates"],
-                       "url": f"/payload/{p.name}-certified-failed.json"})
-            return False
-    p.hashes[tier] = h
-    set_state(p, tier, f"{summary['seconds']}s, {summary['tris']} tris")
-    broadcast({"type": "announce", "project": p.name, "tier": tier, "hash": h,
-               "url": f"/payload/{p.name}-{tier}.json",
-               "gates_pass": (summary["gates"] or {}).get("pass")})
-    return True
+
+
+def _build_pending(p):
+    worked = False
+    with p.lock:
+        preview, gen = p.preview_dirty, p.gen
+        p.preview_dirty = False
+    if preview:
+        ok = run_build(p, "preview")
+        with p.lock:
+            if ok and p.manifest.get("live") and p.gen == gen:
+                p.certified_due = True
+        worked = True
+    with p.lock:
+        # Do not certify while a newer preview is pending.
+        certified = p.certified_due and not p.preview_dirty
+        if certified:
+            p.certified_due = False
+    if certified:
+        run_build(p, "certified")
+        worked = True
+    return worked
 
 
 def build_thread():
     while True:
         worked = False
         for p in PROJECTS.values():
-            if p.preview_dirty:
-                p.preview_dirty = False
-                if run_build(p, "preview"):
-                    gen_at_preview = p.gen
-                    # certified settles after the preview if nothing changed since
-                    if p.manifest.get("live") and p.gen == gen_at_preview:
-                        p.certified_due = True
-                worked = True
-            if p.certified_due:
-                p.certified_due = False
-                run_build(p, "certified")
-                worked = True
+            worked = _build_pending(p) or worked
         if not worked:
             time.sleep(0.3)
 
 
 def snapshot(roots):
     snap = {}
+    def unreadable(error):
+        raise error
     for root in roots:
-        for dirpath, dirnames, filenames in os.walk(root):
-            dirnames[:] = [d for d in dirnames if d != ".git"]
+        for dirpath, dirnames, filenames in os.walk(root, onerror=unreadable):
+            dirnames[:] = [d for d in dirnames if d not in
+                           (".git", ".venv", "venv", "node_modules", "__pycache__")]
             for f in filenames:
                 if f.endswith(".py") or f == "viewer.json":
                     fp = os.path.join(dirpath, f)
                     try:
-                        snap[fp] = os.stat(fp).st_mtime_ns
-                    except OSError:
-                        pass
+                        st = os.stat(fp)
+                        snap[fp] = (st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+                    except FileNotFoundError:
+                        continue  # An atomic save may remove a file mid-snapshot.
     return snap
 
 
-def watcher(roots):
-    prev = snapshot(roots)
+def _apply_changes(changed):
+    for p in PROJECTS.values():
+        mine = [fp for fp in changed if _inside(p.root, fp)]
+        if not mine:
+            continue
+        with p.lock:
+            p.gen += 1
+            p.last_change = time.time()
+            if os.path.join(p.root, "viewer.json") in mine:
+                try:
+                    p.manifest = _read_manifest(p.root, expected_name=p.name)
+                    p.manifest_error = None
+                    broadcast({"type": "manifest", "project": p.name})
+                except Exception as e:
+                    p.manifest_error = f"viewer.json: {type(e).__name__}: {e}"
+                    p.preview_dirty = p.certified_due = False
+                    set_state(p, "error", p.manifest_error)
+                    broadcast({"type": "build_failed", "project": p.name,
+                               "tier": "certified", "error": p.manifest_error,
+                               "detail": p.manifest_error})
+                    continue
+            if p.manifest.get("live") and not p.manifest_error:
+                p.preview_dirty = True
+            set_state(p, "stale", f"changed: {os.path.basename(mine[0])}")
+
+
+def watcher(roots, prev=None):
+    if prev is None:
+        prev = snapshot(roots)
     while True:
         time.sleep(0.5)
-        cur = snapshot(roots)
-        changed = [fp for fp in set(cur) | set(prev) if cur.get(fp) != prev.get(fp)]
-        if changed:
+        try:
+            cur = snapshot(roots)
+            changed = [fp for fp in set(cur) | set(prev) if cur.get(fp) != prev.get(fp)]
+            _apply_changes(changed)
+            prev = cur
+        except OSError as e:
+            # Never let an unreadable directory silently kill the watch thread.
+            print(f"CassQuery watcher: {e}", file=sys.stderr)
             for p in PROJECTS.values():
-                mine = [fp for fp in changed if fp.startswith(p.root)]
-                if mine:
-                    p.gen += 1
-                    p.last_change = time.time()
-                    if any(os.path.basename(fp) == "viewer.json" for fp in mine):
-                        try:
-                            p.manifest = json.load(open(os.path.join(p.root, "viewer.json")))
-                            broadcast({"type": "manifest", "project": p.name})
-                        except Exception:
-                            pass
-                    if p.manifest.get("live"):
-                        p.preview_dirty = True
-                        set_state(p, "stale", f"changed: {os.path.basename(mine[0])}")
-        prev = cur
+                set_state(p, "error", f"watcher: {e}")
 
 
 # ---------- websocket ----------
@@ -622,48 +926,146 @@ async def ws_handler(ws):
         WS_CLIENTS.discard(ws)
 
 
-def ws_thread(port):
+def _header_values(headers, name):
+    try:
+        return headers.get_all(name) or []
+    except KeyError:
+        return []
+
+
+def _boundary_error(headers, port, origin_port):
+    hosts = _header_values(headers, "Host")
+    origins = _header_values(headers, "Origin")
+    if len(hosts) != 1 or len(origins) > 1:
+        return "one loopback Host and at most one Origin are required"
+    try:
+        host = urlsplit("//" + hosts[0])
+        if (host.hostname not in ("127.0.0.1", "localhost") or host.port != port or
+                host.username is not None or host.password is not None or
+                host.path or host.query or host.fragment):
+            return "Host must name this loopback listener"
+        if origins:
+            origin = urlsplit(origins[0])
+            if (origin.scheme != "http" or origin.hostname not in ("127.0.0.1", "localhost") or
+                    origin.port != origin_port or origin.username is not None or
+                    origin.password is not None or origin.path or origin.query or origin.fragment):
+                return "Origin must name this worker's HTTP viewer"
+    except (ValueError, TypeError):
+        return "invalid Host or Origin"
+    return None
+
+
+def ws_thread(sock, ready, errors, stop):
     global WS_LOOP
     async def main():
         from websockets.asyncio.server import serve
-        async with serve(ws_handler, "127.0.0.1", port):
-            await asyncio.Future()
-    WS_LOOP = asyncio.new_event_loop()
-    asyncio.set_event_loop(WS_LOOP)
-    WS_LOOP.run_until_complete(main())
+        async def check(connection, request):
+            error = _boundary_error(request.headers, sock.getsockname()[1], sock.getsockname()[1] - 1000)
+            return connection.respond(HTTPStatus.FORBIDDEN, error + "\n") if error else None
+        async with serve(ws_handler, sock=sock, process_request=check):
+            ready.set()
+            while not stop.is_set():
+                await asyncio.sleep(0.1)
+    loop = asyncio.new_event_loop()
+    WS_LOOP = loop
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(main())
+    except Exception as e:
+        errors.append(e)
+        print(f"CassQuery websocket server failed: {e}", file=sys.stderr)
+    finally:
+        ready.set()
+        WS_LOOP = None
+        sock.close()
+        loop.close()
 
 
 # ---------- HTTP: viewer, payloads, agent protocol ----------
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30)
+
     def log_message(self, *a):
         pass
 
+    def _guard(self):
+        error = _boundary_error(self.headers, self.server.server_port, self.server.server_port)
+        if error:
+            self.close_connection = True
+            self._send(403, {"error": error})
+            return False
+        try:
+            u = urlsplit(self.path)
+            if u.scheme or u.netloc:
+                raise ValueError("absolute request targets are not supported")
+        except ValueError:
+            self.close_connection = True
+            self._send(400, {"error": "invalid request target"})
+            return False
+        return True
+
     def _send(self, code, body, ctype="application/json"):
         if isinstance(body, (dict, list)):
-            body = json.dumps(body).encode()
+            body = json.dumps(body, allow_nan=False).encode()
         elif isinstance(body, str):
             body = body.encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
 
     def _body(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        return json.loads(self.rfile.read(n) or b"{}") if n else {}
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get_all("Transfer-Encoding", []):
+            raise ValueError("Transfer-Encoding is not supported")
+        if len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
+            raise ValueError("one nonnegative Content-Length is required")
+        n = int(lengths[0])
+        if n > 16 * 1024 * 1024:
+            raise OverflowError("request body exceeds 16 MiB")
+        data = self.rfile.read(n)
+        if len(data) != n:
+            raise ValueError("incomplete request body")
+        def bad_constant(value):
+            raise ValueError(f"non-finite JSON number: {value}")
+        body = json.loads(data or b"{}", parse_constant=bad_constant)
+        if not isinstance(body, dict):
+            raise ValueError("request body must be a JSON object")
+        return body
 
     def _project(self, name):
+        if not isinstance(name, str):
+            self._send(400, {"error": "project must be a string"})
+            return None
         p = PROJECTS.get(name)
         if not p:
             self._send(404, {"error": f"unknown project {name}"})
         return p
 
+    def _file(self, root, rel, ctype):
+        fp = os.path.realpath(os.path.join(root, rel))
+        if not _inside(root, fp) or not os.path.isfile(fp):
+            return self._send(404, {"error": "not found"})
+        try:
+            with open(fp, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            return self._send(404, {"error": "not found"})
+        return self._send(200, data, ctype)
+
     def do_GET(self):
-        from urllib.parse import urlparse, parse_qs
-        u = urlparse(self.path)
+        if not self._guard():
+            return
+        u = urlsplit(self.path)
         q = parse_qs(u.query)
         if u.path == "/api/projects":
             return self._send(200, [p.status() for p in PROJECTS.values()])
@@ -679,48 +1081,86 @@ class Handler(BaseHTTPRequestHandler):
                                     "load_errors": LOAD_ERRORS})
         if u.path == "/api/manifest":
             p = self._project((q.get("project") or [""])[0])
-            return p and self._send(200, p.manifest)
+            if p:
+                with p.lock:
+                    manifest = copy.deepcopy(p.manifest)
+                return self._send(200, manifest)
+            return
         if u.path == "/api/gates":
             p = self._project((q.get("project") or [""])[0])
-            return p and self._send(200, p.gates or {"pass": None, "note": "no certified build yet"})
+            if p:
+                with p.lock:
+                    gates = copy.deepcopy(p.gates)
+                return self._send(200, gates or {"pass": None, "note": "no certified build yet"})
+            return
         if u.path == "/api/parts":
             p = self._project((q.get("project") or [""])[0])
             if not p:
                 return
-            if not p.truth:
+            with p.lock:
+                truth = copy.deepcopy(p.truth)
+            if not truth:
                 return self._send(200, {"note": "no build yet", "parts": []})
             return self._send(200, {"project": p.name, "parts": [
                 {"name": n, **{k: t[k] for k in ("volume", "solids", "center", "bbox")}}
-                for n, t in p.truth.items()]})
-        if u.path.startswith("/payload/"):
-            fp = os.path.join(PAYLOAD_DIR, os.path.basename(u.path))
-            if os.path.exists(fp):
-                return self._send(200, open(fp, "rb").read())
-            return self._send(404, {"error": "no such payload"})
-        # static viewer
-        rel = u.path.lstrip("/") or "index.html"
-        fp = os.path.join(VIEWER_DIR, rel)
-        if os.path.isfile(fp):
-            ctype = {"html": "text/html", "js": "text/javascript", "css": "text/css",
-                     "json": "application/json"}.get(rel.rsplit(".", 1)[-1], "application/octet-stream")
-            return self._send(200, open(fp, "rb").read(), ctype)
-        return self._send(404, {"error": "not found"})
+                for n, t in truth.items()]})
+        path = unquote(u.path)
+        if "\x00" in path:
+            return self._send(404, {"error": "not found"})
+        if path.startswith("/payload/"):
+            rel = path[len("/payload/"):]
+            if "/" in rel or "\\" in rel or not rel.endswith(".json"):
+                return self._send(404, {"error": "no such payload"})
+            return self._file(PAYLOAD_DIR, rel, "application/json")
+        rel = path.lstrip("/") or "index.html"
+        if "\\" in rel or "\x00" in rel:
+            return self._send(404, {"error": "not found"})
+        ctype = {"html": "text/html", "js": "text/javascript", "css": "text/css",
+                 "json": "application/json"}.get(rel.rsplit(".", 1)[-1], "application/octet-stream")
+        return self._file(VIEWER_DIR, rel, ctype)
 
     def do_POST(self):
-        from urllib.parse import urlparse
-        u = urlparse(self.path)
-        body = self._body()
+        if not self._guard():
+            return
+        u = urlsplit(self.path)
+        try:
+            body = self._body()
+        except (ValueError, OverflowError, TimeoutError) as e:
+            self.close_connection = True
+            code = 413 if isinstance(e, OverflowError) else 408 if isinstance(e, TimeoutError) else 400
+            return self._send(code, {"error": str(e)})
         if u.path == "/api/rebuild":
             p = self._project(body.get("project", ""))
             if not p:
                 return
             tier = body.get("tier", "certified")
-            if tier in ("preview", "both"):
-                p.preview_dirty = True
-            if tier in ("certified", "both"):
-                p.certified_due = True
+            if tier not in ("preview", "certified", "both"):
+                return self._send(400, {"error": "tier must be preview, certified or both"})
+            with p.lock:
+                if tier in ("preview", "both"):
+                    p.preview_dirty = True
+                if tier in ("certified", "both"):
+                    p.certified_due = True
             return self._send(202, {"accepted": True, "project": p.name, "tier": tier})
         if u.path == "/api/view":
+            if body.get("project") is not None and not self._project(body["project"]):
+                return
+            try:
+                for k in ("step", "variant"):
+                    if k in body and not isinstance(body[k], str):
+                        raise ValueError(f"{k} must be a string")
+                if "explode" in body:
+                    _number(body["explode"], "explode")
+                if "xray" in body and not isinstance(body["xray"], bool):
+                    raise ValueError("xray must be boolean")
+                if "camera" in body:
+                    if not isinstance(body["camera"], dict):
+                        raise ValueError("camera must be an object")
+                    for k in ("position", "target"):
+                        if k in body["camera"]:
+                            _vector(body["camera"][k], "camera " + k)
+            except ValueError as e:
+                return self._send(400, {"error": str(e)})
             cmd = {"type": "command", "project": body.get("project")}
             for k in ("step", "camera", "variant", "explode", "xray"):
                 if k in body:
@@ -731,40 +1171,78 @@ class Handler(BaseHTTPRequestHandler):
             p = self._project(body.get("project", ""))
             if not p:
                 return
-            rid = f"{p.name}-{int(time.time() * 1000)}"
-            ev = threading.Event()
-            SHOTS_PENDING[rid] = (ev, {})
-            broadcast({"type": "screenshot", "project": p.name, "id": rid})
-            if ev.wait(timeout=25):
-                return self._send(200, SHOTS_PENDING[rid][1])
-            SHOTS_PENDING.pop(rid, None)
-            return self._send(504, {"error": "no viewer answered (is the viewer open?)"})
+            rid = f"{p.name}-{uuid.uuid4().hex}"
+            ev, holder = threading.Event(), {}
+            with SHOTS_LOCK:
+                if len(SHOTS_PENDING) >= 64:
+                    return self._send(429, {"error": "too many pending screenshots"})
+                SHOTS_PENDING[rid] = (ev, holder, p.name)
+            try:
+                broadcast({"type": "screenshot", "project": p.name, "id": rid})
+                if ev.wait(timeout=25):
+                    return self._send(200, holder.copy())
+                return self._send(504, {"error": "no viewer answered (is the viewer open?)"})
+            finally:
+                with SHOTS_LOCK:
+                    SHOTS_PENDING.pop(rid, None)
         if u.path == "/api/shot":
-            rid = body.get("id", "")
-            data = body.get("data", "")
-            if rid in SHOTS_PENDING and data.startswith("data:image/png;base64,"):
+            rid, data = body.get("id"), body.get("data")
+            if not isinstance(rid, str) or not isinstance(data, str) or not data.startswith("data:image/png;base64,"):
+                return self._send(400, {"error": "unknown shot id or bad data"})
+            try:
+                png = base64.b64decode(data.split(",", 1)[1], validate=True)
+                if not png.startswith(b"\x89PNG\r\n\x1a\n"):
+                    raise ValueError("not a PNG")
+            except ValueError:
+                return self._send(400, {"error": "invalid PNG data"})
+            with SHOTS_LOCK:
+                pending = SHOTS_PENDING.get(rid)
+                if not pending or pending[0].is_set() or body.get("project") != pending[2]:
+                    return self._send(400, {"error": "unknown shot id or project"})
                 path = os.path.join(SHOT_DIR, f"{rid}.png")
-                with open(path, "wb") as f:
-                    f.write(base64.b64decode(data.split(",", 1)[1]))
-                ev, holder = SHOTS_PENDING[rid]
-                holder.update({"path": path, "project": body.get("project")})
+                try:
+                    _atomic_write(path, png)
+                except OSError as e:
+                    return self._send(500, {"error": f"could not save screenshot: {e}"})
+                ev, holder, project = pending
+                holder.update({"path": path, "project": project})
                 ev.set()
-                return self._send(200, {"saved": path})
-            return self._send(400, {"error": "unknown shot id or bad data"})
+            return self._send(200, {"saved": path})
         return self._send(404, {"error": "not found"})
 
 
-def find_port(start):
+def _port(value):
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        port = int(value)
+        if str(port) != str(value) or not 1 <= port <= 64476:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("port must be an integer from 1 to 64476 (60 attempts + WS offset)")
+    return port
+
+
+def bind_servers(start):
+    """Reserve real HTTP and WS listening sockets together; never probe-and-close."""
     import socket
+    start = _port(start)
+    last = None
     for port in range(start, start + 60):
-        s = socket.socket()
+        http = ws = None
         try:
-            s.bind(("127.0.0.1", port))
-            s.close()
-            return port
-        except OSError:
-            continue
-    raise RuntimeError("no free port")
+            http = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            ws = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            ws.bind(("127.0.0.1", port + 1000))
+            ws.listen()
+            return http, ws
+        except OSError as e:
+            last = e
+            if ws is not None:
+                ws.close()
+            if http is not None:
+                http.server_close()
+    raise RuntimeError(f"no free HTTP/websocket port pair: {last}")
 
 
 def _split_projects(value):
@@ -785,9 +1263,18 @@ def main(argv=None):
     ap.add_argument("projects", nargs="*", metavar="PROJECT_DIR",
                     help="project directories to serve (default: CASSQUERY_PROJECTS, "
                          "else the bundled testpart demo)")
-    ap.add_argument("--port", type=int, default=None,
-                    help="HTTP port (default: CASSQUERY_PORT or 3939; scans upward if busy)")
+    ap.add_argument("--port", type=_port, default=None,
+                    help="HTTP starting port, 1..64476 (default: CASSQUERY_PORT or 3939; scans 60 HTTP/WS pairs)")
+    ap.add_argument("--registry-file", default=os.path.expanduser("~/.cassquery.json"),
+                    help="owned-worker readiness registry (written after both listeners bind)")
     args = ap.parse_args(argv)
+    try:
+        start_port = args.port if args.port is not None else _port(os.environ.get("CASSQUERY_PORT", "3939"))
+    except ValueError as e:
+        ap.error(str(e))
+    _preflight()
+    os.makedirs(PAYLOAD_DIR, exist_ok=True)
+    os.makedirs(SHOT_DIR, exist_ok=True)
 
     roots = [os.path.expanduser(r) for r in args.projects] or \
         _split_projects(os.environ.get("CASSQUERY_PROJECTS", ""))
@@ -804,11 +1291,11 @@ def main(argv=None):
             LOAD_ERRORS.append({"path": r, "error": reason})
             print(f"CassQuery: skipping project {r}: {reason}", flush=True)
             continue
-        if p.name in PROJECTS:
-            # A second project with the same name must not silently
-            # replace the first in PROJECTS.
+        same_name = next((n for n in PROJECTS if n.casefold() == p.name.casefold()), None)
+        if same_name is not None:
+            # Case-only aliases collide on macOS/Windows payload files.
             reason = (f"duplicate project name '{p.name}': {r} skipped; "
-                      f"already serving {PROJECTS[p.name].root}")
+                      f"already serving {PROJECTS[same_name].root}")
             LOAD_ERRORS.append({"path": r, "error": reason})
             print(f"CassQuery: skipping project {r}: {reason}", flush=True)
             continue
@@ -816,21 +1303,49 @@ def main(argv=None):
             p.preview_dirty = True
             p.certified_due = True
         PROJECTS[p.name] = p
-        loaded.append(r)
+        loaded.append(p.root)
     if defaulted:
         print("CassQuery: no projects configured — serving the bundled testpart "
               "demo. Pass project directories as arguments or set "
               "CASSQUERY_PROJECTS (os.pathsep-separated) to serve your own.",
               flush=True)
-    port = find_port(args.port or int(os.environ.get("CASSQUERY_PORT", "3939")))
-    json.dump({"port": port, "pid": os.getpid(), "started": time.time()},
-              open(os.path.expanduser("~/.cassquery.json"), "w"))
-    threading.Thread(target=ws_thread, args=(port + 1000,), daemon=True).start()
-    threading.Thread(target=build_thread, daemon=True).start()
-    threading.Thread(target=watcher, args=(loaded,), daemon=True).start()
-    print(f"CassQuery worker on http://127.0.0.1:{port} (ws {port + 1000}), "
-          f"projects: {', '.join(PROJECTS) or '(none)'}", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    http, ws_sock = bind_servers(start_port)
+    port = http.server_port
+    registry_path = os.path.abspath(os.path.expanduser(args.registry_file))
+    ready, stop, errors = threading.Event(), threading.Event(), []
+    ws = threading.Thread(target=ws_thread, args=(ws_sock, ready, errors, stop), daemon=True)
+    registry_written = False
+    try:
+        ws.start()
+        if not ready.wait(timeout=10) or errors:
+            raise RuntimeError(f"websocket startup failed: {errors or 'timed out'}")
+        initial_sources = snapshot(loaded)
+        os.makedirs(os.path.dirname(registry_path), exist_ok=True)
+        _atomic_write(registry_path, json.dumps({"port": port, "pid": os.getpid(), "started": time.time()}).encode())
+        registry_written = True
+        threading.Thread(target=build_thread, daemon=True).start()
+        threading.Thread(target=watcher, args=(loaded, initial_sources), daemon=True).start()
+        print(f"CassQuery worker on http://127.0.0.1:{port} (ws {port + 1000}), "
+              f"projects: {', '.join(PROJECTS) or '(none)'}", flush=True)
+        http.timeout = 0.5
+        while not errors:
+            http.handle_request()
+        raise RuntimeError(f"websocket server stopped: {errors[0]}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        ws.join(timeout=10)
+        ws_sock.close()
+        http.server_close()
+        if registry_written:
+            try:
+                with open(registry_path, encoding="utf-8") as fh:
+                    owned = json.load(fh).get("pid") == os.getpid()
+                if owned:
+                    os.unlink(registry_path)
+            except FileNotFoundError:
+                pass
 
 
 if __name__ == "__main__":

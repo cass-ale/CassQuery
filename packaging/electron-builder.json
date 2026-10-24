@@ -1,0 +1,28 @@
+{
+  "appId": "com.cassquery.desktop",
+  "productName": "CassQuery",
+  "asar": true,
+  "directories": { "output": "dist/mac-app" },
+  "files": ["shell/**", "package.json"],
+  "extraResources": [
+    { "from": "dist/cassquery-worker", "to": "worker" },
+    { "from": "worker.py", "to": "source/worker.py" },
+    { "from": "viewer", "to": "source/viewer" },
+    { "from": "testpart", "to": "source/testpart" },
+    { "from": "LICENSE", "to": "LICENSE" }
+  ],
+  "mac": {
+    "icon": "assets/icons/cassquery.icns",
+    "category": "public.app-category.graphics-design",
+    "target": ["zip", "dmg"],
+    "artifactName": "CassQuery-${version}-mac-${arch}.${ext}",
+    "hardenedRuntime": false,
+    "identity": "-",
+    "entitlements": "packaging/entitlements.mac.plist",
+    "entitlementsInherit": "packaging/entitlements.mac.plist",
+    "notarize": false,
+    "minimumSystemVersion": "14.0",
+    "extendInfo": { "LSMinimumSystemVersion": "14.0" }
+  },
+  "publish": null
+}

@@ -43,18 +43,6 @@
  "on_demand": false,
  "steps": [
   {
-   "camera": {
-    "position": [
-     70,
-     -95,
-     58
-    ],
-    "target": [
-     0,
-     0,
-     20
-    ]
-   },
    "caption": "Three parts, as designed.",
    "explode": 0,
    "id": "assembled",
@@ -63,18 +51,6 @@
    "xray": false
   },
   {
-   "camera": {
-    "position": [
-     70,
-     -95,
-     58
-    ],
-    "target": [
-     0,
-     0,
-     20
-    ]
-   },
    "caption": "Post and cap lifted clear of the base.",
    "explode": 1,
    "id": "apart",

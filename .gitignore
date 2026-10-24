@@ -19,3 +19,6 @@ payloads/*
 !payloads/TESTPLATE-certified-neutral.json
 
 .DS_Store
+.claude/
+build/
+dist/

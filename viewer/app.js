@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+import { toCreasedNormals } from "three/addons/utils/BufferGeometryUtils.js";
 
 const stage = document.getElementById("stage");
 const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
@@ -18,8 +19,8 @@ const pmrem = new THREE.PMREMGenerator(renderer);
 scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 
 const camera = new THREE.PerspectiveCamera(40, 1, 0.5, 4000);
+camera.up.set(0, 0, 1); // CadQuery workplanes and explode vectors use Z as the vertical axis.
 const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
 
 const key = new THREE.DirectionalLight(0xffffff, 1.25);
 key.position.set(60, -40, 90);
@@ -27,39 +28,107 @@ scene.add(key, new THREE.AmbientLight(0xffffff, 0.15));
 scene.environmentIntensity = 0.85;
 
 const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+controls.enableDamping = !reduced;
 const httpPort = Number(location.port || 3939);
-const api = (p) => fetch(p).then((r) => r.json());
+async function api(path, options = {}, expectedHash = null) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+// Requests cannot follow a redirect outside the worker's loopback origin.
+    const response = await fetch(path, { ...options, cache: "no-store", redirect: "error", signal: controller.signal });
+    if (!response.ok) throw new Error(`worker returned ${response.status}`);
+    const text = await response.text();
+    if (expectedHash && await contentHash(text) !== expectedHash)
+      throw new Error("payload changed while loading; waiting for the next build");
+    return JSON.parse(text);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+async function contentHash(text) {
+  const bytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(bytes), (b) => b.toString(16).padStart(2, "0")).join("").slice(0, 16);
+}
 
 // ---------- state ----------
 let projects = [];           // [{name, root, state, hashes, ...}]
 let current = null;          // project name
 let manifest = null;
-let model = null;            // {group, parts: Map name->[{mesh, base}], bounds, hash, tier}
-let currentStep = -1;
+let model = null;            // visible model; previews never carry certified interactions
+let certifiedModel = null;   // retained until a replacement passes and loads completely
+let certifiedView = null;
+let currentStep = -1, displayedStep = -1;
 let explodeAmt = 0, explodeTarget = 0;
 let xrayOn = false;
 let camAnim = null;
-let wsDown = false;          // websocket was open, then dropped
-const shownHashes = {};      // project -> {preview, certified}
+let wsDown = false, rebuildPending = false;
+let workerEpoch = 0, cameraRequest = 0, explodeRequest = 0, xrayRequest = 0;
+let projectRequest = 0, manifestRequest = 0, variantRequest = 0, projectsRequest = 0;
+const payloadRequests = { preview: 0, certified: 0 };
 
 // ---------- small helpers ----------
-function b64f32(s) {
-  const bin = atob(s), u8 = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-  return new Float32Array(u8.buffer);
+const vector = (v) => Array.isArray(v) && v.length === 3 && v.every(Number.isFinite);
+const amount = (v) => Number.isFinite(v) && v >= 0 && v <= 1;
+const interactive = () => !!(manifest && model && model.tier === "certified");
+function validateManifest(value, name) {
+  if (!value || value.name !== name || !Array.isArray(value.steps || []) || !Array.isArray(value.chips || []))
+    throw new Error("invalid project manifest");
+  const steps = value.steps || [], chips = value.chips || [];
+  const ids = new Set();
+  for (const s of steps) {
+    if (!s || typeof s.id !== "string" || ids.has(s.id) || typeof s.label !== "string" ||
+        (s.caption !== undefined && typeof s.caption !== "string") ||
+        (s.variant !== undefined && typeof s.variant !== "string") ||
+        (s.explode !== undefined && !amount(s.explode)) ||
+        (s.xray !== undefined && typeof s.xray !== "boolean") ||
+        (s.camera && (!vector(s.camera.position) || !vector(s.camera.target))))
+      throw new Error("invalid manifest step");
+    ids.add(s.id);
+  }
+  if (chips.some((c) => typeof c !== "string")) throw new Error("invalid manifest chips");
+  return { ...value, steps, chips };
+}
+function updateTools() {
+  const enabled = interactive();
+  for (const id of ["explode", "xraybtn", "selshow"])
+    document.getElementById(id).disabled = !enabled;
+  for (const id of ["selisolate", "selhide"])
+    document.getElementById(id).disabled = !enabled || !selected;
+  document.querySelectorAll("#steps button").forEach((b) => { b.disabled = !enabled; });
+  document.getElementById("prev").disabled = !enabled || currentStep <= 0;
+  document.getElementById("next").disabled = !enabled || currentStep < 0 || currentStep >= manifest.steps.length - 1;
+  document.getElementById("buildbtn").disabled = !manifest || rebuildPending;
+  document.getElementById("resetview").disabled = !model;
+}
+function clearSelection() {
+  selected = null;
+  downAt = null;
+  const v = interactive() ? activeVariant()[1] : null;
+  const hidden = v && Array.from(v.parts.values()).some((p) => p.meshes.some((m) => !m.visible));
+  document.getElementById("selection").style.display = hidden ? "flex" : "none";
+  document.getElementById("selname").textContent = "";
+  document.getElementById("selisolate").disabled = true;
+  document.getElementById("selhide").disabled = true;
 }
 function b64indices(s) {
+  if (s.itype !== "u16" && s.itype !== "u32") throw new Error("invalid index encoding");
   const bin = atob(s.indices), u8 = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-  return s.itype === "u16" ? new Uint16Array(u8.buffer) : new Uint32Array(u8.buffer);
+  const out = s.itype === "u16" ? new Uint16Array(u8.buffer) : new Uint32Array(u8.buffer);
+  if (!out.length || out.length % 3) throw new Error("invalid triangle indices");
+  return out;
 }
 function b64positions(s) {
   // positions arrive as uint16 quantized (qoffset + q * qscale)
+  if (!vector(s.qoffset) || !Number.isFinite(s.qscale) || s.qscale <= 0)
+    throw new Error("invalid position encoding");
   const bin = atob(s.positions), u8 = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
   const q = new Uint16Array(u8.buffer);
+  if (!q.length || q.length % 3) throw new Error("invalid vertex positions");
   const out = new Float32Array(q.length);
   for (let i = 0; i < q.length; i++) out[i] = s.qoffset[i % 3] + q[i] * s.qscale;
+  if (!out.every(Number.isFinite)) throw new Error("non-finite vertex positions");
   return out;
 }
 function fitDist(radius) {
@@ -70,6 +139,7 @@ function fitDist(radius) {
   return radius / Math.sin(Math.min(v, h)) * 1.02;
 }
 function frameCamera(center, radius, dir = new THREE.Vector3(0.95, -1.35, 0.62)) {
+  camAnim = null;
   const d = dir.clone().normalize().multiplyScalar(fitDist(radius));
   camera.position.copy(center).add(d);
   controls.target.copy(center);
@@ -79,6 +149,8 @@ function frameCamera(center, radius, dir = new THREE.Vector3(0.95, -1.35, 0.62))
   controls.update();
 }
 function tweenCamera(pos, target) {
+  ++cameraRequest;
+  camAnim = null;
   if (reduced) {
     if (pos) camera.position.copy(pos);
     if (target) controls.target.copy(target);
@@ -91,62 +163,129 @@ function tweenCamera(pos, target) {
 }
 
 // ---------- model ----------
-function disposeModel() {
-  if (!model) return;
-  scene.remove(model.group);
-  model.group.traverse((o) => {
+function disposeGroup(group, materials = new Set()) {
+  group.traverse((o) => {
     if (o.geometry) o.geometry.dispose();
-    if (o.material) o.material.dispose();
+    if (o.material) materials.add(o.material);
   });
-  model = null;
+  for (const material of materials) material.dispose();
 }
-
-async function buildModel(index) {
-  disposeModel();
-  const group = new THREE.Group();
-  scene.add(group);
-  model = { group, variants: new Map(), index, hash: index.hash, tier: index.tier,
-            gates: index.gates, bounds: null, activeName: null };
-  await loadVariant("neutral");
-  applyExplode(0, true);
-  applyXray(false);
+function disposeModel(value = model) {
+  if (!value || value.disposed) return;
+  value.disposed = true;
+  scene.remove(value.group);
+  const materials = new Set();
+  for (const [, variant] of value.variants)
+    for (const [, part] of variant.parts) materials.add(part.mat);
+  disposeGroup(value.group, materials);
+  if (model === value) model = null;
+  if (certifiedModel === value) certifiedModel = null;
 }
-
-// Variants load lazily: the index names each variant file + hash; a variant
-// is fetched the first time a step (or command) asks for it.
-async function loadVariant(name) {
-  if (!model || model.variants.has(name)) return model.variants.get(name);
-  const meta = model.index.variants[name];
-  if (!meta) return undefined;
-  const m0 = model;
-  const v = await api(meta.url);
-  if (model !== m0) return undefined; // model replaced while fetching
-  const vgroup = new THREE.Group();
-  vgroup.visible = false;
-  const vparts = new Map();
-  for (const part of v.parts) {
-    const mat = new THREE.MeshStandardMaterial({
-      color: new THREE.Color(part.finish.color),
-      metalness: part.finish.metalness, roughness: part.finish.roughness });
-    const meshes = [];
-    for (const s of part.solids) {
-      const g = new THREE.BufferGeometry();
-      g.setAttribute("position", new THREE.BufferAttribute(b64positions(s), 3));
-      g.setIndex(new THREE.BufferAttribute(b64indices(s), 1));
-      g.computeVertexNormals();
-      const mesh = new THREE.Mesh(g, mat);
-      mesh.userData.part = part.name;
-      vgroup.add(mesh);
-      meshes.push(mesh);
-    }
-    vparts.set(part.name, { meshes, mat, xray: part.xray,
-                            explode: new THREE.Vector3(...part.explode) });
+function validateBounds(b) {
+  if (!b || !vector(b.min) || !vector(b.max) || !vector(b.center) ||
+      !Number.isFinite(b.radius) || b.radius <= 0 || b.min.some((x, i) => x > b.max[i]))
+    throw new Error("invalid model bounds");
+}
+async function validateIndex(index, name, tier, hash) {
+  if (!index || index.project !== name || index.tier !== tier || index.hash !== hash ||
+      !/^[a-f0-9]{16}$/.test(hash) || !Number.isInteger(index.gen) || index.gen < 0 ||
+      !index.variants || !Object.hasOwn(index.variants, "neutral"))
+    throw new Error("invalid model index");
+  if (tier === "certified") {
+    const ids = ["units", "watertight", "volume", "thin-extent", "triangulation",
+                 "payload-roundtrip", "budget-tris", "budget-bytes"];
+    if (index.gates?.pass !== true || !Array.isArray(index.gates.checks) ||
+        index.gates.checks.some((c) => !c || c.status !== "pass") ||
+        ids.some((id) => !index.gates.checks.some((c) => c.id === id)))
+      throw new Error("certified gates did not pass");
   }
-  model.group.add(vgroup);
-  const entry = { group: vgroup, parts: vparts, bounds: v.bounds };
-  model.variants.set(name, entry);
-  if (name === "neutral") model.bounds = v.bounds;
-  return entry;
+  for (const [variant, meta] of Object.entries(index.variants)) {
+    if (!meta || !/^[a-f0-9]{16}$/.test(meta.hash) || typeof meta.url !== "string")
+      throw new Error("invalid variant metadata");
+    const base = `/payload/${encodeURIComponent(name)}-${tier}-${encodeURIComponent(variant)}`;
+    const allowed = [new URL(base + ".json", location.origin).href,
+                     new URL(base + "-" + meta.hash + ".json", location.origin).href];
+    if (!allowed.includes(new URL(meta.url, location.origin).href))
+      throw new Error("invalid variant metadata");
+  }
+  const hashes = Object.keys(index.variants).sort().map((n) => index.variants[n].hash).join("");
+  if (await contentHash(hashes) !== hash) throw new Error("invalid model content hash");
+}
+async function buildModel(index) {
+  const value = { group: new THREE.Group(), variants: new Map(), pending: new Map(),
+    index, hash: index.hash, tier: index.tier, gates: index.gates,
+    bounds: null, activeName: "neutral", disposed: false, epoch: workerEpoch };
+  try {
+    const entry = await loadVariant("neutral", value);
+    entry.group.visible = true;
+    return value;
+  } catch (error) {
+    disposeModel(value);
+    throw error;
+  }
+}
+
+// Variants load lazily, deduplicated per model. Fixed filenames are mutable:
+// verify the bytes against the index hash before using them, even for neutral.
+async function loadVariant(name, value = model) {
+  if (!value || value.disposed) return undefined;
+  if (value.variants.has(name)) return value.variants.get(name);
+  if (value.pending.has(name)) return value.pending.get(name);
+  if (!Object.hasOwn(value.index.variants, name)) throw new Error(`unknown variant ${name}`);
+  const meta = value.index.variants[name];
+  const pending = (async () => {
+    const v = await api(meta.url, {}, meta.hash);
+    if (value.disposed) return undefined;
+    validateBounds(v.bounds);
+    if (!Array.isArray(v.parts)) throw new Error("invalid model parts");
+    const vgroup = new THREE.Group(), vparts = new Map();
+    vgroup.visible = false;
+    try {
+      for (const part of v.parts) {
+        if (!part || typeof part.name !== "string" || vparts.has(part.name) ||
+            !vector(part.explode) || !Array.isArray(part.solids) || !part.finish ||
+            typeof part.finish.color !== "string" ||
+            !amount(part.finish.metalness) || !amount(part.finish.roughness) ||
+            !["ghost", "opaque"].includes(part.xray))
+          throw new Error("invalid semantic part");
+        const meshes = [];
+        const mat = new THREE.MeshStandardMaterial({
+          color: new THREE.Color(part.finish.color),
+          metalness: part.finish.metalness, roughness: part.finish.roughness });
+        vparts.set(part.name, { meshes, mat, xray: part.xray,
+          explode: new THREE.Vector3(...part.explode) });
+        for (const s of part.solids) {
+          const positions = b64positions(s), indices = b64indices(s);
+          if (indices.some((i) => i >= positions.length / 3)) throw new Error("triangle index outside vertices");
+          const g = new THREE.BufferGeometry();
+          const mesh = new THREE.Mesh(g, mat);
+          vgroup.add(mesh);
+          meshes.push(mesh);
+          g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+          g.setIndex(new THREE.BufferAttribute(indices, 1));
+          // Welded CAD vertices share sharp boundaries; split normals at creases
+          // while retaining smooth normals across curved tessellation facets.
+          const creased = toCreasedNormals(g, Math.PI / 3);
+          mesh.geometry = creased;
+          if (creased !== g) g.dispose();
+          mesh.userData.part = part.name;
+        }
+      }
+    } catch (error) {
+      // Parts without meshes still own a material.
+      for (const [, part] of vparts) part.mat.dispose();
+      vgroup.traverse((o) => { if (o.geometry) o.geometry.dispose(); });
+      throw error;
+    }
+    value.group.add(vgroup);
+    const entry = { group: vgroup, parts: vparts, bounds: v.bounds };
+    value.variants.set(name, entry);
+    if (name === "neutral") value.bounds = v.bounds;
+    return entry;
+  })();
+  value.pending.set(name, pending);
+  try { return await pending; }
+  finally { value.pending.delete(name); }
 }
 
 function activeVariant() {
@@ -155,35 +294,39 @@ function activeVariant() {
   return ["neutral", model && model.variants.get("neutral")];
 }
 async function setVariant(name) {
-  if (!model) return;
-  // An uncached variant is a real fetch: say so, so a step click never
-  // looks like a freeze while the view is on its way.
-  const loading = !model.variants.has(name);
-  if (loading) setStale(`loading ${name} view`);
+  if (!interactive()) return false;
+  const value = model, request = ++variantRequest;
+  const loading = !value.variants.has(name);
+  const loadingText = `loading ${name} view`;
+  if (loading) setStale(loadingText);
   try {
-    const entry = await loadVariant(name);
-    if (!entry || !model) return;
+    const entry = await loadVariant(name, value);
+    if (!entry || model !== value || request !== variantRequest) return false;
     model.activeName = name;
     for (const [n, v] of model.variants) v.group.visible = n === name;
+    clearSelection();
     applyExplode(explodeAmt, true);
     applyXray(xrayOn);
+    return true;
   } catch (e) {
-    document.getElementById("diag").textContent =
-      `Could not load the ${name} view: ${e.message || e}`;
+    if (model === value && request === variantRequest)
+      document.getElementById("diag").textContent = `Could not load the ${name} view: ${e.message || e}`;
+    return false;
   } finally {
     const line = document.getElementById("buildline");
-    if (loading && line.textContent.startsWith("loading")) line.textContent = "";
+    if (loading && model === value && request === variantRequest && line.textContent.trim() === loadingText)
+      line.textContent = "";
   }
 }
 function applyExplode(amt, hard = false) {
   explodeAmt = amt;
+  document.getElementById("explode").value = Math.round(amt * 100);
+  document.getElementById("explodeval").textContent = Math.round(amt * 100) + "%";
   if (!model) return;
   const [, v] = activeVariant();
   if (!v) return;
   for (const [, p] of v.parts)
     for (const m of p.meshes) m.position.copy(p.explode).multiplyScalar(amt);
-  document.getElementById("explode").value = Math.round(amt * 100);
-  document.getElementById("explodeval").textContent = Math.round(amt * 100) + "%";
 }
 function applyXray(on) {
   xrayOn = on;
@@ -220,142 +363,261 @@ function renderSteps() {
     chips.append(li);
   }
 }
-function goStep(i, animate) {
-  if (!manifest || i < 0 || i >= manifest.steps.length) return;
-  currentStep = i;
-  const s = manifest.steps[i];
-  document.getElementById("caption").textContent = s.caption;
+function updateStepText() {
+  const s = manifest?.steps[currentStep];
+  document.getElementById("caption").textContent = s ? (s.caption || "") : "";
   document.querySelectorAll("#steps button").forEach((b, j) =>
-    b.setAttribute("aria-pressed", String(j === i)));
-  document.getElementById("prev").disabled = i === 0;
-  document.getElementById("next").disabled = i === manifest.steps.length - 1;
-  if (!model) return;
-  const before = activeVariant()[0];
-  const stepAtCall = i;
-  setVariant(s.variant || "neutral").then(() => {
-    if (currentStep !== stepAtCall || !model) return;
-    applyXray(!!s.xray);
-    if (s.camera) {
-      tweenCamera(new THREE.Vector3(...s.camera.position),
-                  new THREE.Vector3(...s.camera.target));
-      return;
-    }
-    if (!(before !== (s.variant || "neutral") || stepAtCall === 0 ||
-          Math.abs((s.explode || 0) - explodeAmt) > 0.5)) return;
-    const v = model.variants.get(s.variant || "neutral");
-    if (!v) return;
-    const b = v.bounds, amt = s.explode || 0;
-    const lo = [0, 0, 0], hi = [0, 0, 0];
-    for (const [, p] of v.parts) {
-      for (let k = 0; k < 3; k++) {
-        lo[k] = Math.min(lo[k], p.explode.getComponent(k) * amt);
-        hi[k] = Math.max(hi[k], p.explode.getComponent(k) * amt);
-      }
-    }
-    const center = new THREE.Vector3(...b.center).add(
-      new THREE.Vector3((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2));
-    const size = new THREE.Vector3(b.max[0] - b.min[0] + hi[0] - lo[0],
-                                   b.max[1] - b.min[1] + hi[1] - lo[1],
-                                   b.max[2] - b.min[2] + hi[2] - lo[2]);
-    frameCamera(center, size.length() / 2);
-  }).catch((e) => {
-    document.getElementById("diag").textContent =
-      `Could not show this step: ${e.message || e}`;
-  });
-  explodeTarget = s.explode || 0;
-  if (reduced) applyExplode(explodeTarget, true);
+    b.setAttribute("aria-pressed", String(j === currentStep)));
+  updateTools();
+}
+async function goStep(i, animate) {
+  if (!interactive() || !Number.isInteger(i) || i < 0 || i >= manifest.steps.length) return false;
+  const value = model, project = projectRequest, oldStep = displayedStep;
+  const s = manifest.steps[i], before = activeVariant()[0];
+  const cameraAtCall = cameraRequest, xrayAtCall = xrayRequest, explodeAtCall = explodeRequest;
+  currentStep = i;
+  if (animate) camAnim = null;
+  updateStepText();
+  const loading = setVariant(s.variant || "neutral"), request = variantRequest;
+  const success = await loading;
+  if (model !== value || project !== projectRequest || currentStep !== i || request !== variantRequest) return false;
+  if (!success) {
+    currentStep = oldStep;
+    updateStepText();
+    return false;
+  }
+  displayedStep = i;
+  if (xrayAtCall === xrayRequest) applyXray(!!s.xray);
+  const oldExplode = explodeAmt;
+  if (explodeAtCall === explodeRequest) explodeTarget = s.explode || 0;
+  if (reduced || !animate) applyExplode(explodeTarget, true);
+  if (cameraAtCall !== cameraRequest) return true;
+  if (animate && s.camera) {
+    tweenCamera(new THREE.Vector3(...s.camera.position), new THREE.Vector3(...s.camera.target));
+  } else if (animate && (before !== (s.variant || "neutral") || i === 0 ||
+                        Math.abs(explodeTarget - oldExplode) > 0.5)) {
+    const b = viewBounds(explodeTarget);
+    frameCamera(b.center, b.radius);
+  }
+  return true;
 }
 
 // ---------- project / payload loading ----------
-async function loadProject(name) {
-  current = name;
-  currentStep = -1;
-  try {
-    manifest = await api(`/api/manifest?project=${name}`);
-  } catch (e) {
-    document.getElementById("diag").textContent =
-      `Could not load ${name}: ${e.message || e}`;
-    return;
+function captureView() {
+  return { step: manifest?.steps[displayedStep]?.id, variant: model?.activeName || "neutral",
+    explode: explodeAmt, target: explodeTarget, xray: xrayOn };
+}
+function restoreView(view) {
+  currentStep = view ? manifest.steps.findIndex((s) => s.id === view.step) : -1;
+  displayedStep = currentStep;
+  explodeTarget = view?.target || 0;
+  applyExplode(view?.explode || 0, true);
+  applyXray(view?.xray || false);
+  updateStepText();
+}
+function viewBounds(amt = explodeAmt) {
+  const v = activeVariant()[1], b = v.bounds, lo = [0, 0, 0], hi = [0, 0, 0];
+  for (const [, p] of v.parts) {
+    for (let k = 0; k < 3; k++) {
+      lo[k] = Math.min(lo[k], p.explode.getComponent(k) * amt);
+      hi[k] = Math.max(hi[k], p.explode.getComponent(k) * amt);
+    }
   }
+  const center = new THREE.Vector3(...b.center).add(
+    new THREE.Vector3((lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2));
+  const size = new THREE.Vector3(b.max[0] - b.min[0] + hi[0] - lo[0],
+                               b.max[1] - b.min[1] + hi[1] - lo[1],
+                               b.max[2] - b.min[2] + hi[2] - lo[2]);
+  return { center, radius: Math.max(b.radius, size.length() / 2) };
+}
+function fitModel() {
+  const b = viewBounds();
+  const dir = camera.position.clone().sub(controls.target);
+  frameCamera(b.center, b.radius,
+    dir.lengthSq() ? dir : new THREE.Vector3(0.95, -1.35, 0.62));
+}
+async function reloadManifest(name = current) {
+  const project = projectRequest, request = ++manifestRequest;
+  const value = validateManifest(await api(`/api/manifest?project=${encodeURIComponent(name)}`), name);
+  if (project !== projectRequest || request !== manifestRequest || name !== current) return false;
+  const step = manifest?.steps[currentStep]?.id, displayed = manifest?.steps[displayedStep]?.id;
+  ++variantRequest;
+  manifest = value;
+  currentStep = manifest.steps.findIndex((s) => s.id === step);
+  displayedStep = manifest.steps.findIndex((s) => s.id === displayed);
+  renderSteps();
+  updateStepText();
+  return true;
+}
+async function loadProject(name) {
+  if (name === current && manifest) return;
+  const request = ++projectRequest;
+  ++manifestRequest; ++variantRequest;
+  ++payloadRequests.preview; ++payloadRequests.certified;
+  current = name;
+  rebuildPending = false;
+  ++commandRequest; commandWork = Promise.resolve();
+  manifest = null;
+  currentStep = -1; displayedStep = -1;
+  camAnim = null;
+  disposeModel(model);
+  disposeModel(certifiedModel);
+  certifiedView = null;
+  clearSelection();
+  applyExplode(0, true); explodeTarget = 0; applyXray(false);
+  document.getElementById("steps").innerHTML = "";
+  document.getElementById("chips").innerHTML = "";
+  document.getElementById("caption").textContent = "";
+  document.getElementById("diag").textContent = "";
+  document.querySelectorAll("#projects button").forEach((b) =>
+    b.setAttribute("aria-pressed", String(b.dataset.name === name)));
+  setBadge(null, "loading…");
+  hideStageMsg();
+  updateTools();
   try {
-    hideStageMsg();
-    document.querySelectorAll("#projects button").forEach((b) =>
-      b.setAttribute("aria-pressed", String(b.dataset.name === name)));
-    renderSteps();
+    if (!await reloadManifest(name) || request !== projectRequest) return;
     const st = projects.find((p) => p.name === name) || {};
-    const tier = st.hashes && st.hashes.certified ? "certified" : "preview";
-    if (st.hashes && st.hashes[tier]) {
-      await fetchPayload(name, tier, st.hashes[tier]);
-      if (st.state && st.state.startsWith("building")) setStale(st.state.replace("-", " "));
-    } else {
-      disposeModel();
-      // Reflect the project's real state instead of a bare "no model" while
-      // the first build is already running.
-      if (st.state && st.state.startsWith("building")) {
-        setBadge(null, "building…");
-        setStale(st.state.replace("-", " "));
-      } else if (st.state === "error") {
-        setBadge(null, "build failed");
-        const err = (st.history || []).filter((h) => h.event === "error").pop();
-        if (err) document.getElementById("diag").textContent = "Build error: " + err.detail;
-      } else {
-        setBadge(null, "no model yet");
-      }
+    const tier = st.hashes?.certified ? "certified" : "preview";
+    if (st.hashes?.[tier]) await fetchPayload(name, tier, st.hashes[tier]);
+    if (request !== projectRequest) return;
+    if (tier === "certified" && st.hashes?.preview && !["gate-failed", "error"].includes(st.state))
+      await fetchPayload(name, "preview", st.hashes.preview);
+    if (request !== projectRequest) return;
+    if (!model) {
+      setBadge(null, "no model yet");
       document.getElementById("caption").textContent =
         "No build yet. Use Rebuild certified to build this project.";
     }
+    reflectStatus(st);
   } catch (e) {
-    document.getElementById("diag").textContent =
-      `Could not load ${name}: ${e.message || e}`;
-    return;
+    if (request === projectRequest)
+      document.getElementById("diag").textContent = `Could not load ${name}: ${e.message || e}`;
   }
-  goStep(0, false);
 }
-
+function canDisplay(index) {
+  return !model || model.epoch !== workerEpoch || index.gen > model.index.gen ||
+    (index.gen === model.index.gen && !(index.tier === "preview" && model.tier === "certified"));
+}
 async function fetchPayload(name, tier, hash) {
-  if (shownHashes[name] && shownHashes[name][tier] === hash && model && model.tier === tier) return;
-  // Never rejects: a malformed payload (not just a failed fetch) lands on
-  // the diag line, never as an unhandled rejection with a half-set stage.
+  if (name !== current || !["preview", "certified"].includes(tier)) return false;
+  const project = projectRequest, request = ++payloadRequests[tier];
+  const fresh = () => project === projectRequest && name === current && request === payloadRequests[tier];
+  let candidate = null;
   try {
-    const payload = await api(`/payload/${name}-${tier}.json`);
-    if (payload.hash !== hash) return; // stale fetch
-    shownHashes[name] = { ...(shownHashes[name] || {}), [tier]: hash };
-    const keepDir = camera.position.clone().sub(controls.target);
-    await buildModel(payload);
+    const payload = await api(`/payload/${encodeURIComponent(name)}-${tier}.json`);
+    if (!fresh()) return false;
+    if (payload.hash !== hash) throw new Error("payload changed while loading; waiting for the next build");
+    await validateIndex(payload, name, tier, hash);
+    if (!fresh()) return false;
+    if (model?.index.project === name && model.hash === hash && model.tier === tier &&
+        (model.epoch !== workerEpoch || payload.gen >= model.index.gen)) {
+      model.index = payload;
+      model.epoch = workerEpoch;
+      document.getElementById("diag").textContent = "";
+      setBadge(tier, tier === "certified" ? `certified · gates passed · ${hash.slice(0, 8)}`
+        : `preview · not gate-checked · ${hash.slice(0, 8)}`);
+      return true;
+    }
+    if (!canDisplay(payload) && tier !== "certified") return false;
+    candidate = await buildModel(payload);
+    if (!fresh()) { disposeModel(candidate); return false; }
+    if (tier === "certified" && certifiedModel?.epoch === workerEpoch && payload.gen < certifiedModel.index.gen) {
+      disposeModel(candidate); return false;
+    }
+    let view = interactive() ? captureView() : certifiedView;
+    if (tier === "certified" && view) {
+      // A step/command may change while its replacement variant is loading.
+      // Carry the latest visible variant, not the one captured before the fetch.
+      while (Object.hasOwn(payload.variants, view.variant)) {
+        await loadVariant(view.variant, candidate);
+        if (!fresh()) { disposeModel(candidate); return false; }
+        const latest = interactive() ? captureView() : certifiedView;
+        if (!latest || latest.variant === view.variant) { view = latest; break; }
+        view = latest;
+      }
+      if (view && candidate.variants.has(view.variant)) {
+        candidate.activeName = view.variant;
+        for (const [n, v] of candidate.variants) v.group.visible = n === view.variant;
+      }
+    }
+    if (tier === "certified" && view && !candidate.variants.has(view.variant)) view = null;
+    if (!canDisplay(payload)) {
+      if (tier !== "certified") { disposeModel(candidate); return false; }
+      const old = certifiedModel;
+      certifiedModel = candidate;
+      certifiedView = view;
+      if (old && old !== model) disposeModel(old);
+      return false;
+    }
+    const old = model, oldCertified = certifiedModel;
+    if (old?.tier === "certified") certifiedView = captureView();
+    ++variantRequest;
+    camAnim = null;
+    model = candidate;
+    scene.add(model.group);
+    if (old) scene.remove(old.group);
+    if (tier === "certified") certifiedModel = model;
+    if (old && old !== certifiedModel) disposeModel(old);
+    if (oldCertified && oldCertified !== certifiedModel && oldCertified !== old) disposeModel(oldCertified);
+    clearSelection();
+    restoreView(tier === "certified" ? view : null);
+    fitModel();
     hideStageMsg();
-    if (keepDir.lengthSq() > 0) {
-      const b = model.bounds;
-      const dist = fitDist(b.radius);
-      const dir = keepDir.normalize();
-      controls.target.set(...b.center);
-      camera.position.copy(controls.target).add(dir.multiplyScalar(dist));
-      camera.near = Math.max(0.1, b.radius / 50);
-      camera.far = b.radius * 40;
-      camera.updateProjectionMatrix();
-      controls.update();
-    }
+    document.getElementById("diag").textContent = "";
     setBadge(tier, tier === "certified"
-      ? `certified · gates ${payload.gates && payload.gates.pass ? "passed" : "FAILED"} · ${hash.slice(0, 8)}`
+      ? `certified · gates passed · ${hash.slice(0, 8)}`
       : `preview · not gate-checked · ${hash.slice(0, 8)}`);
-    if (currentStep >= 0) {
-      const keep = currentStep;
-      currentStep = -1;
-      goStep(keep, false);
-    }
+    if (tier === "certified" && !view && manifest.steps.length) await goStep(0, !oldCertified);
+    return true;
   } catch (e) {
-    document.getElementById("diag").textContent =
+    if (candidate && candidate !== model && candidate !== certifiedModel) disposeModel(candidate);
+    if (fresh()) document.getElementById("diag").textContent =
       `Could not load the ${tier} model for ${name}: ${e.message || e}`;
+    return false;
   }
+}
+function restoreCertified() {
+  ++payloadRequests.preview; ++payloadRequests.certified; ++variantRequest;
+  camAnim = null;
+  if (certifiedModel && model !== certifiedModel) {
+    disposeModel(model);
+    model = certifiedModel;
+    scene.add(model.group);
+    clearSelection();
+    restoreView(certifiedView);
+    fitModel();
+  }
+}
+function gateFailed(gates) {
+  restoreCertified();
+  setBadge(null, certifiedModel ? "gate FAILED — showing last certified" : "gate FAILED — no certified model");
+  document.getElementById("tierbadge").className = "badge bad";
+  document.getElementById("diag").textContent = (gates?.diagnostics || []).slice(0, 6).join("\n");
+}
+function reflectStatus(st) {
+  if (st.state === "stale" || st.state?.startsWith("building")) setStale(st.state.replace("-", " "));
+  else if (st.state === "gate-failed") gateFailed(st.gates || { diagnostics: [st.detail || "Certified gates failed"] });
+  else if (st.state === "error") {
+    restoreCertified();
+    setBadge(null, certifiedModel ? "build failed — showing last certified" : "build failed — no certified model");
+    document.getElementById("tierbadge").className = "badge bad";
+    document.getElementById("buildline").textContent = "build failed";
+    const err = (st.history || []).filter((h) => h.event === "error").pop();
+    document.getElementById("diag").textContent = "Build error: " + (st.detail || err?.detail || "unknown error");
+  } else document.getElementById("buildline").textContent = wsDown ? "disconnected — reconnecting" : "";
 }
 
 function setBadge(tier, text) {
   const el = document.getElementById("tierbadge");
   el.textContent = text;
   el.className = "badge" + (tier === "preview" ? " preview" : tier === "certified" ? " ok" : "");
-  document.getElementById("buildline").textContent = "";
+  document.getElementById("buildline").textContent = wsDown ? "disconnected — reconnecting" : "";
 }
 function setStale(text) {
-  document.getElementById("buildline").innerHTML = `<span class="spin"></span> ${text}`;
+  const line = document.getElementById("buildline"), spin = document.createElement("span");
+  if (wsDown) { line.textContent = "disconnected — reconnecting"; return; }
+  spin.className = "spin";
+  line.replaceChildren(spin, document.createTextNode(" " + text));
 }
 function showStageMsg(title, detail) {
   const el = document.getElementById("stage-msg");
@@ -376,21 +638,23 @@ let downAt = null;
 // Pick on release, and only when the pointer barely moved: a press that
 // turns into an orbit drag must not also select (or deselect) a part.
 renderer.domElement.addEventListener("pointerdown", (e) => {
-  downAt = [e.clientX, e.clientY];
+  downAt = interactive() && e.button === 0 ? [e.clientX, e.clientY, e.pointerId] : null;
 });
+renderer.domElement.addEventListener("pointercancel", () => { downAt = null; });
 renderer.domElement.addEventListener("pointerup", (e) => {
-  if (!downAt) return;
+  if (!downAt || e.pointerId !== downAt[2]) return;
   const moved = Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]);
   downAt = null;
-  if (moved > 6 || !model) return;
+  if (moved > 6 || !interactive()) return;
   const r = renderer.domElement.getBoundingClientRect();
+  if (!r.width || !r.height) return;
   const nd = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1,
                                -((e.clientY - r.top) / r.height) * 2 + 1);
   ray.setFromCamera(nd, camera);
   const [, v] = activeVariant();
   if (!v) return;
   const meshes = [];
-  for (const [, p] of v.parts) meshes.push(...p.meshes);
+  for (const [, p] of v.parts) meshes.push(...p.meshes.filter((m) => m.visible));
   const hit = ray.intersectObjects(meshes, false)[0];
   const box = document.getElementById("selection");
   if (hit) {
@@ -399,11 +663,14 @@ renderer.domElement.addEventListener("pointerup", (e) => {
     box.style.display = "flex";
   } else {
     selected = null;
-    box.style.display = "none";
+    document.getElementById("selname").textContent = "";
+    const hidden = Array.from(v.parts.values()).some((p) => p.meshes.some((m) => !m.visible));
+    box.style.display = hidden ? "flex" : "none"; // keep Show all reachable after hiding the last part
   }
+  updateTools();
 });
 function showOnly(name) {
-  if (!model) return;
+  if (!interactive()) return;
   const [, v] = activeVariant();
   if (!v) return;
   for (const [n, p] of v.parts)
@@ -411,7 +678,7 @@ function showOnly(name) {
 }
 document.getElementById("selisolate").addEventListener("click", () => selected && showOnly(selected));
 document.getElementById("selhide").addEventListener("click", () => {
-  if (!model || !selected) return;
+  if (!interactive() || !selected) return;
   const [, v] = activeVariant();
   if (!v || !v.parts.get(selected)) return;
   for (const m of v.parts.get(selected).meshes) m.visible = false;
@@ -420,32 +687,40 @@ document.getElementById("selshow").addEventListener("click", () => showOnly(null
 
 // ---------- tools ----------
 document.getElementById("explode").addEventListener("input", (e) => {
-  explodeTarget = e.target.value / 100;
+  if (!interactive()) return;
+  const value = Number(e.target.value) / 100;
+  if (!amount(value)) return;
+  ++explodeRequest;
+  explodeTarget = value;
   if (reduced) applyExplode(explodeTarget, true);
 });
-document.getElementById("xraybtn").addEventListener("click", () => applyXray(!xrayOn));
+document.getElementById("xraybtn").addEventListener("click", () => {
+  if (interactive()) { ++xrayRequest; applyXray(!xrayOn); }
+});
 document.getElementById("prev").addEventListener("click", () => goStep(currentStep - 1, true));
 document.getElementById("next").addEventListener("click", () => goStep(currentStep + 1, true));
 document.getElementById("buildbtn").addEventListener("click", async (e) => {
-  const btn = e.currentTarget;
+  if (!manifest || e.currentTarget.disabled) return;
+  const btn = e.currentTarget, project = projectRequest;
+  rebuildPending = true;
   btn.disabled = true;
   setStale("rebuild queued");
   try {
-    const r = await fetch("/api/rebuild", { method: "POST", headers: { "Content-Type": "application/json" },
+    await api("/api/rebuild", { method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ project: current, tier: manifest.on_demand ? "certified" : "both" }) });
-    if (!r.ok) throw new Error(`worker returned ${r.status}`);
   } catch (err) {
-    document.getElementById("diag").textContent =
-      `Could not queue a rebuild: ${err.message || err}`;
-    document.getElementById("buildline").textContent = "";
+    if (project === projectRequest) {
+      document.getElementById("diag").textContent = `Could not queue a rebuild: ${err.message || err}`;
+      document.getElementById("buildline").textContent = "";
+    }
   } finally {
-    btn.disabled = false;
+    if (project === projectRequest) { rebuildPending = false; updateTools(); }
   }
 });
 document.getElementById("resetview").addEventListener("click", () => {
   if (!model || !model.bounds) return;
-  const b = model.bounds;
-  const center = new THREE.Vector3(...b.center);
+  const b = viewBounds(explodeTarget);
+  const center = b.center;
   const pos = center.clone().add(new THREE.Vector3(0.95, -1.35, 0.62)
     .normalize().multiplyScalar(fitDist(b.radius)));
   camera.near = Math.max(0.1, b.radius / 50);
@@ -460,71 +735,146 @@ window.addEventListener("keydown", (e) => {
 });
 
 // ---------- websocket: announces + agent commands ----------
-function connectWS() {
-  const ws = new WebSocket(`ws://${location.hostname}:${httpPort + 1000}`);
-  let wasOpen = false;
-  ws.onopen = () => {
-    wasOpen = true;
-    if (wsDown) {
-      wsDown = false;
-      document.getElementById("buildline").textContent = "";
+function validateProjects(value) {
+  if (!Array.isArray(value) || value.some((p) => !p || typeof p.name !== "string" ||
+      (p.state !== undefined && typeof p.state !== "string")) ||
+      new Set(value.map((p) => p.name)).size !== value.length)
+    throw new Error("invalid projects response");
+  return value;
+}
+function renderProjects() {
+  const nav = document.getElementById("projects");
+  nav.innerHTML = "";
+  for (const p of projects) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = p.name;
+    b.dataset.name = p.name;
+    b.setAttribute("aria-pressed", String(p.name === current));
+    b.addEventListener("click", () => loadProject(p.name));
+    nav.appendChild(b);
+  }
+}
+let commandRequest = 0, commandWork = Promise.resolve();
+async function runCommand(m) {
+  const project = projectRequest, request = ++commandRequest;
+  if ((m.step !== undefined || m.variant !== undefined || m.explode !== undefined || m.xray !== undefined) && !interactive())
+    throw new Error("view controls require a certified model");
+  if ((m.camera && ((m.camera.position !== undefined && !vector(m.camera.position)) ||
+                    (m.camera.target !== undefined && !vector(m.camera.target)))) ||
+      (m.explode !== undefined && !amount(m.explode)) ||
+      (m.xray !== undefined && typeof m.xray !== "boolean") ||
+      (m.variant !== undefined && typeof m.variant !== "string"))
+    throw new Error("invalid view command");
+  if (m.step !== undefined) {
+    const i = manifest.steps.findIndex((s) => s.id === m.step);
+    if (i < 0) throw new Error("unknown step");
+    if (!await goStep(i, true)) return;
+  }
+  if (project !== projectRequest || request !== commandRequest) return;
+  if (m.variant !== undefined && !await setVariant(m.variant)) return;
+  if (project !== projectRequest || request !== commandRequest) return;
+  if (m.explode !== undefined) { ++explodeRequest; explodeTarget = m.explode; applyExplode(m.explode, true); }
+  if (m.xray !== undefined) { ++xrayRequest; applyXray(m.xray); }
+  if (m.camera) tweenCamera(m.camera.position && new THREE.Vector3(...m.camera.position),
+                            m.camera.target && new THREE.Vector3(...m.camera.target));
+}
+async function handleMessage(m) {
+  if (!m || typeof m !== "object" || typeof m.type !== "string") throw new Error("invalid worker message");
+  if (m.type === "hello") {
+    ++projectsRequest; ++workerEpoch;
+    ++payloadRequests.preview; ++payloadRequests.certified;
+    projects = validateProjects(m.projects);
+    renderProjects();
+    if (!current || !projects.some((p) => p.name === current)) {
+      if (projects[0]) await loadProject(projects[0].name);
+      else showStageMsg("No projects configured", "");
+      return;
     }
+    // Hello is the reconnect snapshot: missed announcements must not leave an
+    // old hash or stale manifest on screen forever.
+    if (manifest) {
+      const name = current, project = projectRequest;
+      if (!await reloadManifest(name) || project !== projectRequest) return;
+      if (currentStep !== displayedStep) { currentStep = displayedStep; updateStepText(); }
+      const st = projects.find((p) => p.name === name);
+      if (st.hashes?.certified) await fetchPayload(name, "certified", st.hashes.certified);
+      if (project !== projectRequest) return;
+      if (st.hashes?.preview && st.state !== "gate-failed") await fetchPayload(name, "preview", st.hashes.preview);
+      if (project === projectRequest) reflectStatus(st);
+    }
+    return;
+  }
+  const st = projects.find((p) => p.name === m.project);
+  if (m.type === "announce") {
+    if (!["preview", "certified"].includes(m.tier) || typeof m.hash !== "string") throw new Error("invalid announcement");
+    if (st) { st.hashes = { ...(st.hashes || {}), [m.tier]: m.hash }; st.state = m.tier; }
+  } else if (m.type === "status") {
+    if (typeof m.state !== "string") throw new Error("invalid worker status");
+    if (st) { st.state = m.state; st.detail = m.detail; if (m.hashes) st.hashes = m.hashes; }
+  } else if (m.type === "gate_failed" && st) {
+    st.state = "gate-failed"; st.gates = m.gates;
+  } else if (m.type === "build_failed" && st) {
+    st.state = "error"; st.detail = m.detail || m.error;
+  }
+  if (m.project && m.project !== current) return;
+  const project = projectRequest;
+  if (m.type === "announce" && manifest) {
+    await fetchPayload(current, m.tier, m.hash);
+    if (project === projectRequest && st) reflectStatus(st);
+  } else if (m.type === "status") {
+    reflectStatus(st || m);
+  } else if (m.type === "gate_failed") {
+    gateFailed(m.gates);
+  } else if (m.type === "build_failed") {
+    reflectStatus(st || { state: "error", detail: m.detail || m.error });
+  } else if (m.type === "manifest") {
+    if (await reloadManifest() && project === projectRequest && interactive())
+      await goStep(currentStep < 0 ? 0 : currentStep, false);
+  } else if (m.type === "command") {
+    const work = runCommand(m);
+    commandWork = work;
+    try { await work; }
+    finally { if (commandWork === work) commandWork = Promise.resolve(); }
+  } else if (m.type === "screenshot" && m.project === current) {
+    await commandWork;
+    if (project !== projectRequest) return;
+    // Capture the settled command, not an intermediate camera/explode tween.
+    if (camAnim) {
+      if (camAnim.p1) camera.position.copy(camAnim.p1);
+      if (camAnim.t1) controls.target.copy(camAnim.t1);
+      camAnim = null;
+    }
+    applyExplode(explodeTarget, true);
+    controls.update();
+    renderer.render(scene, camera);
+    await api("/api/shot", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: m.id, project: current, data: renderer.domElement.toDataURL("image/png") }) });
+  }
+}
+let socketRequest = 0;
+function connectWS() {
+  const request = ++socketRequest;
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.hostname}:${httpPort + 1000}`);
+  ws.onopen = () => {
+    if (request !== socketRequest) return;
+    wsDown = false;
+    const line = document.getElementById("buildline");
+    if (line.textContent === "disconnected — reconnecting") line.textContent = "";
   };
   ws.onmessage = async (ev) => {
-    const m = JSON.parse(ev.data);
-    if (m.type === "announce" && m.project === current) {
-      const st = projects.find((p) => p.name === current);
-      if (st) { st.hashes = { ...(st.hashes || {}), [m.tier]: m.hash }; st.state = m.tier; }
-      // certified wins over preview when both are fresh
-      if (m.tier === "certified" || !shownHashes[current] || !shownHashes[current].certified) {
-        await fetchPayload(current, m.tier, m.hash);
-      }
-      document.getElementById("buildline").textContent = "";
-    } else if (m.type === "status" && m.project === current) {
-      if (m.state === "stale" || m.state.startsWith("building")) setStale(m.state.replace("-", " "));
-      if (m.state === "preview" || m.state === "certified") document.getElementById("buildline").textContent = "";
-    } else if (m.type === "gate_failed" && m.project === current) {
-      const el = document.getElementById("tierbadge");
-      el.textContent = "gate FAILED — showing last certified";
-      el.className = "badge bad";
-      document.getElementById("diag").textContent =
-        (m.gates.diagnostics || []).slice(0, 6).join("\n");
-    } else if (m.type === "build_failed" && m.project === current) {
-      document.getElementById("diag").textContent = "Build error: " + (m.detail || m.error);
-      setStale("build failed");
-    } else if (m.type === "manifest" && m.project === current) {
-      try {
-        manifest = await api(`/api/manifest?project=${current}`);
-        renderSteps();
-        const keep = currentStep;
-        currentStep = -1;
-        goStep(keep < 0 ? 0 : keep, false);
-      } catch (e) {
-        document.getElementById("diag").textContent =
-          `Could not reload ${current}: ${e.message || e}`;
-      }
-    } else if (m.type === "command" && (!m.project || m.project === current)) {
-      if (m.step !== undefined && manifest) {
-        const i = manifest.steps.findIndex((s) => s.id === m.step);
-        if (i >= 0) goStep(i, true);
-      }
-      if (m.camera) tweenCamera(m.camera.position && new THREE.Vector3(...m.camera.position),
-                                m.camera.target && new THREE.Vector3(...m.camera.target));
-      if (m.variant) setVariant(m.variant);
-      if (m.explode !== undefined) { explodeTarget = m.explode; if (reduced) applyExplode(m.explode, true); }
-      if (m.xray !== undefined) applyXray(!!m.xray);
-    } else if (m.type === "screenshot" && m.project === current) {
-      renderer.render(scene, camera);
-      const data = renderer.domElement.toDataURL("image/png");
-      await fetch("/api/shot", { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: m.id, project: current, data }) });
+    if (request !== socketRequest) return;
+    const project = projectRequest;
+    try { await handleMessage(JSON.parse(ev.data)); }
+    catch (e) {
+      if (project === projectRequest)
+        document.getElementById("diag").textContent = `Worker message failed: ${e.message || e}`;
     }
   };
   ws.onclose = () => {
-    if (wasOpen && !wsDown) {
-      wsDown = true;
-      document.getElementById("buildline").textContent = "disconnected — reconnecting";
-    }
+    if (request !== socketRequest) return;
+    wsDown = true;
+    document.getElementById("buildline").textContent = "disconnected — reconnecting";
     setTimeout(connectWS, 2000);
   };
 }
@@ -544,7 +894,6 @@ function resize() {
 }
 function tick(now) {
   requestAnimationFrame(tick);
-  resize();
   if (camAnim) {
     const k = Math.min(1, (now - camAnim.start) / camAnim.dur);
     const e = 1 - Math.pow(1 - k, 3);
@@ -564,32 +913,28 @@ function tick(now) {
 window.__cq = { camera, controls, scene, get model() { return model; }, goStep };
 
 // ---------- boot ----------
+resize();
+new ResizeObserver(resize).observe(stage);
+controls.addEventListener("start", () => { ++cameraRequest; camAnim = null; });
+updateTools();
+requestAnimationFrame(tick);
+connectWS();
 (async () => {
+  const request = ++projectsRequest;
   try {
-    projects = await api("/api/projects");
+    const value = validateProjects(await api("/api/projects"));
+    if (request !== projectsRequest) return;
+    projects = value;
   } catch (e) {
-    showStageMsg("Can't reach the CassQuery worker",
+    if (!current) showStageMsg("Can't reach the CassQuery worker",
       `Tried ${location.origin}/api/projects — is the worker running?`);
-    requestAnimationFrame(tick);
     return;
   }
+  renderProjects();
   if (!projects.length) {
     showStageMsg("No projects configured",
       "This worker was started without projects. Restart it with project " +
       "directories as arguments, or with CASSQUERY_PROJECTS set.");
   }
-  const nav = document.getElementById("projects");
-  for (const p of projects) {
-    const b = document.createElement("button");
-    b.type = "button";
-    b.textContent = p.name;
-    b.dataset.name = p.name;
-    b.setAttribute("aria-pressed", "false");
-    b.addEventListener("click", () => loadProject(p.name));
-    nav.appendChild(b);
-  }
-  connectWS();
-  const first = projects[0];
-  if (first) await loadProject(first.name);
-  requestAnimationFrame(tick);
+  if (!current && projects[0]) await loadProject(projects[0].name);
 })();

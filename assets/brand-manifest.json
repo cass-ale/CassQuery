@@ -1,0 +1,217 @@
+{
+  "schema": 1,
+  "brand": "Counterform",
+  "source": "branding/source/counterform.json",
+  "source_sha256": "d791479e0808c0abe27bd9f4a460bf29db814cc845c48b6d23ec504b73ac287b",
+  "labels_source": "branding/source/labels.json",
+  "labels_sha256": "c5c98be9a9cb8b9f4f52ce8726a468c07e2d00911005a6c75395c7b418518c18",
+  "generator": "tools/make_brand_assets.py",
+  "rasterizer": "Pillow 13.0.0, 4x supersampling",
+  "assets": [
+    {
+      "path": "assets/icons/cassquery-1024.png",
+      "bytes": 4195716,
+      "sha256": "fc7635a8cad91425bc06915fb590ee21a50690ea082f9e1525aa4c5f32e65fb7"
+    },
+    {
+      "path": "assets/icons/cassquery-128.png",
+      "bytes": 65737,
+      "sha256": "6e52b0e403070660d6d1de222027d9968d9d0911ab30ac659712853b6f45f9dc"
+    },
+    {
+      "path": "assets/icons/cassquery-16.png",
+      "bytes": 1108,
+      "sha256": "dc719cb1434c49402f240da1dc709e56f98f5f3d7083e35d7dc8a8bc3ee53c1f"
+    },
+    {
+      "path": "assets/icons/cassquery-24.png",
+      "bytes": 2396,
+      "sha256": "bf2bde7364b7cb3038f080a2840406d1c68239a199c0659f935a9b14b7ec27fe"
+    },
+    {
+      "path": "assets/icons/cassquery-256.png",
+      "bytes": 262488,
+      "sha256": "804ef4005a146fd54dc453e5b098ab053711d70289d408330078b921a89e372d"
+    },
+    {
+      "path": "assets/icons/cassquery-32.png",
+      "bytes": 4196,
+      "sha256": "72fd52f8efe710679403b8214116d4b39b254f76b7662af97723904ec4bf8762"
+    },
+    {
+      "path": "assets/icons/cassquery-48.png",
+      "bytes": 9332,
+      "sha256": "c51499546e543df53ef137b93d92397f1d3849421cce37e2e7d613942f1bffee"
+    },
+    {
+      "path": "assets/icons/cassquery-512.png",
+      "bytes": 1049236,
+      "sha256": "684ac69d7f70675125d2008a140f8a4fa30c37d3f012ed527075890e02a416bc"
+    },
+    {
+      "path": "assets/icons/cassquery-64.png",
+      "bytes": 16516,
+      "sha256": "c85216a8aa38adec93dbf0f4f0cc2a5f167dcd81c0124cd439090efc5266198f"
+    },
+    {
+      "path": "assets/icons/cassquery.icns",
+      "bytes": 6910869,
+      "sha256": "0df7a0d5db4a449782e810d73ae83be358c3634de5968c851212cb9099198976"
+    },
+    {
+      "path": "assets/icons/cassquery.ico",
+      "bytes": 361891,
+      "sha256": "3b48e32746ce291528b1a2e2896b9fe175cae55c586aeabf51183e2cd0cfc892"
+    },
+    {
+      "path": "assets/icons/cassquery.iconset/icon_128x128.png",
+      "bytes": 65737,
+      "sha256": "6e52b0e403070660d6d1de222027d9968d9d0911ab30ac659712853b6f45f9dc"
+    },
+    {
+      "path": "assets/icons/cassquery.iconset/icon_128x128@2x.png",
+      "bytes": 262488,
+      "sha256": "804ef4005a146fd54dc453e5b098ab053711d70289d408330078b921a89e372d"
+    },
+    {
+      "path": "assets/icons/cassquery.iconset/icon_16x16.png",
+      "bytes": 1108,
+      "sha256": "dc719cb1434c49402f240da1dc709e56f98f5f3d7083e35d7dc8a8bc3ee53c1f"
+    },
+    {
+      "path": "assets/icons/cassquery.iconset/icon_16x16@2x.png",
+      "bytes": 4196,
+      "sha256": "72fd52f8efe710679403b8214116d4b39b254f76b7662af97723904ec4bf8762"
+    },
+    {
+      "path": "assets/icons/cassquery.iconset/icon_256x256.png",
+      "bytes": 262488,
+      "sha256": "804ef4005a146fd54dc453e5b098ab053711d70289d408330078b921a89e372d"
+    },
+    {
+      "path": "assets/icons/cassquery.iconset/icon_256x256@2x.png",
+      "bytes": 1049236,
+      "sha256": "684ac69d7f70675125d2008a140f8a4fa30c37d3f012ed527075890e02a416bc"
+    },
+    {
+      "path": "assets/icons/cassquery.iconset/icon_32x32.png",
+      "bytes": 4196,
+      "sha256": "72fd52f8efe710679403b8214116d4b39b254f76b7662af97723904ec4bf8762"
+    },
+    {
+      "path": "assets/icons/cassquery.iconset/icon_32x32@2x.png",
+      "bytes": 16516,
+      "sha256": "c85216a8aa38adec93dbf0f4f0cc2a5f167dcd81c0124cd439090efc5266198f"
+    },
+    {
+      "path": "assets/icons/cassquery.iconset/icon_512x512.png",
+      "bytes": 1049236,
+      "sha256": "684ac69d7f70675125d2008a140f8a4fa30c37d3f012ed527075890e02a416bc"
+    },
+    {
+      "path": "assets/icons/cassquery.iconset/icon_512x512@2x.png",
+      "bytes": 4195716,
+      "sha256": "fc7635a8cad91425bc06915fb590ee21a50690ea082f9e1525aa4c5f32e65fb7"
+    },
+    {
+      "path": "assets/icons/cassquery.svg",
+      "bytes": 10740,
+      "sha256": "84f1c30d80e830f2ddea213d62ac675489a3c125abd4d27d6484b3be6b9d9cf9"
+    },
+    {
+      "path": "assets/icons/favicon-16.png",
+      "bytes": 1108,
+      "sha256": "99cc2429c2625fdef6633398fd66c8bf7617dc80cb39f577a75e106bbe721c09"
+    },
+    {
+      "path": "assets/icons/favicon-32.png",
+      "bytes": 4196,
+      "sha256": "96b0b10499d40fff940a3766fcd74a3017c3aab2d3cc887238bf8adbd621b5d3"
+    },
+    {
+      "path": "assets/icons/favicon.ico",
+      "bytes": 361891,
+      "sha256": "b71f777cd316ecb690c62e70094e3a587b30b62332a2aa6738127baa1e443eed"
+    },
+    {
+      "path": "assets/icons/favicon.svg",
+      "bytes": 5370,
+      "sha256": "b5fe34f958fd4a1af3279010eced35d554ccabdc39746daf50813ef215079e97"
+    },
+    {
+      "path": "branding/mark-dark.svg",
+      "bytes": 5422,
+      "sha256": "3ab08e7235bc51a0c74aa80f28ac290e4fcf8657893c1b34e2d908f026587f0a"
+    },
+    {
+      "path": "branding/mark-mono-dark.svg",
+      "bytes": 5325,
+      "sha256": "2f0956481bffe62ced9457fd11de8eb2a743edaa934e18c7154a1ecdb7733818"
+    },
+    {
+      "path": "branding/mark-mono.svg",
+      "bytes": 5325,
+      "sha256": "3c6f6f59c5e6f9e09290677b0320126ceae10749499474b0f9259f9eddbaceb7"
+    },
+    {
+      "path": "branding/mark.svg",
+      "bytes": 5422,
+      "sha256": "7b42c81a1fced013c645f75d6dd3b8b4d4766a943baec73cf99fa16f68355a32"
+    },
+    {
+      "path": "branding/readme-dark.png",
+      "bytes": 3584898,
+      "sha256": "3fd41f53db56dede610ec8b0f8d393ee54043355e91afbd86564160d13f98ff2"
+    },
+    {
+      "path": "branding/readme-dark.svg",
+      "bytes": 32747,
+      "sha256": "d40fe6687d859ce99cbe66b5fd3d198b1070ee210f69cbb292aade88902b8a02"
+    },
+    {
+      "path": "branding/readme-light.png",
+      "bytes": 3584898,
+      "sha256": "251530e3fa692730fa7aad631c0860cae488a7589a9b0c34051865660b692f0d"
+    },
+    {
+      "path": "branding/readme-light.svg",
+      "bytes": 32747,
+      "sha256": "28eee498e2c5eeff6d3be3cb6ad5636b43297338293dbead83d0e97bee6c3cb9"
+    },
+    {
+      "path": "branding/social-preview.png",
+      "bytes": 3024928,
+      "sha256": "6f6bf92428af8813a0328d33f757fd6f4c6be8ae3ec326cb993cc36e040645e7"
+    },
+    {
+      "path": "branding/social-preview.svg",
+      "bytes": 32005,
+      "sha256": "63e585c39994cde12c9903e69d5c35f17780873782d942f11c6af5597f3c6451"
+    },
+    {
+      "path": "branding/style-guide.png",
+      "bytes": 6529923,
+      "sha256": "1bf9bfd88cf325472bec798d2c71ba83c12517b1f6dc6cd730e6825691b25711"
+    },
+    {
+      "path": "branding/style-guide.svg",
+      "bytes": 97337,
+      "sha256": "bf5d95540fbe36fce49446cf18d55811454927005bf35888f72b220728241b24"
+    },
+    {
+      "path": "branding/wordmark-dark.svg",
+      "bytes": 11639,
+      "sha256": "ee1548abb2ce2643e9d44bf42e365408623077d908d45cc487616a2c15ef44ab"
+    },
+    {
+      "path": "branding/wordmark-light.svg",
+      "bytes": 11639,
+      "sha256": "ff6c0d3a72022ec0b2285a21ca44e8fc3e8a94f5339149261930d8d0329162b8"
+    },
+    {
+      "path": "viewer/brand.svg",
+      "bytes": 5325,
+      "sha256": "3c6f6f59c5e6f9e09290677b0320126ceae10749499474b0f9259f9eddbaceb7"
+    }
+  ]
+}

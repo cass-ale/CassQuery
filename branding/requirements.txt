@@ -1,0 +1,2 @@
+# Offline development-only raster export dependency; not shipped at runtime.
+Pillow==13.0.0

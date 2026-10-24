@@ -82,6 +82,22 @@ state changes are visible the moment they happen (a disconnect says so, a
 build in progress says so), no per-frame layout work, and a rebuild never
 confiscates the camera — direction survives, distance is recomputed.
 
+## Release and brand verification
+
+- `npm run preflight` runs real regressions, semantic release-input checks, and
+  byte-for-byte brand regeneration. Brand changes go through
+  `branding/source/` and `tools/make_brand_assets.py`, never edited exports.
+- `CASSQUERY_BROWSER=/path/to/chrome npm run test:visual` uses real browser
+  rendering and actual step clicks against the public TESTPLATE fixture;
+  inspect its frames. It is not live CAD or native Mac launch proof.
+- Source/frozen-worker smoke, native packaged renderer smoke, and final mounted/
+  copied DMG smoke are separate gates. A success in one does not imply another.
+- Candidate signing is explicitly ad-hoc/non-hardened. Do not claim Developer ID,
+  notarization or Gatekeeper acceptance. Do not bypass host sandbox failures.
+- Release readiness and every checked/not-checked gap live in `docs/AUDIT.md` and
+  `docs/MACOS_RELEASE.md`; preserve their distinctions rather than promising
+  first-attempt success.
+
 ## Repo hygiene
 
 Never commit: payloads for private projects, `evidence/`, `phase0/`,

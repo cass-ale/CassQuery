@@ -9,6 +9,10 @@ for package in ('cadquery', 'OCP', 'cadquery_ocp_proxy', 'websockets'):
     datas += d
     binaries += b
     hidden += h
+# SciPy 1.18 vendors array_api_compat under _external. PyInstaller 6.20's
+# scipy hook still names _lib; this current package dynamically imports .fft.
+# Keep the exact relocated import explicit rather than collecting all of SciPy.
+hidden.append('scipy._external.array_api_compat.numpy.fft')
 for folder in ('viewer', 'testpart'):
     datas.append((str(root / folder), folder))
 

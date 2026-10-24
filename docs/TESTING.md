@@ -8,7 +8,7 @@ source worker and Chromium viewer**, not for the packaged macOS application.
 ## Production-path integration
 
 Run from a Linux checkout with Python 3.12, the runtime dependency versions in
-`requirements-build.txt`, Node, `playwright-core`, and an explicitly
+`requirements-build.txt`, Node 22.2+ (for the built-in PNG CRC32 validator), `playwright-core`, and an explicitly
 installed Chrome/Chromium executable with a working Linux sandbox. The runner
 sets `chromiumSandbox: true` explicitly and has no sandbox-off fallback. No
 browser or Python dependency is
@@ -42,7 +42,12 @@ Four scenarios cross the actual production boundaries:
    announcement is emitted, and the viewer retains the last certified model.
 2. **Interaction ordering:** actual step buttons and arrow keys, delayed real
    lazy variant loading with rapid A–B–A input, X-ray material/depth-write changes,
-   range-keyboard explode transforms, and pointer raycast → Hide → Show all.
+   range-keyboard explode transforms, and pointer raycast → Hide → changed CAD
+   rebuild retaining the hidden part → Show all. A real `POST /api/view` carries
+   step, lazy variant, camera, explode and X-ray fields. An immediately requested
+   `POST /api/screenshot` must wait for that held real variant load; the renderer
+   sends the settled PNG to `/api/shot`, and the worker returns the actual saved
+   file. Invalid view camera input and an unrequested shot ID must return 400.
    Projecting a model coordinate chooses a pointer location; it does not invoke
    the viewer's selection or step functions.
 3. **Isolation and reconnect:** one malformed manifest cannot prevent two valid
@@ -70,7 +75,9 @@ Each run requires a new output directory. `integration-results.json` is schema
 1, with an explicit platform, source SHA-256s, scenario/check observations,
 received WebSocket frames, screenshot names/descriptions/SHA-256s, errors, and a
 process/listener cleanup ledger. Nonzero exit means failed or incomplete work.
-Every declared scenario and check is mandatory; no `--skip-*` options exist.
+Every declared scenario and check is mandatory (four scenarios, 22 checks); no
+`--skip-*` options exist. The protocol screenshot is the actual model canvas;
+the other required screenshots cover the full source viewport/document.
 
 The absolute deadline is four minutes, including cleanup, in addition to
 individual HTTP/browser waits. Graceful cancellation begins ten seconds before
@@ -100,7 +107,22 @@ positive three-vectors, part identities unique and complete, mesh-position and
 visibility arrays nonempty, and build times finite numbers rather than coerced
 strings. Contradictory observations, empty objects/arrays, and placeholder
 `fixture` evidence cannot be green. Typed parser fixtures in the contract tests
-are explicitly synthetic; they are not browser proof.
+are explicitly synthetic; they are not browser proof. PNG evidence must also be
+fully decodable RGB/RGBA capture data: bounded dimensions and decoded size,
+complete chunk framing and CRCs, contiguous IDAT, valid bounded deflate length
+and scanline filters, exact IEND, and dimensions matching the observation. A
+PNG signature plus a SHA-256 is insufficient. Parser fixtures generate valid
+RGB PNGs; signature-only junk, truncated images, bad CRC/deflate/filter data,
+unmatched dimensions and mismatched renderer/worker shot IDs/hashes must fail.
+
+`tests/test_viewer_motion.cjs` executes actual pinned Three/OrbitControls and
+viewer frame/tween/Reset/pointer source against public geometry. It covers
+returning drags without disabling stationary picking, orbit/pan inertia at
+programmatic camera boundaries, and small mm models at portrait/landscape
+aspects. Its DOM/renderer adapters prove geometry/state, not native GUI input.
+Viewer-state regressions also preserve per-variant hidden parts through a
+changed certified build and preview-failure fallback; new parts default visible
+and project changes clear inspection state.
 
 For an explicit negative runner test, use another new output directory and run
 `node tools/integration_suite.cjs --mutation`. This applies the omitted-boundary

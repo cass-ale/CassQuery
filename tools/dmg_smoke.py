@@ -9,8 +9,9 @@ import shutil
 import subprocess
 import tempfile
 
-from macos_smoke import (ROOT, architecture, checkpoint, file_evidence, inventory,
-                         require, run_smoke, sha256, verify_bundle, write_report)
+from macos_smoke import (ROOT, architecture, checked_bundle_inventory, checkpoint,
+                         file_evidence, inventory, require, run_smoke, sha256,
+                         verify_bundle, write_report)
 
 
 def check_launch(app, output, arch, version, baseline):
@@ -24,8 +25,10 @@ def check_launch(app, output, arch, version, baseline):
             'images': report['images'], 'matrix': report['matrix'], 'checked': report['checked']}
 
 
-def run_package(dmg, output, arch):
+def run_package(dmg, output, arch, *, checked_app, checked_inventory):
     dmg, output, arch = Path(dmg).resolve(), Path(output).resolve(), architecture(arch)
+    checked_app, checked_inventory = Path(checked_app), Path(checked_inventory)
+    require(not output.is_relative_to(checked_app.resolve()), 'Evidence must be outside checked app')
     version = json.loads((ROOT / 'package.json').read_text())['version']
     output.mkdir(parents=True, exist_ok=True)
     report = {'schema': 1, 'pass': False, 'source_sha': os.environ.get('GITHUB_SHA') or None,
@@ -35,12 +38,14 @@ def run_package(dmg, output, arch):
               'checkpoints': [checkpoint('package-start')], 'detach_attempted': False, 'detach_completed': False,
               'images': [], 'launches': {}}
     error = None
-    device, mount = None, None
-    scratch = Path(tempfile.mkdtemp(prefix='cq-dmg-'))
+    device, mount, scratch = None, None, None
     write_report(output / 'package.json', report)
     try:
         require(dmg.is_file() and dmg.stat().st_size > 0, 'Missing/empty final DMG')
         report['asset'] = file_evidence(dmg)
+        baseline, report['checked_inventory'] = checked_bundle_inventory(checked_app, checked_inventory, output)
+        report['checked_bundle_sha256'] = baseline['sha256']
+        scratch = Path(tempfile.mkdtemp(prefix='cq-dmg-'))
         subprocess.run(['hdiutil', 'verify', str(dmg)], check=True, timeout=120)
         mount = scratch / 'mounted'
         mount.mkdir()
@@ -64,8 +69,9 @@ def run_package(dmg, output, arch):
         report['mount']['info_evidence'] = file_evidence(output / 'mount-info.plist')
         report['checkpoints'].append(checkpoint('mounted'))
         app = mount / 'CassQuery.app'
-        _, baseline = verify_bundle(app, arch, version)
-        write_report(output / 'bundle-inventory.json', baseline)
+        _, mounted_inventory = verify_bundle(app, arch, version)
+        require(mounted_inventory == baseline, 'DMG app differs from source-checked prepackaged inventory')
+        write_report(output / 'bundle-inventory.json', mounted_inventory)
         report['bundle_inventory'] = file_evidence(output / 'bundle-inventory.json')
         copied = scratch / 'copied/CassQuery.app'
         copied.parent.mkdir()
@@ -76,9 +82,11 @@ def run_package(dmg, output, arch):
             report['launches'][label] = result
             report['images'].extend(result['images'])
             report['checkpoints'].append(checkpoint(f'{label}-launch-complete'))
+        require(inventory(checked_app) == baseline and sha256(checked_inventory) == report['checked_inventory']['sha256'], 'Source-checked app/inventory changed during package smoke')
         require(sha256(dmg) == report['asset']['sha256'], 'Final DMG bytes changed during smoke')
         report['checks'] = ['DMG verified', 'bundle ID/version/native architecture', 'bundle seal', 'mounted launch', 'copied launch']
-        report['checked'] = report['checks'] + ['exact final DMG SHA256', 'all embedded Mach-O and source/icon/resource parity',
+        report['checked'] = report['checks'] + ['exact final DMG SHA256', 'source-checked prepackaged inventory parity',
+                                               'all embedded Mach-O and source/icon/resource parity',
                                                'immutable mounted/copied byte-mode-symlink parity']
     except BaseException as exc:
         error = f'{type(exc).__name__}: {exc}'
@@ -96,10 +104,10 @@ def run_package(dmg, output, arch):
         try:
             # Never traverse/delete a volume whose detach failed; retain its exact
             # owned mount path for the operator rather than attempting a bypass.
-            if mount is None or report['detach_completed']:
+            if scratch is not None and (mount is None or report['detach_completed']):
                 shutil.rmtree(scratch)
-            report['temp_root_removed'] = not scratch.exists()
-            if scratch.exists():
+            report['temp_root_removed'] = scratch is None or not scratch.exists()
+            if scratch is not None and scratch.exists():
                 report['retained_temp_root'] = str(scratch)
         except Exception as exc:
             error = '; '.join(filter(None, [error, f'Cleanup failed: {exc}']))
@@ -121,8 +129,11 @@ def main():
     parser.add_argument('--dmg', required=True, type=Path)
     parser.add_argument('--arch', required=True, choices=('arm64', 'x86_64', 'x64'))
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--checked-app', required=True, type=Path)
+    parser.add_argument('--checked-inventory', required=True, type=Path)
     args = parser.parse_args()
-    print(json.dumps(run_package(args.dmg, args.output, args.arch), indent=2))
+    print(json.dumps(run_package(args.dmg, args.output, args.arch,
+                                 checked_app=args.checked_app, checked_inventory=args.checked_inventory), indent=2))
 
 
 if __name__ == '__main__':

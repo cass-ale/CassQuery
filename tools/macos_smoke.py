@@ -16,10 +16,11 @@ import tempfile
 import time
 import uuid
 
+from release_evidence import (NATIVE_CHECKS as CHECKS, validate_native_matrix,
+                              validate_native_renderer)
+
 ROOT = Path(__file__).resolve().parents[1]
-CHECKS = {'certified demo', 'gate pass', 'assembled step', 'exploded step', 'reset view',
-          'save updates rendered model', 'camera preserved on rebuild',
-          'failed gate restores certified model', 'no renderer diagnostics'}
+SHELL_FILES = ('shell/main.js', 'shell/renderer_config.cjs', 'shell/runtime.cjs', 'shell/smoke.cjs')
 MACHO_MAGIC = {bytes.fromhex(s) for s in ('feedface', 'cefaedfe', 'feedfacf', 'cffaedfe',
                                         'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca')}
 
@@ -78,12 +79,14 @@ def checkpoint(name):
 def inventory(app):
     """Only the explicitly supplied app, no symlink traversal; sized before hashing.
 
-    Current app: 2698 entries/1.37GB. Bounds reject accidental broad filesystem
+    Current app: 2699 records (including root)/1.37GB. Bounds reject accidental broad filesystem
     roots and unexpectedly expanded packages, rather than scanning them forever.
     """
-    app = Path(app).resolve()
+    app = Path(app)
+    require(not app.is_symlink(), 'Inventory requires a nonsymlink app root')
+    app = app.resolve()
     require(app.suffix == '.app' and (app / 'Contents/Info.plist').is_file(), 'Inventory requires an explicit app bundle')
-    entries, total = [], 0
+    entries, total = [(app, app.lstat())], 0
     for directory, dirs, files in os.walk(app, followlinks=False):
         for name in sorted(dirs + files):
             file = Path(directory) / name
@@ -91,22 +94,42 @@ def inventory(app):
             total += metadata.st_size if stat.S_ISREG(metadata.st_mode) else 0
             entries.append((file, metadata))
             require(len(entries) <= 10000 and total <= 4 * 1024**3, 'App inventory exceeds reviewed 10000-entry/4GiB scope')
+    # Check every link/type before hashing any bundle resource. A later unsafe
+    # entry must not authorize earlier reads through an out-of-bundle link.
+    for file, metadata in entries:
+        if stat.S_ISLNK(metadata.st_mode):
+            require(file.resolve().is_relative_to(app), f'Bundle symlink escapes app: {file}')
+            require(file.exists(), f'Dangling bundle symlink: {file}')
+        else:
+            require(stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode), f'Unsupported bundle entry: {file}')
     records = []
     for file, metadata in entries:
         record = {'path': file.relative_to(app).as_posix(), 'mode': stat.S_IMODE(metadata.st_mode)}
-        if file.is_symlink():
-            require(file.resolve().is_relative_to(app), f'Bundle symlink escapes app: {file}')
-            require(file.exists(), f'Dangling bundle symlink: {file}')
+        if stat.S_ISLNK(metadata.st_mode):
             record.update(kind='symlink', target=os.readlink(file))
         elif stat.S_ISDIR(metadata.st_mode):
             record['kind'] = 'directory'
         else:
-            require(stat.S_ISREG(metadata.st_mode), f'Unsupported bundle entry: {file}')
             record.update(kind='file', bytes=metadata.st_size, sha256=sha256(file))
         records.append(record)
     records.sort(key=lambda record: record['path'])
     digest = hashlib.sha256(json.dumps(records, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     return {'sha256': digest, 'entries': len(records), 'bytes': total, 'records': records}
+
+
+def checked_bundle_inventory(app, recorded_file, output):
+    """Bind the prepackaged app to its prior native inventory, retaining exact bytes."""
+    recorded_file = Path(recorded_file)
+    require(recorded_file.is_file() and not recorded_file.is_symlink()
+            and 0 < recorded_file.stat().st_size <= 8 * 1024 * 1024, 'Missing/invalid checked-app inventory')
+    with recorded_file.open('rb') as stream:
+        data = stream.read(8 * 1024 * 1024 + 1)
+    require(len(data) <= 8 * 1024 * 1024, 'Checked-app inventory exceeds bound')
+    baseline = json.loads(data)
+    require(inventory(app) == baseline, 'Checked app changed since its native inventory')
+    retained = Path(output) / 'checked-inventory.json'
+    retained.write_bytes(data)
+    return baseline, file_evidence(retained)
 
 
 def asar_contents(file, names):
@@ -139,7 +162,9 @@ def source_files(folder):
 
 
 def verify_bundle(app, arch, version):
-    app, arch = Path(app).resolve(), architecture(arch)
+    arch = architecture(arch)
+    tree = inventory(app)
+    app = Path(app).resolve()
     info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
     require(info.get('CFBundleIdentifier') == 'com.cassquery.desktop', 'Wrong bundle identity')
     require(info.get('CFBundleExecutable') == 'CassQuery', 'Wrong bundle executable')
@@ -159,13 +184,12 @@ def verify_bundle(app, arch, version):
     worker_source = resources / 'source/worker.py'
     require(sha256(worker_source) == sha256(ROOT / 'worker.py'), 'Packaged worker source mismatch')
     source.append(file_evidence(ROOT / 'worker.py'))
-    packed_names = ['package.json', 'shell/main.js', 'shell/runtime.cjs', 'shell/smoke.cjs', 'shell/renderer_config.cjs']
+    packed_names = ['package.json', *SHELL_FILES]
     packed = asar_contents(resources / 'app.asar', packed_names)
     require(json.loads(packed['package.json'])['version'] == version, 'Packed package version differs')
     for name in packed_names[1:]:
         require(packed[name] == (ROOT / name).read_bytes(), f'Packed shell source mismatch: {name}')
         source.append(file_evidence(ROOT / name))
-    tree = inventory(app)
     machos = []
     for entry in tree['records']:
         if entry['kind'] != 'file':
@@ -182,6 +206,14 @@ def verify_bundle(app, arch, version):
     require(expected.issubset({m['path'] for m in machos}), 'Missing native app/worker Mach-O')
     for relative in expected:
         require(os.access(app / relative, os.X_OK), f'Nonexecutable native binary: {relative}')
+    libraries = app / 'Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries'
+    driver, loader = libraries / 'libvk_swiftshader.dylib', libraries / 'libvulkan.dylib'
+    require(loader.is_symlink() and os.readlink(loader) == driver.name and driver.is_file()
+            and not driver.is_symlink() and loader.resolve() == driver.resolve(), 'Missing/invalid contained Vulkan discovery alias')
+    # Signing changes the reviewed archive driver bytes. Match the currently
+    # sealed driver, not its pre-sign hash used by the afterPack hook.
+    driver_record = next((entry for entry in tree['records'] if entry['path'] == driver.relative_to(app).as_posix()), {})
+    require(sha256(loader) == driver_record.get('sha256'), 'Vulkan loader alias differs from inventoried driver')
     subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True, timeout=120)
     return {'bundle_id': info['CFBundleIdentifier'], 'architecture': arch, 'version': version,
             'icon': file_evidence(icon), 'source_files': source, 'machos': machos,
@@ -200,75 +232,37 @@ def image_evidence(file):
 
 
 def validate_matrix(records):
-    required = {(theme, width, state) for theme in ('dark', 'light') for width in (450, 700, 1000, 1320) for state in ('assembled', 'apart')}
-    require(isinstance(records, list) and len(records) == len(required), 'Incomplete native matrix')
-    seen = set()
-    for row in records:
-        key = (row.get('theme'), row.get('width'), row.get('state'))
-        require(key in required and key not in seen and row.get('status') == 'checked', 'Invalid/duplicate/skipped matrix cell')
-        seen.add(key)
-        require(row.get('viewport') == [row['width'], 700] and row.get('realized_theme') == row['theme'], 'Unrealized native size/theme')
-        full_size = row.get('full_size')
-        require(isinstance(full_size, list) and len(full_size) == 2 and full_size[0] == row['width']
-                and type(full_size[1]) is int and full_size[1] >= 700
-                and isinstance(row.get('scroll_regions'), list) and type(row.get('vertical_scroll')) is bool, 'Missing full-document/scroll geometry')
-        require(type(row.get('vertices')) is int and row['vertices'] > 0 and type(row.get('meshes')) is int and row['meshes'] > 0
-                and type(row.get('controls_checked')) is int and row['controls_checked'] > 0, 'Zero native coverage')
-        for key_name in ('clipped', 'nonfinite'):
-            require(type(row.get(key_name)) is int and row[key_name] == 0, f'Bad native projection: {key_name}')
-        require(row.get('overflow') is False and row.get('bad') == [] and row.get('overlaps') == [] and row.get('errors') == []
-                and row.get('diag') == '' and row.get('tier') == 'certified' and row.get('gates_pass') is True, 'Native layout/renderer failure')
-        require(row.get('step_pressed') == (['true', 'false'] if row['state'] == 'assembled' else ['false', 'true'])
-                and row.get('explode') == ('0%' if row['state'] == 'assembled' else '100%'), 'Wrong production state')
-        canvas = row.get('canvas', {})
-        require(all(type(canvas.get(k)) in (int, float) and canvas[k] > 0 for k in ('width', 'height', 'client_width', 'client_height')), 'Zero native canvas')
-    for width in (450, 700, 1000, 1320):
-        colors = [r.get('background') for r in records if r['width'] == width and r['state'] == 'assembled']
-        require(len(colors) == 2 and all(colors) and colors[0] != colors[1], 'Theme style did not change')
+    try:
+        validate_native_matrix(records)
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
 
 
 def validate_renderer(report, output, challenge, pid, app, version, arch, started, finished, *, bundled):
-    require(type(report.get('schema')) is int and report['schema'] == 1 and report.get('pass') is True, 'Packaged renderer failed')
-    require(report.get('challenge') == challenge and type(report.get('app_pid')) is int and report['app_pid'] == pid, 'Stale/unrelated renderer evidence')
-    require(type(report.get('worker_pid')) is int and report['worker_pid'] > 0 and report['worker_pid'] != pid, 'Missing worker process evidence')
-    require(report.get('packaged') is True and report.get('bundled_worker') is True and report.get('worker_shutdown') is True, 'Missing packaged worker/shutdown proof')
-    require(report.get('version') == version and report.get('architecture') == arch, 'Renderer architecture/version mismatch')
-    require(report.get('source_sha') == (os.environ.get('GITHUB_SHA') or None), 'Renderer source SHA mismatch')
+    try:
+        validate_native_renderer(report, expected_sha=os.environ.get('GITHUB_SHA') or None,
+                                 expected_arch=arch, expected_version=version, bundled=bundled,
+                                 started=started, finished=finished)
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+    require(report.get('challenge') == challenge and report['app_pid'] == pid, 'Stale/unrelated renderer evidence')
+    source = {'files': [{'bytes': (ROOT / name).stat().st_size, 'path': name, 'sha256': sha256(ROOT / name)} for name in SHELL_FILES]}
+    source['fingerprint'] = hashlib.sha256(json.dumps(source, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    require(report.get('native_source') == source, 'Raw native shell source differs from checked source')
+    requested = os.environ.get('CASSQUERY_ANGLE', '')
+    expected_backend = f'{requested}-requested' if requested else 'desktop-default'
+    require(report.get('render_backend_requested') == expected_backend, 'Renderer backend request differs from actual launch')
+    if requested == 'swiftshader':
+        observed = report.get('graphics', {}).get('webgl', {}).get('unmasked_renderer')
+        require(isinstance(observed, str) and 'swiftshader' in observed.casefold(), 'Requested SwiftShader was not observed in actual WebGL telemetry')
     resources = (Path(app) / 'Contents/Resources').resolve()
-    require(Path(report.get('resources_path', '')).resolve() == resources
-            and Path(report.get('worker_executable', '')).resolve() == resources / 'worker/cassquery-worker', 'Wrong worker/resources executable')
-    require(report.get('errors') == [], 'Renderer diagnostics')
-    marks = [report.get('started', {}), *report.get('checkpoints', []), report.get('finished', {})]
-    require(len(marks) >= 8 and all(type(m.get('monotonic_ms')) in (int, float) and type(m.get('wall_time_ms')) in (int, float) for m in marks), 'Missing checkpoint times')
-    monotonic = [m['monotonic_ms'] for m in marks]
-    require(all(started['monotonic_ms'] <= value <= finished['monotonic_ms'] for value in monotonic)
-            and all(a < b for a, b in zip(monotonic, monotonic[1:])), 'Stale/nonmonotonic checkpoint evidence')
-    require(all(started['wall_time_ms'] - 1000 <= m['wall_time_ms'] <= finished['wall_time_ms'] + 1000 for m in marks), 'Stale wall-time checkpoint evidence')
-    names = [m.get('name') for m in report.get('checkpoints', [])]
-    required_marks = {'renderer-start', 'certified-ready', 'production-controls', 'native-matrix', 'renderer-complete', 'worker-shutdown'}
-    if not bundled:
-        required_marks |= {'save-certified', 'failed-gate-retained'}
-    require(required_marks.issubset(names) and len(names) == len(set(names)), 'Missing/duplicate required checkpoints')
-    lifecycle = report.get('lifecycle', {})
-    require(lifecycle.get('pass') is True and lifecycle.get('close_reopen') is True and type(lifecycle.get('secondary_exit')) is int and lifecycle['secondary_exit'] == 0
-            and type(lifecycle.get('secondary_pid')) is int and lifecycle['secondary_pid'] > 0
-            and lifecycle.get('second_instance_events') == 1 and lifecycle.get('worker_pid_before') == report['worker_pid']
-            and lifecycle.get('worker_pid_after') == report['worker_pid'], 'Missing native lifecycle evidence')
-    if not bundled:
-        require(set(report.get('checks', [])) == CHECKS and len(report['checks']) == 9, 'Incomplete legacy renderer checks')
-    else:
-        require('bundled default certified demo' in report.get('checks', []), 'Missing default launch check')
-        status = report.get('worker_status', {})
-        projects = status.get('projects', [])
-        require(status.get('api_version') == 2 and status.get('load_errors') == [] and len(projects) == 1
-                and projects[0].get('name') == 'TESTPLATE', 'Invalid bundled worker status')
-        require(Path(projects[0].get('root', '')).resolve() == resources / 'worker/_internal/testpart', 'Default launch did not use frozen bundled demo')
-    validate_matrix(report.get('matrix'))
+    require(Path(report['resources_path']).resolve() == resources
+            and Path(report['worker_executable']).resolve() == resources / 'worker/cassquery-worker', 'Wrong worker/resources executable')
+    if bundled:
+        require(Path(report['worker_status']['projects'][0]['root']).resolve() == resources / 'worker/_internal/testpart', 'Default launch did not use frozen bundled demo')
     expected = [output / 'assembled.png', output / 'apart.png']
     require(report.get('screenshots') == [str(file) for file in expected], 'Wrong legacy screenshot paths')
-    images = report.get('images', [])
-    supplements = sum(bool(row.get('scroll_regions')) for row in report['matrix'])
-    require(len(images) == 18 + supplements + (2 if not bundled else 0), 'Incomplete image evidence')
+    images = report['images']
     seen = set()
     for image in images:
         file = Path(image.get('path', ''))
@@ -372,15 +366,16 @@ def renderer_environment(base):
     result.pop('CASSQUERY_SOFTWARE_GL', None)
     result.pop('CASSQUERY_ANGLE', None)
     requested = os.environ.get('CASSQUERY_ANGLE', '')
-    require(not os.environ.get('CASSQUERY_SOFTWARE_GL'), 'Native macOS smoke must not force Vulkan SwiftShader')
-    require(requested in ('', 'metal'), 'Unsupported native macOS ANGLE backend')
+    require(not os.environ.get('CASSQUERY_SOFTWARE_GL'), 'Native macOS smoke must not use the legacy software-GL override')
+    require(requested in ('', 'metal', 'swiftshader'), 'Unsupported native macOS ANGLE backend')
     if requested:
         result['CASSQUERY_ANGLE'] = requested
-    return result, ('metal-requested' if requested else 'desktop-default')
+    return result, (f'{requested}-requested' if requested else 'desktop-default')
 
 
 def run_smoke(app, output, arch, signed=False):
-    app, output, arch = Path(app).resolve(), Path(output).resolve(), architecture(arch)
+    supplied_app = Path(app)
+    app, output, arch = supplied_app.resolve(), Path(output).resolve(), architecture(arch)
     version = json.loads((ROOT / 'package.json').read_text())['version']
     report = {'schema': 1, 'pass': False, 'source_sha': os.environ.get('GITHUB_SHA') or None,
               'version': version, 'architecture': arch, 'checked': [], 'not_checked': [],
@@ -390,6 +385,7 @@ def run_smoke(app, output, arch, signed=False):
     output.mkdir(parents=True, exist_ok=True)
     write_report(output / 'renderer.json', report)
     try:
+        require(not supplied_app.is_symlink(), 'Native smoke requires a nonsymlink app root')
         identity, before = verify_bundle(app, arch, version)
         write_report(output / 'bundle-before.json', before)
         report['bundle'] = identity

@@ -603,3 +603,57 @@ test('crease conversion failure disposes provisional resources and retains displ
   assert.ok(h.geometries.slice(geometryCount).every((g) => g.disposals === 1));
   assert.ok(h.materials.slice(materialCount).every((m) => m.disposals === 1));
 });
+
+test('changed certified geometry preserves hidden parts and Show all, including preview fallback', async () => {
+  const h = harness(); await h.prepare();
+  const canvas = h.eval('renderer.domElement'), mesh = h.eval('activeVariant()[1].parts.get("Base").meshes[0]');
+  h.setHits([{ object: mesh }]);
+  await canvas.fire('pointerdown', { button: 0, pointerId: 1, clientX: 20, clientY: 20 });
+  await canvas.fire('pointerup', { button: 0, pointerId: 1, clientX: 20, clientY: 20 });
+  await h.node('selhide').fire('click');
+  const next = fixture('TESTPLATE', 'certified', 1, ['neutral'], 3); h.put(next); h.context.nextHash = next.index.hash;
+  await h.eval('fetchPayload(current, "certified", nextHash)');
+  assert.equal(h.eval('activeVariant()[1].parts.get("Base").meshes[0].visible'), false);
+  assert.equal(h.node('selection').style.display, 'flex');
+  const preview = fixture('TESTPLATE', 'preview', 2, ['neutral'], 4); h.put(preview); h.context.nextHash = preview.index.hash;
+  await h.eval('fetchPayload(current, "preview", nextHash)');
+  h.eval('gateFailed({ diagnostics: [] })');
+  assert.equal(h.eval('activeVariant()[1].parts.get("Base").meshes[0].visible'), false);
+  assert.equal(h.node('selection').style.display, 'flex');
+  await h.node('selshow').fire('click');
+  assert.equal(h.eval('activeVariant()[1].parts.get("Base").meshes[0].visible'), true);
+});
+
+test('rebuild preserves inactive variant visibility when it loads lazily; new parts remain visible', async () => {
+  const h = harness(); await h.prepare(fixture('TESTPLATE', 'certified', 0, ['neutral', 'pose']));
+  await h.eval('goStep(1, false)');
+  const canvas = h.eval('renderer.domElement'), mesh = h.eval('activeVariant()[1].parts.get("Base").meshes[0]');
+  h.setHits([{ object: mesh }]);
+  await canvas.fire('pointerdown', { button: 0, pointerId: 1, clientX: 20, clientY: 20 });
+  await canvas.fire('pointerup', { button: 0, pointerId: 1, clientX: 20, clientY: 20 });
+  await h.node('selhide').fire('click'); await h.eval('goStep(0, false)');
+  const next = fixture('TESTPLATE', 'certified', 1, ['neutral', 'pose'], 3);
+  const meta = next.index.variants.pose, value = JSON.parse(next.routes.get(meta.url));
+  value.parts.push({ ...value.parts[0], name: 'New part' });
+  const text = JSON.stringify(value); meta.hash = hash(text);
+  next.index.hash = hash(Object.keys(next.index.variants).sort().map((v) => next.index.variants[v].hash).join(''));
+  next.routes.set(meta.url, text); next.routes.set('/payload/TESTPLATE-certified.json', JSON.stringify(next.index));
+  h.put(next); h.context.nextHash = next.index.hash;
+  await h.eval('fetchPayload(current, "certified", nextHash)');
+  assert.equal(h.eval('model.variants.has("pose")'), false);
+  await h.eval('goStep(1, false)');
+  assert.equal(h.eval('activeVariant()[1].parts.get("Base").meshes[0].visible'), false);
+  assert.equal(h.eval('activeVariant()[1].parts.get("New part").meshes[0].visible'), true);
+  assert.equal(h.node('selection').style.display, 'flex');
+  h.routes.set('/api/manifest?project=SECOND', manifestFor('SECOND'));
+  const second = fixture('SECOND'); h.put(second); h.context.secondProject = { name: 'SECOND', hashes: { certified: second.index.hash } };
+  h.eval('projects.push(secondProject)'); await h.eval('loadProject("SECOND")');
+  assert.equal(h.eval('activeVariant()[1].parts.get("Base").meshes[0].visible'), true);
+});
+
+test('visibility uses variant identity without object-prototype aliases', async () => {
+  const h = harness(); await h.prepare(fixture('TESTPLATE', 'certified', 0, ['neutral', 'constructor', 'toString']));
+  assert.equal(await h.eval('goStep(1, false)'), true);
+  assert.equal(await h.eval('goStep(2, false)'), true);
+  assert.equal(h.node('diag').textContent, '');
+});

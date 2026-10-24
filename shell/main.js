@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, nativeTheme } = require('electron');
+const { app, BrowserWindow, Menu, nativeTheme, screen } = require('electron');
 const { configureRenderer } = require('./renderer_config.cjs');
 const renderBackendRequested = configureRenderer(app.commandLine, process.platform, process.env);
 const fs = require('fs');
@@ -153,14 +153,29 @@ async function createWindow() {
 
 async function runNativeSmoke(win) {
   const { spawn } = require('node:child_process');
-  const { smoke, waitFor, checkpoint } = require('./smoke.cjs');
+  const { smoke, waitFor, checkpoint, closeWindow, evaluate, bounded } = require('./smoke.cjs');
   const output = process.env.CASSQUERY_SMOKE_DIR;
   const report = { schema: 1, pass: false, checkpoints: [], errors: [] };
   const ownedWorker = worker;
   try {
     if (!app.isPackaged) throw new Error('Native assurance requires the packaged Electron app');
+    const crypto = require('node:crypto');
+    const files = ['main.js', 'renderer_config.cjs', 'runtime.cjs', 'smoke.cjs'].map((name) => {
+      const bytes = fs.readFileSync(path.join(__dirname, name));
+      return { bytes: bytes.length, path: `shell/${name}`, sha256: crypto.createHash('sha256').update(bytes).digest('hex') };
+    });
+    // Sorted paths and lexically ordered keys: a plain canonical, fresh executed-shell fingerprint.
+    report.native_source = { files, fingerprint: crypto.createHash('sha256').update(JSON.stringify({ files })).digest('hex') };
+    const display = screen.getDisplayMatching(win.getBounds());
+    report.graphics = { runtime: { electron: process.versions.electron, chromium: process.versions.chrome,
+      node: process.versions.node, platform: process.platform, architecture: process.arch },
+      display: { bounds: display.bounds, work_area: display.workArea, scale_factor: display.scaleFactor,
+        window_bounds: win.getBounds() } };
+    report.graphics.gpu = await bounded(() => app.getGPUInfo('complete'), 10000, 'Native GPU telemetry');
+    const { readRendererContext } = require('./renderer_config.cjs');
+    report.graphics.webgl = await evaluate(win, `(${readRendererContext.toString()})()`);
     await waitFor(win, 'window.__cq?.model?.tier === "certified" && window.__cq.model.gates?.pass');
-    const hash = await win.webContents.executeJavaScript('__cq.model.hash');
+    const hash = await evaluate(win, '__cq.model.hash');
     const beforeSecond = secondInstances;
     const secondary = spawn(process.execPath, [], { env: process.env, stdio: 'ignore' });
     const secondaryExit = await new Promise((resolve, reject) => {
@@ -170,11 +185,10 @@ async function runNativeSmoke(win) {
     });
     if (secondaryExit !== 0 || secondInstances !== beforeSecond + 1 || worker !== ownedWorker)
       throw new Error('Single-instance process/worker ownership failed');
-    win.close();
-    if (!win.isDestroyed()) throw new Error('Native close did not destroy the window');
+    await closeWindow(win);
     if (worker !== ownedWorker || worker.exitCode !== null) throw new Error('Closing Mac window killed warm worker');
     app.emit('activate');
-    await Promise.resolve(opening);
+    await bounded(() => Promise.resolve(opening), 30000, 'Native reopen');
     const reopened = window;
     if (!reopened || reopened === win || reopened.isDestroyed()) throw new Error('Activation did not reopen the window');
     await waitFor(reopened, `window.__cq?.model?.tier === 'certified' && window.__cq.model.hash === ${JSON.stringify(hash)}`);
@@ -183,8 +197,8 @@ async function runNativeSmoke(win) {
       second_instance_events: secondInstances - beforeSecond, close_reopen: true,
       worker_pid_before: ownedWorker.pid, worker_pid_after: worker.pid,
       method: 'real secondary process; BrowserWindow.close; production activate handler; same live worker' };
-    Object.assign(report, await smoke(reopened, output, { nativeTheme, errors: rendererErrors, evidence: report }));
     report.lifecycle = lifecycle;
+    Object.assign(report, await smoke(reopened, output, { nativeTheme, errors: rendererErrors, evidence: report }));
   } catch (error) { report.pass = false; report.error = error.stack || String(error); }
   report.schema = 1;
   report.worker_pid = ownedWorker?.pid;
@@ -210,9 +224,9 @@ function finishSmokeReport(shutdownError = null) {
   const { checkpoint } = require('./smoke.cjs');
   const { report, output } = pendingSmokeReport;
   report.errors = [...rendererErrors];
-  if (report.errors.length) { report.pass = false; report.error = 'Renderer diagnostics through shutdown'; }
+  if (report.errors.length) { report.pass = false; report.error ||= 'Renderer diagnostics through shutdown'; }
   report.worker_shutdown = !shutdownError;
-  if (shutdownError) { report.pass = false; report.error = String(shutdownError); }
+  if (shutdownError) { report.pass = false; report.error ||= String(shutdownError); report.shutdown_error = String(shutdownError); }
   report.checkpoints.push(checkpoint('worker-shutdown'));
   report.finished = checkpoint('app-complete');
   fs.mkdirSync(output, { recursive: true });

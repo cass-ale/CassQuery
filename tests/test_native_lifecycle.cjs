@@ -1,0 +1,123 @@
+'use strict';
+// Synthetic callback/state regressions. These are not native OS or packaged-app proof.
+const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),os=require('node:os'),vm=require('node:vm');
+const {EventEmitter}=require('node:events');
+const {test}=require('node:test');
+const api=require('../shell/smoke.cjs');
+const graphics=require('../shell/renderer_config.cjs');
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+test('normal close waits for actual closed; veto/throw/already-dead/false-closed stay red with no destroy bypass',async()=>{
+ for(const mode of ['immediate','pending','veto','throw','false-closed','already-dead']){
+  const win=new EventEmitter();let dead=mode==='already-dead',destroyCalls=0;
+  win.isDestroyed=()=>dead;win.destroy=()=>{destroyCalls++;throw Error('destroy forbidden');};
+  win.close=()=>{const closed=()=>{dead=mode!=='false-closed';win.emit('closed');};if(mode==='immediate'||mode==='false-closed')closed();if(mode==='pending')setTimeout(closed,5);if(mode==='throw')throw Error('close sentinel');};
+  if(mode==='immediate'||mode==='pending')await api.closeWindow(win,30);else await assert.rejects(api.closeWindow(win,30));
+  assert.equal(win.listenerCount('closed'),0);assert.equal(destroyCalls,0);
+ }
+});
+test('pending execution and late true result cannot exceed the budget and be graded ready',async()=>{
+ const pending={isDestroyed:()=>false,webContents:{executeJavaScript:()=>new Promise(()=>{})}};
+ await assert.rejects(api.waitFor(pending,'true',20),/timed out/);
+ const late={isDestroyed:()=>false,webContents:{executeJavaScript:()=>{const end=performance.now()+30;while(performance.now()<end){}return Promise.resolve(true);}}};
+ await assert.rejects(api.waitFor(late,'true',10),/exceeded its deadline/);
+ const errors={...pending,cassqueryRendererErrors:['late page error']};await assert.rejects(api.waitFor(errors,'true'),/late page error/);
+});
+test('capture timeouts/failures release only owned debugger attachment',async()=>{
+ let code=fs.readFileSync(path.join(__dirname,'../shell/smoke.cjs'),'utf8').replace('timeoutMs = 10000','timeoutMs = 20');
+ code=code.replace("}), 15000, 'Native screenshot capture')","}), 20, 'Native screenshot capture')");
+ for(const mode of ['execution','cdp','reject','owned']){
+  const context=vm.createContext({require,process,setTimeout,clearTimeout,Buffer,module:{exports:{}}});vm.runInContext(code+'\nglobalThis.capture=capture;',context);
+  let attached=mode==='owned',attachments=0,detachments=0;
+  const debuggerAPI={isAttached:()=>attached,attach:()=>{attached=true;attachments++;},detach:()=>{attached=false;detachments++;},sendCommand:()=>mode==='reject'?Promise.reject(Error('CDP sentinel')):new Promise(()=>{})};
+  const win={webContents:{debugger:debuggerAPI,executeJavaScript:()=>mode==='execution'?new Promise(()=>{}):Promise.resolve({width:100,height:100})}};
+  await assert.rejects(context.capture(win,'/never-written.png',20));
+  assert.equal(attachments,mode==='owned'?0:1);assert.equal(detachments,mode==='owned'?0:1);assert.equal(attached,mode==='owned');
+ }
+});
+
+async function mainFixture({closeMode='pending',failSmoke=false,lateError=false,shutdownError=false}={}){
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'cq-lifecycle-unit-'));
+ const app=new EventEmitter(),windows=[];let context,doneResolve;const done=new Promise(r=>{doneResolve=r;});
+ Object.assign(app,{commandLine:{appendSwitch(){}},isPackaged:true,getVersion:()=> '0.1.0',getPath:()=>directory,requestSingleInstanceLock:()=>true,whenReady:()=>new Promise(()=>{}),getGPUInfo:async()=>({auxAttributes:{glRenderer:'synthetic'}}),exit:()=>doneResolve()});
+ app.quit=()=>{if(lateError)windows[0].webContents.emit('console-message',{level:'error',message:'old page diagnostic'});app.emit('before-quit',{preventDefault(){}});if(vm.runInContext('shutdownComplete',context))doneResolve();};
+ class Win extends EventEmitter{
+  constructor(){super();this.dead=false;windows.push(this);this.webContents=new EventEmitter();Object.assign(this.webContents,{setWindowOpenHandler(){},session:{setPermissionRequestHandler(){}},executeJavaScript:async source=>source==='__cq.model.hash'?'a'.repeat(16):source.includes('readRendererContext')?{context:'webgl2',is_context_lost:false}:true});}
+  isDestroyed(){return this.dead;}getBounds(){return{x:0,y:0,width:1320,height:880};}show(){}focus(){}loadURL(){return Promise.resolve();}
+  close(){if(closeMode==='veto')return;const closed=()=>{this.dead=true;this.emit('closed');};if(closeMode==='pending')setTimeout(closed,5);else closed();}
+  destroy(){throw Error('destroy forbidden');}
+ }
+ const worker=Object.assign(new EventEmitter(),{pid:100,exitCode:null,signalCode:null});
+ const req=name=>{
+  if(name==='electron')return{app,BrowserWindow:Win,Menu:{},nativeTheme:{},screen:{getDisplayMatching:()=>({bounds:{width:1920,height:1080},workArea:{width:1920,height:1080},scaleFactor:1})}};
+  if(name==='./renderer_config.cjs')return graphics;
+  if(name==='./runtime.cjs')return{stopWorker:async()=>{worker.exitCode=0;if(shutdownError)throw Error('shutdown sentinel');}};
+  if(name==='./smoke.cjs')return{...api,closeWindow:win=>api.closeWindow(win,30),smoke:async(_w,_d,{evidence})=>{if(failSmoke)throw Error('primary smoke sentinel');evidence.pass=true;return evidence;}};
+  if(name==='node:child_process')return{spawn:()=>{const secondary=Object.assign(new EventEmitter(),{pid:101,kill(){}});setImmediate(()=>{app.emit('second-instance');secondary.emit('exit',0);});return secondary;}};
+  return require(name);
+ };
+ context=vm.createContext({require:req,console:{error(){}},AbortController,setTimeout,clearTimeout,process:{env:{CASSQUERY_SMOKE_DIR:directory},platform:process.platform,arch:process.arch,versions:process.versions,pid:99,resourcesPath:'/synthetic',execPath:'/synthetic/app',hrtime:process.hrtime},__dirname:path.join(__dirname,'../shell')});
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../shell/main.js'),'utf8')+'\nglobalThis.audit={runNativeSmoke,openWindow,getWindow:()=>window,setWorker:w=>{worker=w;workerPort=3939;smokeStarted=true;tried.python="/synthetic/worker/cassquery-worker";}};',context);
+ try{context.audit.setWorker(worker);await context.audit.openWindow();await context.audit.runNativeSmoke(context.audit.getWindow());await done;const report=JSON.parse(fs.readFileSync(path.join(directory,'renderer-raw.json'),'utf8'));return{report,windows};}
+ finally{fs.rmSync(directory,{recursive:true,force:true});}
+}
+test('capture uses one absolute budget across dimensions and native CDP phases',async()=>{
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'cq-capture-budget-'));
+ try{
+  const bytes=Buffer.alloc(1200);Buffer.from('89504e470d0a1a0a','hex').copy(bytes);bytes.writeUInt32BE(100,16);bytes.writeUInt32BE(100,20);
+  for(const [phaseMs,pass] of [[30,true],[65,false]]){
+   let attached=false,detached=0;const file=path.join(directory,`phase-${phaseMs}.png`);
+   const debuggerAPI={isAttached:()=>attached,attach:()=>{attached=true;},detach:()=>{attached=false;detached++;},sendCommand:async()=>{await sleep(phaseMs);return{data:bytes.toString('base64')};}};
+    const win={webContents:{debugger:debuggerAPI,executeJavaScript:async expression=>{if(expression.includes('decodeVisibleImages'))return;await sleep(phaseMs);return{width:100,height:100};}}};
+   if(pass){const image=await api.capture(win,file,100);assert.equal(image.width,100);assert.equal(fs.existsSync(file),true);}
+   else{await assert.rejects(api.capture(win,file,100),/timed out|deadline/);assert.equal(fs.existsSync(file),false);}
+   assert.equal(attached,false);assert.equal(detached,1);
+  }
+ }finally{fs.rmSync(directory,{recursive:true,force:true});}
+});
+
+test('capture waits pending image decode but rejects broken rendered images without native screenshot output',async()=>{
+ const code=fs.readFileSync(path.join(__dirname,'../shell/smoke.cjs'),'utf8');
+ for(const mode of ['healthy','pending','broken','decode-rejected','hidden-broken']){
+  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'cq-image-capture-'));let decodeCalls=0,sendCalls=0,detached=0,attached=false;
+  const image={src:'/brand.svg',currentSrc:'/brand.svg',complete:mode!=='pending',naturalWidth:mode==='broken'||mode==='hidden-broken'?0:100,naturalHeight:mode==='broken'||mode==='hidden-broken'?0:100,parentElement:null,
+   getBoundingClientRect:()=>({width:40,height:40}),decode:async()=>{decodeCalls++;if(mode==='decode-rejected')throw Error('bad decoder');if(mode==='pending'){await sleep(15);image.complete=true;image.naturalWidth=image.naturalHeight=100;}}};
+  const context=vm.createContext({require,process,setTimeout,clearTimeout,Buffer,module:{exports:{}},document:{images:[image]},getComputedStyle:()=>({visibility:'visible',display:mode==='hidden-broken'?'none':'block'})});
+  vm.runInContext(code+'\nglobalThis.decodeVisibleImages=decodeVisibleImages;',context);
+  const bytes=Buffer.alloc(1200);Buffer.from('89504e470d0a1a0a','hex').copy(bytes);bytes.writeUInt32BE(100,16);bytes.writeUInt32BE(100,20);
+  const debuggerAPI={isAttached:()=>attached,attach:()=>{attached=true;},detach:()=>{attached=false;detached++;},sendCommand:async()=>{sendCalls++;return{data:bytes.toString('base64')};}};
+  const win={webContents:{debugger:debuggerAPI,executeJavaScript:expression=>expression.includes('decodeVisibleImages')?context.decodeVisibleImages():Promise.resolve({width:100,height:100})}};
+  const file=path.join(directory,'frame.png');
+  try{
+   if(mode==='broken'||mode==='decode-rejected'){await assert.rejects(context.module.exports.capture(win,file,100),/Image.*brand.svg/);assert.equal(sendCalls,0);assert.equal(fs.existsSync(file),false);}
+   else{await context.module.exports.capture(win,file,100);assert.equal(sendCalls,1);assert.equal(fs.existsSync(file),true);}
+   assert.equal(attached,false);assert.equal(detached,1);if(mode==='broken'||mode==='hidden-broken')assert.equal(decodeCalls,0);
+  }finally{fs.rmSync(directory,{recursive:true,force:true});}
+ }
+});
+
+test('native input waits reachable geometry and rejects a persistent overlay/disabled target without sending input',async()=>{
+ for(const mode of ['transient','overlay','disabled']){
+  let reads=0;const events=[];
+  const win={isDestroyed:()=>false,webContents:{executeJavaScript:async()=>({ready:mode==='transient'&&++reads>1,x:10,y:20,reason:mode}),sendInputEvent:e=>events.push(e)}};
+  if(mode==='transient'){await api.click(win,'#target',250);assert.equal(reads,2);assert.equal(events.length,3);}
+  else{await assert.rejects(api.click(win,'#target',20),/Unreachable control/);assert.equal(events.length,0);}
+ }
+});
+test('renderer readiness waits actual stage/canvas dimensions and camera aspect, not viewport alone',async()=>{
+ for(const mode of ['transient','stale']){
+  let reads=0;const win={isDestroyed:()=>false,webContents:{executeJavaScript:async source=>{assert.ok(source.includes('canvas.width'));assert.ok(source.includes('camera.aspect'));return{ready:mode==='transient'&&++reads>1,viewport:[450,700],stage:[0,0,450,364],canvas:[0,0,1024,773,1024,773]};}}};
+  if(mode==='transient'){await api.waitRendererLayout(win,250);assert.equal(reads,2);}
+  else await assert.rejects(api.waitRendererLayout(win,20),/(?:layout timed out|exceeded its deadline).*1024/);
+ }
+});
+
+test('executed main waits delayed close and activates a new window with the same worker',async()=>{
+ const{report,windows}=await mainFixture();assert.equal(report.pass,true);assert.equal(report.lifecycle.pass,true);assert.equal(report.lifecycle.worker_pid_before,100);assert.equal(report.lifecycle.worker_pid_after,100);assert.equal(windows.length,2);assert.equal(windows[0].isDestroyed(),true);assert.equal(report.worker_shutdown,true);assert.ok(report.native_source.fingerprint);
+});
+test('executed main veto stays failed and cannot be repaired by destroy',async()=>{
+ const{report,windows}=await mainFixture({closeMode:'veto'});assert.equal(report.pass,false);assert.match(report.error,/Native window close timed out/);assert.equal(windows.length,1);assert.equal(windows[0].isDestroyed(),false);
+});
+test('executed main preserves completed lifecycle, first error and diagnostics across page regeneration/shutdown',async()=>{
+ const{report,windows}=await mainFixture({failSmoke:true,lateError:true,shutdownError:true});assert.equal(report.pass,false);assert.equal(report.lifecycle.pass,true);assert.match(report.error,/primary smoke sentinel/);assert.deepEqual(report.errors,['old page diagnostic']);assert.match(report.shutdown_error,/shutdown sentinel/);assert.equal(report.worker_shutdown,false);assert.equal(windows[0].cassqueryRendererErrors,windows[1].cassqueryRendererErrors);
+});

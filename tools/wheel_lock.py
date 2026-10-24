@@ -24,9 +24,15 @@ def compatible(filename, arch):
         return False
     if not valid_python:
         return False
-    return any(value == 'any' or (value.startswith('macosx_') and
-               ('universal2' in value or value.endswith('_arm64' if arch == 'arm64' else '_x86_64')))
-               for value in platforms)
+    if arch not in ('arm64', 'x64'):
+        return False
+    for value in platforms:
+        if value == 'any':
+            return True
+        match = re.fullmatch(r'macosx_(\d+)_(\d+)_(arm64|x86_64|universal2)', value)
+        if match and (int(match[1]), int(match[2])) <= (14, 0) and match[3] in ('universal2', 'arm64' if arch == 'arm64' else 'x86_64'):
+            return True
+    return False
 
 
 def validate(root):

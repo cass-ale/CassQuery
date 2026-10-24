@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import struct
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 SUITE = ROOT / "tools/integration_suite.cjs"
@@ -17,13 +19,26 @@ EXPECTED = {
                    "save-preview-certified", "camera-direction",
                    "failed-gates-retain-bytes-and-model"],
     "interaction-order": ["step-buttons-keyboard", "rapid-aba-variant",
-                          "xray-materials", "explode-transforms", "pointer-pick-hide-show"],
+                          "xray-materials", "explode-transforms", "pointer-pick-hide-show",
+                          "http-view-screenshot"],
     "isolation-reconnect": ["malformed-manifest-isolation", "syntax-error-no-model",
                             "error-recovery", "project-switch-stale-response",
                             "reconnect-hello-snapshot"],
     "boundary": ["malformed-json", "host-origin", "static-traversal",
                  "websocket-origin", "mutation-witness"],
 }
+
+
+def png_chunk(kind, content):
+    return struct.pack(">I", len(content)) + kind + content + struct.pack(">I", zlib.crc32(kind + content))
+
+
+def png_fixture(width=1320, height=900, raw=None, compressed=None):
+    """Decodable RGB parser fixture, explicitly not a captured browser frame."""
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    if compressed is None:
+        compressed = zlib.compress(raw if raw is not None else bytes((width * 3 + 1) * height))
+    return b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", header) + png_chunk(b"IDAT", compressed) + png_chunk(b"IEND", b"")
 
 
 def parser_evidence():
@@ -45,10 +60,19 @@ def parser_evidence():
     failed_gates["checks"][0]["status"] = "fail"
     files = {name: "a" * 64 for name in ("index.json", "neutral.json", "lifted.json")}
     parts = [{"name": name, "opacity": 1 if name == "Cap" else 0.2,
-              "depthWrite": name == "Cap", "positions": [[0, 0, z]]}
+              "transparent": name != "Cap", "depthWrite": name == "Cap", "positions": [[0, 0, z]]}
              for name, z in (("Base", 0), ("Post", 22), ("Cap", 48))]
     hidden = model()
     hidden["parts"][2]["visible"] = [False]
+    rebuilt_hidden = copy.deepcopy(hidden)
+    rebuilt_hidden["hash"] = "e" * 16
+    wire_command = {"project": "TESTPLATE", "step": "apart", "variant": "lifted", "explode": 0.5, "xray": True,
+                    "camera": {"position": [150, -170, 110], "target": [0, 0, 24]}}
+    wire = model()
+    wire.update(variant="lifted", camera=wire_command["camera"]["position"], target=wire_command["camera"]["target"])
+    wire["parts"] = [{**part, "visible": [True], "positions": [[0, 0, {"Base": 0, "Post": 11, "Cap": 24}[part["name"]]]]}
+                     for part in parts]
+    shot_id = "TESTPLATE-" + "a" * 32
     mutation = {"detected": True, "check": "host-origin", "baseline_status": 403,
                 "actual": 200, "expected": 403, "isolated_copy": True,
                 "production_source_unchanged": True, "original_sha256": "a" * 64,
@@ -71,9 +95,19 @@ def parser_evidence():
         "step-buttons-keyboard": {"buttons": 3, "keyboard_step": "Take it apart", "explode": "100%"},
         "rapid-aba-variant": {"delayed_real_variant": True, "final": model(),
                               "selected_step": "Assembled", "pending": 0, "loading_line": ""},
-        "xray-materials": {"parts": parts}, "explode-transforms": {"parts": parts, "keyboard_range_input": "End"},
+        "xray-materials": {"parts": parts, "off_parts": [{**p, "opacity": 1, "transparent": False, "depthWrite": True} for p in parts]},
+        "explode-transforms": {"parts": parts, "keyboard_range_input": "End"},
         "pointer-pick-hide-show": {"actual_pointer": {"x": 300, "y": 200}, "picked": "Cap",
-                                   "hidden": hidden, "shown": model()},
+                                   "hidden": hidden, "shown": model(), "prior_hidden_hash": "b" * 16,
+                                   "rebuilt_hidden": rebuilt_hidden, "show_all_reachable": True},
+        "http-view-screenshot": {"statuses": [202, 200, 200], "rejected_statuses": [400, 400],
+                                 "held_actual_variant": True, "renderer_posts_before_release": 0,
+                                 "request": wire_command, "visible": wire, "canvas": {"width": 1320, "height": 900},
+                                 "shot": {"project": "TESTPLATE", "file": "09-protocol-shot.png", "id": shot_id,
+                                          "renderer_id": shot_id, "sha256": "a" * 64, "renderer_sha256": "a" * 64,
+                                          "width": 1320, "height": 900},
+                                 "worker_frames": [{"type": "command", **wire_command},
+                                                   {"type": "screenshot", "project": "TESTPLATE", "id": shot_id}]},
         "malformed-manifest-isolation": {"api_version": 2, "projects": ["TESTPLATE", "SECONDPLATE"],
                                          "errors": [{"error": "JSONDecodeError: fixture"}]},
         "syntax-error-no-model": {"visible": {"project": None, "tier": None, "hash": None,
@@ -105,13 +139,15 @@ class IntegrationReportContractTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.output = Path(self.temporary.name)
         # Report-parser fixture only, never passed off as a rendered browser screenshot.
-        png = b"\x89PNG\r\n\x1a\nparser contract fixture"
+        png = png_fixture()
+        self.png = png
         shots = ["01-default-certified.png", "02-live-preview.png", "03-live-certified.png",
                  "04-unit-failure-retained.png", "05-xray.png", "06-exploded.png",
-                 "07-syntax-no-model.png", "08-reconnect-snapshot.png"]
+                 "07-syntax-no-model.png", "08-reconnect-snapshot.png", "09-protocol-shot.png"]
         for shot in shots:
             (self.output / shot).write_bytes(png)
         evidence = parser_evidence()
+        evidence["http-view-screenshot"]["shot"].update(sha256=hashlib.sha256(png).hexdigest(), renderer_sha256=hashlib.sha256(png).hexdigest())
         self.report = {
             "schema": 1, "platform": "linux-source-browser-worker", "pass": True,
             "error": None, "cleanup": {"pass": True, "process_groups_gone": True,
@@ -122,7 +158,7 @@ class IntegrationReportContractTests(unittest.TestCase):
             "mutation": evidence["mutation-witness"],
             "source": {"worker_sha256": "a" * 64, "viewer_sha256": "d" * 64, "chromium_sandbox": True},
             "screenshots": [{"file": shot, "description": "Parser fixture, not browser evidence",
-                             "sha256": hashlib.sha256(png).hexdigest()} for shot in shots],
+                             "sha256": hashlib.sha256(png).hexdigest(), "width": 1320, "height": 900} for shot in shots],
         }
 
     def validate(self, report):
@@ -254,6 +290,64 @@ class IntegrationReportContractTests(unittest.TestCase):
                                 if item["id"] == check["id"]:
                                     item["evidence"] = copy.deepcopy(empty)
                         self.assertNotEqual(self.validate(report).returncode, 0)
+
+    def test_png_signature_is_not_decoded_evidence(self):
+        header = struct.pack(">IIBBBBB", 1320, 900, 8, 2, 0, 0, 0)
+        raw = bytes((1320 * 3 + 1) * 900)
+        compressed = zlib.compress(raw)
+        signature = b"\x89PNG\r\n\x1a\n"
+        cases = {
+            "old-31-byte-fixture": signature + b"parser contract fixture",
+            "truncated": self.png[:-5],
+            "missing-end": self.png[:-12],
+            "checksum": self.png[:-1] + bytes([self.png[-1] ^ 1]),
+            "invalid-deflate": png_fixture(compressed=b"not-deflate"),
+            "trailing-deflate": png_fixture(compressed=compressed + b"unused"),
+            "decoded-length": png_fixture(raw=raw[:-1]),
+            "row-filter": png_fixture(raw=b"\x05" + raw[1:]),
+            "zero-width": png_fixture(width=0),
+            "duplicate-header": signature + png_chunk(b"IHDR", header) + self.png[8:],
+            "critical-chunk": signature + png_chunk(b"IHDR", header) + png_chunk(b"ABCD", b"") + self.png[33:],
+            "noncontiguous-data": signature + png_chunk(b"IHDR", header) + png_chunk(b"IDAT", compressed[:4])
+                                  + png_chunk(b"tEXt", b"x\0y") + png_chunk(b"IDAT", compressed[4:]) + png_chunk(b"IEND", b""),
+            "high-bit-type": signature + png_chunk(b"\xc9HDR", header) + self.png[33:],
+        }
+        for kind, png in cases.items():
+            with self.subTest(kind=kind):
+                report = copy.deepcopy(self.report)
+                (self.output / report["screenshots"][0]["file"]).write_bytes(png)
+                report["screenshots"][0]["sha256"] = hashlib.sha256(png).hexdigest()
+                self.assertNotEqual(self.validate(report).returncode, 0, kind)
+        (self.output / self.report["screenshots"][0]["file"]).write_bytes(self.png)
+        for key, value in (("width", 1), ("height", 1), ("width", "1320")):
+            report = copy.deepcopy(self.report)
+            report["screenshots"][0][key] = value
+            self.assertNotEqual(self.validate(report).returncode, 0)
+
+    def test_wire_command_and_shot_observations_fail_closed(self):
+        def evidence(report):
+            return next(c["evidence"] for s in report["scenarios"] for c in s["checks"] if c["id"] == "http-view-screenshot")
+        rounded = copy.deepcopy(self.report)
+        evidence(rounded)["visible"]["camera"] = [149.99999999999994, -169.99999999999955, 109.99999999999974]
+        self.assertEqual(self.validate(rounded).returncode, 0)
+        mutations = [
+            lambda e: e.update(statuses=[202, 504, 200]),
+            lambda e: e.update(renderer_posts_before_release=1),
+            lambda e: e.update(held_actual_variant=False),
+            lambda e: e.update(worker_frames=[]),
+            lambda e: e["visible"].update(variant="neutral"),
+            lambda e: e["visible"].update(camera=[1, 2, 3]),
+            lambda e: e["visible"]["parts"][1].update(positions=[[0, 0, 22]]),
+            lambda e: e["shot"].update(renderer_id="unrelated"),
+            lambda e: e["shot"].update(renderer_sha256="0" * 64),
+            lambda e: e["shot"].update(width=1),
+            lambda e: e.update(rejected_statuses=[202, 400]),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                report = copy.deepcopy(self.report)
+                mutate(evidence(report))
+                self.assertNotEqual(self.validate(report).returncode, 0)
 
     def test_missing_worker_setup_is_red_and_cleans_fixture(self):
         # Execute a real copy of the runner with absent source, no mocks or browser required.

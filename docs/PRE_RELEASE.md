@@ -40,8 +40,10 @@ publish or create a version tag. The first public version is **0.1.0**, tagged
   not establish Developer ID, hardened runtime, notarization or Gatekeeper acceptance.
 - [ ] Developer ID releases require a separate verified signing/notarization/stapling
   contract; no unsigned fallback. Current promotion does not claim that capability.
-- [ ] GitHub environment **`releases`** allows only **`v*` tags**, has required
-  independent reviewers and prevents self-review. A tag rule alone is not approval.
+- [ ] GitHub environment **`releases`** allows only **`v*` tags** and has required
+  reviewers. Approval must come from a currently eligible reviewer; self-review
+  follows the owner-configured policy, matching FrameGuard. The agent never submits
+  deployment approval or bypasses the protected human gate.
 - [ ] Existing annotated `v0.1.0` tag resolves to the exact validated source SHA.
   Recheck tag object and target immediately before every promotion/publication boundary.
 - [ ] Owner explicitly dispatches the release workflow from that version tag,

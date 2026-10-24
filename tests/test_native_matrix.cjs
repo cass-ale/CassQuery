@@ -9,7 +9,7 @@ function validMatrix() {
   return THEMES.flatMap((theme) => WIDTHS.flatMap((width) => STATES.map((state) => ({
     theme, realized_theme: theme, background: theme, width, state, status: 'checked', viewport: [width, 700],
     full_size: [width, 700], scroll_regions: [], vertical_scroll: false,
-    vertices: 30, meshes: 3, controls_checked: 15, clipped: 0, nonfinite: 0, overflow: false,
+    vertices: 30, meshes: 3, triangles: 10, degenerate: 0, controls_checked: 15, clipped: 0, nonfinite: 0, overflow: false,
     bad: [], overlaps: [], errors: [], diag: '', tier: 'certified', gates_pass: true,
     step_pressed: state === 'assembled' ? ['true', 'false'] : ['false', 'true'],
     explode: state === 'assembled' ? '0%' : '100%',
@@ -52,10 +52,10 @@ test('scrolling requires full-document dimensions and scrolled-control capture, 
 
 test('controls send native mouse input, not synthetic DOM or semantic control calls', async () => {
   const events = [];
-  const win = { webContents: {
+  const win = { isDestroyed: () => false, webContents: {
     executeJavaScript: async (source) => {
       assert.ok(source.includes('elementFromPoint')); assert.ok(source.includes('e.disabled'));
-      assert.ok(!source.includes('.click()')); return { x: 50, y: 60 };
+      assert.ok(!source.includes('.click()')); return { ready:true, x: 50, y: 60 };
     },
     sendInputEvent: (event) => events.push(event),
   } };
@@ -104,4 +104,60 @@ test('projection uses every actual visible world-space vertex, excluding hidden 
   mesh.visible = false;
   assert.equal(measure().vertices, 0, 'hidden geometry cannot count as coverage');
   geometry.dispose(); mesh.material.dispose();
+});
+
+async function pinnedThree() {
+  const data = (s) => 'data:text/javascript;base64,' + Buffer.from(s).toString('base64');
+  const base = path.join(__dirname, '../viewer/vendor');
+  return import(data(fs.readFileSync(path.join(base, 'three.core.js'), 'utf8')));
+}
+function measureScene(three, geometry, material = new three.MeshBasicMaterial()) {
+  const group = new three.Group(), mesh = new three.Mesh(geometry, material);
+  group.add(mesh);
+  const camera = new three.PerspectiveCamera(40, 1, 0.1, 100); camera.position.set(0, 0, 10); camera.lookAt(0, 0, 0);
+  const rect = { left: 0, top: 0, right: 100, bottom: 100, width: 100, height: 100 };
+  const globals = { window: { __cq: { model: { group, tier: 'certified', gates: { pass: true }, hash: 'hash' }, camera } },
+    document: { body: {}, documentElement: { scrollWidth: 100, scrollHeight: 100 }, querySelectorAll: () => [],
+      querySelector: () => ({ width: 100, height: 100, getBoundingClientRect: () => rect }),
+      getElementById: (id) => ({ textContent: id === 'explodeval' ? '0%' : '' }) },
+    innerWidth: 100, innerHeight: 100, devicePixelRatio: 1, Node: { TEXT_NODE: 3 },
+    getComputedStyle: () => ({ backgroundColor: 'dark' }), matchMedia: () => ({ matches: true }) };
+  return { mesh, group, camera, measure: () => require('node:vm').runInNewContext(`(${measureFrame.toString()})()`, globals) };
+}
+test('actual Three draw ranges, materials, camera layers and collapsed triangles cannot pad coverage', async () => {
+  const three = await pinnedThree();
+  for (const indexed of [false, true]) {
+    const geometry = new three.BufferGeometry();
+    geometry.setAttribute('position', new three.Float32BufferAttribute([0,0,0, 0.1,0,0, 0,0.1,0],3));
+    if (indexed) geometry.setIndex([0,1,2]);
+    const fixture = measureScene(three, geometry);
+    assert.equal(fixture.measure().triangles,1); assert.equal(fixture.measure().vertices,3);
+    geometry.setDrawRange(0,0); assert.equal(fixture.measure().vertices,0); geometry.setDrawRange(0,Infinity);
+    fixture.mesh.material.visible=false; assert.equal(fixture.measure().vertices,0); fixture.mesh.material.visible=true;
+    fixture.mesh.layers.set(1); assert.equal(fixture.measure().vertices,0); fixture.mesh.layers.set(0);
+    fixture.mesh.scale.x=-1; assert.equal(fixture.measure().triangles,1,'reflected front-face winding must remain eligible'); fixture.mesh.scale.x=1;
+    fixture.mesh.material.side=three.BackSide; assert.equal(fixture.measure().triangles,0); fixture.mesh.material.side=three.DoubleSide;
+    for(let i=0;i<3;i++) geometry.getAttribute('position').setXYZ(i,0,0,0);
+    assert.equal(fixture.measure().vertices,0); assert.equal(fixture.measure().degenerate,1);
+    geometry.dispose(); fixture.mesh.material.dispose();
+  }
+});
+test('actual grouped/indexed draw intersection excludes unused vertices and rejects invalid draw indices', async () => {
+  const three=await pinnedThree(), geometry=new three.BufferGeometry();
+  geometry.setAttribute('position',new three.Float32BufferAttribute([0,0,0,.1,0,0,0,.1,0, .1,.1,0,.2,.1,0,.1,.2,0, 10000,10000,0],3));
+  geometry.setIndex([0,1,2,3,4,5]); geometry.addGroup(0,3,0); geometry.addGroup(3,3,1);
+  const materials=[new three.MeshBasicMaterial(),new three.MeshBasicMaterial()]; materials[0].visible=false;
+  const fixture=measureScene(three,geometry,materials);
+  assert.equal(fixture.measure().triangles,1); assert.equal(fixture.measure().clipped,0,'unused far position is not drawn coverage');
+  geometry.setDrawRange(0,3); assert.equal(fixture.measure().vertices,0);
+  geometry.setDrawRange(3,3); assert.equal(fixture.measure().vertices,3);
+  geometry.index.setX(3,999); assert.throws(fixture.measure,/Draw index outside/);
+  geometry.dispose();materials.forEach(m=>m.dispose());
+});
+test('scale-relative degeneracy check retains a healthy tiny triangle and matrix rejects degenerate padding', async () => {
+  const three=await pinnedThree(), geometry=new three.BufferGeometry();
+  geometry.setAttribute('position',new three.Float32BufferAttribute([0,0,0,1e-12,0,0,0,1e-12,0],3));
+  const fixture=measureScene(three,geometry);assert.equal(fixture.measure().triangles,1);assert.equal(fixture.measure().degenerate,0);
+  for(const mutation of [{triangles:0},{degenerate:1},{vertices:31}]) {const records=validMatrix();Object.assign(records[0],mutation);assert.throws(()=>validateMatrix(records));}
+  geometry.dispose();fixture.mesh.material.dispose();
 });

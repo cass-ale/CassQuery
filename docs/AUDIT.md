@@ -1,10 +1,9 @@
 # CassQuery audit and delivery ledger
 
-This is a development/review pass, not a published or release-ready product.
-Base commit: `40c916b66c0b7d6bf1d1d80e7a7263bfecc96cc0`. The initial handoff was
-uncommitted; the owner subsequently authorized committing and pushing this reviewed
-source. No release tags, manual release dispatches, binary publication, or human
-outreach are authorized by that source push.
+This ledger distinguishes implemented capabilities, executed evidence and release
+approval. The owner authorized source pushes and subsequently authorized a tagged
+**v0.1.0** release after the repaired candidate passes. That authorization does not
+approve a failed build or allow the agent to bypass the protected human gate.
 
 ## Implemented
 
@@ -26,11 +25,10 @@ outreach are authorized by that source push.
 
 ## Checked
 
-- Full `npm run preflight` on equipped macOS: **237 tests pass, zero skips**,
-  with source fingerprints unchanged before/after, hashed stage logs, semantic
-  release contracts and all 42 brand exports. Native icon and real CAD/WebSocket
-  checks are included. This is verified dirty-worktree source evidence, not a
-  clean committed release candidate.
+- Source preflight at `4385901`: **242 tests pass, zero skips**. This historical
+  result did not execute the native lifecycle and is not proof of the subsequent
+  repairs. The merged source must receive a fresh complete preflight and native
+  candidate run, with source fingerprints and hashed logs unchanged.
 - Real Linux production-path integration: four scenarios and 21 observed
   invariants pass with real CadQuery/OCP, HTTP/WebSocket, save watcher and
   explicitly sandbox-enabled Chromium. Eight required screenshots are hash-bound.
@@ -80,8 +78,9 @@ outreach are authorized by that source push.
   coverage and a complete display-scale/accessibility-device matrix remain outside
   the checked evidence. SPEC.md referenced by AGENTS is absent publicly; gate
   thresholds and the unauthenticated loopback API shape were not invented/changed.
-- Automatic updates, authenticated update manifests, candidate-byte promotion and
-  public release workflow are deliberately not implemented.
+- Automatic updates and authenticated update manifests remain unimplemented.
+  Protected exact-byte candidate promotion is implemented and covered by negative
+  tests; no public release has yet executed that path.
 
 ## Raw release evidence
 
@@ -110,10 +109,12 @@ and stop readiness immediately. Same-source Rebuild is proved by a new certified
 build timestamp, not a source-generation increment. These are source-reviewed
 repairs; successful native Metal execution remains required on the new commit.
 
-The live GitHub environment is `releases`, restricted to tag pattern `v*`; required
-reviewers are not yet configured. Publication refuses to write until approval
-protections exist and an existing annotated version tag matches the exact passing
-main-push candidate. No tag, draft or release is created by a source push.
+The live GitHub environment is `releases`, restricted to tag pattern `v*`, with
+owner-managed required reviewer `cass-ale` and self-review prevention disabled,
+matching FrameGuard's verified release policy. Publication requires recorded
+approval by a currently configured eligible reviewer; the agent never approves
+its own deployment. An existing annotated version tag must match the exact passing
+native and integration source. No source push creates tags or releases.
 
 ## v0.1 source push — release remains on hold
 

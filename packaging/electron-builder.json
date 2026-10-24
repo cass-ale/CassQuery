@@ -2,6 +2,7 @@
   "appId": "com.cassquery.desktop",
   "productName": "CassQuery",
   "asar": true,
+  "afterPack": "./tools/package_renderer.cjs",
   "directories": { "output": "dist/mac-app" },
   "files": ["shell/**", "package.json"],
   "extraResources": [

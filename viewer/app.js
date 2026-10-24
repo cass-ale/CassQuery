@@ -138,19 +138,34 @@ function fitDist(radius) {
   const h = Math.atan(Math.tan(v) * camera.aspect);
   return radius / Math.sin(Math.min(v, h)) * 1.02;
 }
+function stopControlMotion() {
+  const position = camera.position.clone(), target = controls.target.clone();
+  const damping = controls.enableDamping;
+  controls.enableDamping = false;
+  controls.update(); // Consume OrbitControls' pending rotation/pan without retaining its motion.
+  controls.enableDamping = damping;
+  camera.position.copy(position);
+  controls.target.copy(target);
+  controls.update();
+}
+function cameraDepth(radius) {
+  camera.near = radius / 50;
+  camera.far = Math.max(radius * 40, fitDist(radius) + radius * 2);
+  camera.updateProjectionMatrix();
+}
 function frameCamera(center, radius, dir = new THREE.Vector3(0.95, -1.35, 0.62)) {
   camAnim = null;
+  stopControlMotion();
   const d = dir.clone().normalize().multiplyScalar(fitDist(radius));
   camera.position.copy(center).add(d);
   controls.target.copy(center);
-  camera.near = Math.max(0.1, radius / 50);
-  camera.far = radius * 40;
-  camera.updateProjectionMatrix();
+  cameraDepth(radius);
   controls.update();
 }
 function tweenCamera(pos, target) {
   ++cameraRequest;
   camAnim = null;
+  stopControlMotion();
   if (reduced) {
     if (pos) camera.position.copy(pos);
     if (target) controls.target.copy(target);
@@ -279,6 +294,8 @@ async function loadVariant(name, value = model) {
     }
     value.group.add(vgroup);
     const entry = { group: vgroup, parts: vparts, bounds: v.bounds };
+    for (const [part, p] of vparts)
+      for (const mesh of p.meshes) mesh.visible = !value.hiddenParts?.get(name)?.includes(part);
     value.variants.set(name, entry);
     if (name === "neutral") value.bounds = v.bounds;
     return entry;
@@ -405,11 +422,18 @@ async function goStep(i, animate) {
 // ---------- project / payload loading ----------
 function captureView() {
   return { step: manifest?.steps[displayedStep]?.id, variant: model?.activeName || "neutral",
-    explode: explodeAmt, target: explodeTarget, xray: xrayOn };
+    explode: explodeAmt, target: explodeTarget, xray: xrayOn,
+    hiddenParts: new Map([...(model.hiddenParts || []), ...[...model.variants].map(([name, v]) =>
+      [name, [...v.parts].filter(([, p]) => p.meshes.some((m) => !m.visible)).map(([part]) => part)])]) };
 }
 function restoreView(view) {
   currentStep = view ? manifest.steps.findIndex((s) => s.id === view.step) : -1;
   displayedStep = currentStep;
+  model.hiddenParts = view?.hiddenParts || new Map();
+  for (const [name, v] of model.variants)
+    for (const [part, p] of v.parts)
+      for (const m of p.meshes) m.visible = !model.hiddenParts.get(name)?.includes(part);
+  clearSelection();
   explodeTarget = view?.target || 0;
   applyExplode(view?.explode || 0, true);
   applyXray(view?.xray || false);
@@ -638,14 +662,18 @@ let downAt = null;
 // Pick on release, and only when the pointer barely moved: a press that
 // turns into an orbit drag must not also select (or deselect) a part.
 renderer.domElement.addEventListener("pointerdown", (e) => {
-  downAt = interactive() && e.button === 0 ? [e.clientX, e.clientY, e.pointerId] : null;
+  downAt = interactive() && e.button === 0 ? [e.clientX, e.clientY, e.pointerId, false] : null;
+});
+renderer.domElement.addEventListener("pointermove", (e) => {
+  if (downAt && e.pointerId === downAt[2] && Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 6)
+    downAt[3] = true;
 });
 renderer.domElement.addEventListener("pointercancel", () => { downAt = null; });
 renderer.domElement.addEventListener("pointerup", (e) => {
   if (!downAt || e.pointerId !== downAt[2]) return;
-  const moved = Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]);
+  const moved = downAt[3] || Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 6;
   downAt = null;
-  if (moved > 6 || !interactive()) return;
+  if (moved || !interactive()) return;
   const r = renderer.domElement.getBoundingClientRect();
   if (!r.width || !r.height) return;
   const nd = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1,
@@ -723,9 +751,7 @@ document.getElementById("resetview").addEventListener("click", () => {
   const center = b.center;
   const pos = center.clone().add(new THREE.Vector3(0.95, -1.35, 0.62)
     .normalize().multiplyScalar(fitDist(b.radius)));
-  camera.near = Math.max(0.1, b.radius / 50);
-  camera.far = b.radius * 40;
-  camera.updateProjectionMatrix();
+  cameraDepth(b.radius);
   tweenCamera(pos, center);
 });
 window.addEventListener("keydown", (e) => {

@@ -48,7 +48,7 @@ Intel. `npm run build:mac` also creates architecture-labelled ZIP and DMG files.
 On a host allowed to mount disk images, check the **final** DMG:
 
 ```sh
-python tools/dmg_smoke.py --dmg dist/mac-app/CassQuery-0.1.0-mac-arm64.dmg --arch arm64 --output evidence/dmg
+python tools/dmg_smoke.py --dmg dist/mac-app/CassQuery-0.1.0-mac-arm64.dmg --arch arm64 --output evidence/dmg --checked-app dist/mac-app/mac-arm64/CassQuery.app --checked-inventory evidence/mac/bundle-before.json
 ```
 
 Inspect every generated assembled/apart screenshot. A nonempty PNG and passing
@@ -80,8 +80,9 @@ and saved actual failed Actions job logs, not release summaries.
 
 - First-release metadata 404 broke publication even after native builds passed
   ([run 38685201770](https://github.com/cass-ale/FrameGuard/actions/runs/38685201770)).
-  CassQuery intentionally has **no publication/updater workflow yet**. When added,
-  test 404 bootstrap separately from 401/403/5xx; never parse error JSON as a version.
+  CassQuery's protected promotion now tests first-release 404 bootstrap separately
+  from 401/403/5xx; error JSON is never treated as a version. Automatic updating
+  remains unimplemented.
 - Binaries over GitHub's per-file Git limit broke an update mirror
   ([run 38691226131](https://github.com/cass-ale/FrameGuard/actions/runs/38691226131)).
   Native candidates stay in Actions artifact storage, not Git history.
@@ -101,10 +102,9 @@ and saved actual failed Actions job logs, not release summaries.
   CassQuery names ad-hoc seal checks separately from Developer ID/notarization.
 
 Dependencies and actions are exact-pinned; `package-lock.json` locks npm's graph
-and `requirements-build.txt` pins Python's graph. Versions are not wheel digests:
-Python wheel-hash locking remains a separate supply-chain improvement. Native
-frozen functional checks are mandatory because static import/warning checks
-cannot prove CadQuery/OCP and lazy binary dependencies work.
+and `packaging/requirements-macos.lock` binds Python's graph to the reviewed native
+wheel SHA-256s. Native frozen functional checks remain mandatory because static
+import/warning checks cannot prove CadQuery/OCP and lazy binary dependencies work.
 
 ## Verification commands
 

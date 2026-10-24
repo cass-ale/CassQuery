@@ -33,8 +33,11 @@ class SupplyChainTests(unittest.TestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         self.assertTrue(module.compatible('pyinstaller-6.20.0-py3-none-macosx_10_13_universal2.whl', 'arm64'))
-        for name in ('pkg-1-cp314-abi3-macosx_14_0_arm64.whl', 'pkg-1-cp313-none-any.whl', 'pkg-1-py2-none-any.whl'):
+        for name in ('pkg-1-cp314-abi3-macosx_14_0_arm64.whl', 'pkg-1-cp313-none-any.whl', 'pkg-1-py2-none-any.whl',
+                     'pkg-1-cp312-cp312-macosx_15_0_arm64.whl', 'pkg-1-cp312-cp312-macosx_14_1_arm64.whl'):
             self.assertFalse(module.compatible(name, 'arm64'), name)
+        self.assertTrue(module.compatible('pkg-1-cp312-cp312-macosx_14_0_arm64.whl', 'arm64'))
+        self.assertFalse(module.compatible('pkg-1-py3-none-any.whl', 'unknown'))
 
     def test_missing_intel_wheel_and_extra_package_rejected(self):
         import importlib.util

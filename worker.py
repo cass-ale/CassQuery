@@ -12,7 +12,7 @@ Run:  python worker.py [project_dir ...] [--port N]
       (or CASSQUERY_PROJECTS=/path/projA:/path/projB python worker.py;
       with neither, the bundled testpart demo is served)
 """
-import asyncio, base64, copy, hashlib, importlib, importlib.machinery, importlib.util, json, math, os, re, sys, tempfile, threading, time, traceback, uuid
+import asyncio, base64, copy, hashlib, importlib, importlib.machinery, importlib.util, json, math, os, re, stat, sys, tempfile, threading, time, traceback, uuid
 from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -322,6 +322,15 @@ def _component(value, label):
 def _inside(root, path):
     try:
         return os.path.commonpath((os.path.realpath(root), os.path.realpath(path))) == os.path.realpath(root)
+    except ValueError:
+        return False
+
+
+def _input_inside(root, path):
+    # Snapshot keys retain lexical ownership after deletion or symlink retargeting.
+    # This is only change routing; source/HTTP access still uses realpath _inside.
+    try:
+        return os.path.commonpath((os.path.abspath(root), os.path.abspath(path))) == os.path.abspath(root)
     except ValueError:
         return False
 
@@ -853,27 +862,51 @@ def build_thread():
 
 
 def snapshot(roots):
+    """Fingerprint regular project inputs, including CAD/data files, by content.
+
+    Dependency/cache trees, directory symlinks and worker-owned payload/shot
+    outputs aren't inputs. Build-generated files must live outside the input
+    tree. Trusted project code may read external files, but this filesystem
+    boundary doesn't watch those files and isn't a sandbox.
+    """
     snap = {}
+    outputs = (os.path.realpath(PAYLOAD_DIR), os.path.realpath(SHOT_DIR))
     def unreadable(error):
         raise error
     for root in roots:
         for dirpath, dirnames, filenames in os.walk(root, onerror=unreadable):
+            if any(_inside(output, dirpath) for output in outputs):
+                dirnames[:] = []
+                continue
             dirnames[:] = [d for d in dirnames if d not in
                            (".git", ".venv", "venv", "node_modules", "__pycache__")]
             for f in filenames:
-                if f.endswith(".py") or f == "viewer.json":
-                    fp = os.path.join(dirpath, f)
-                    try:
-                        st = os.stat(fp)
-                        snap[fp] = (st.st_mtime_ns, st.st_ctime_ns, st.st_size)
-                    except FileNotFoundError:
-                        continue  # An atomic save may remove a file mid-snapshot.
+                fp = os.path.join(dirpath, f)
+                if any(_inside(output, fp) for output in outputs):
+                    continue  # An in-tree alias of a worker output is still output.
+                if not _inside(root, fp):
+                    continue  # Linked external dependencies aren't project-tree inputs.
+                try:
+                    if not stat.S_ISREG(os.stat(fp).st_mode):
+                        continue  # Never read devices, sockets or FIFOs as source.
+                    with open(fp, "rb") as fh:
+                        before = os.fstat(fh.fileno())
+                        digest = hashlib.sha256()
+                        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                        after = os.fstat(fh.fileno())
+                    metadata = lambda st: (st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+                    if metadata(before) != metadata(after):
+                        raise StaleBuild("project input changed while snapshotting")
+                    snap[fp] = (*metadata(after), digest.hexdigest())
+                except FileNotFoundError:
+                    continue  # An atomic save may remove a file mid-snapshot.
     return snap
 
 
 def _apply_changes(changed):
     for p in PROJECTS.values():
-        mine = [fp for fp in changed if _inside(p.root, fp)]
+        mine = [fp for fp in changed if _input_inside(p.root, fp)]
         if not mine:
             continue
         with p.lock:
@@ -907,8 +940,8 @@ def watcher(roots, prev=None):
             changed = [fp for fp in set(cur) | set(prev) if cur.get(fp) != prev.get(fp)]
             _apply_changes(changed)
             prev = cur
-        except OSError as e:
-            # Never let an unreadable directory silently kill the watch thread.
+        except (OSError, StaleBuild) as e:
+            # An unreadable/changing input must not silently kill the watch thread.
             print(f"CassQuery watcher: {e}", file=sys.stderr)
             for p in PROJECTS.values():
                 set_state(p, "error", f"watcher: {e}")
@@ -1116,7 +1149,7 @@ class Handler(BaseHTTPRequestHandler):
         if "\\" in rel or "\x00" in rel:
             return self._send(404, {"error": "not found"})
         ctype = {"html": "text/html", "js": "text/javascript", "css": "text/css",
-                 "json": "application/json"}.get(rel.rsplit(".", 1)[-1], "application/octet-stream")
+                 "json": "application/json", "svg": "image/svg+xml"}.get(rel.rsplit(".", 1)[-1], "application/octet-stream")
         return self._file(VIEWER_DIR, rel, ctype)
 
     def do_POST(self):

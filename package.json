@@ -4,7 +4,7 @@
   "description": "A local desktop viewer for CadQuery projects — live preview tier, certified gated builds, semantic payloads, and a loopback agent protocol.",
   "main": "shell/main.js",
   "scripts": {
-    "check": "node --check shell/main.js && node --check shell/runtime.cjs && node --check shell/renderer_config.cjs && node --check shell/smoke.cjs && node --check tools/viewer_render.cjs && node --input-type=module --check < viewer/app.js && python3 -m py_compile worker.py tools/macos_smoke.py tools/worker_smoke.py tools/dmg_smoke.py tools/check_release.py",
+    "check": "node --check shell/main.js && node --check shell/runtime.cjs && node --check shell/renderer_config.cjs && node --check shell/smoke.cjs && node --check tools/package_renderer.cjs && node --check tools/native_lifecycle_probe.cjs && node --check tools/integration_suite.cjs && node --check tools/viewer_render.cjs && node --input-type=module --check < viewer/app.js && python3 -m py_compile worker.py tools/macos_smoke.py tools/worker_smoke.py tools/dmg_smoke.py tools/zip_smoke.py tools/check_release.py tools/preflight.py tools/python_test_stage.py tools/readiness.py tools/release_evidence.py tools/release_publish.py tools/sbom.py tools/wheel_lock.py",
     "test": "npm run check && node --test tests/*.cjs && python3 -m unittest discover -s tests -p 'test_*.py'",
     "app": "electron .",
     "build:worker": "python3 -m PyInstaller --noconfirm --clean packaging/worker.spec",

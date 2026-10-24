@@ -25,8 +25,16 @@ SHA = "a" * 40
 TAG_SHA = "b" * 40
 LOCKED_INPUTS = {name: (ROOT / name).read_bytes() for name in
                  ("package.json", "requirements-build.txt", "package-lock.json", "packaging/requirements-macos.lock", "packaging/wheel-manifest.json")}
+NATIVE_SOURCE_NAMES = ('worker.py', 'shell/main.js', 'shell/runtime.cjs', 'shell/smoke.cjs', 'shell/renderer_config.cjs',
+    'viewer/app.js', 'viewer/brand.svg', 'viewer/index.html', 'viewer/style.css', 'viewer/vendor/LICENSE.three',
+    'viewer/vendor/three.core.js', 'viewer/vendor/three.module.js', 'viewer/vendor/addons/controls/OrbitControls.js',
+    'viewer/vendor/addons/environments/RoomEnvironment.js', 'viewer/vendor/addons/utils/BufferGeometryUtils.js',
+    'testpart/part_entry.py', 'testpart/viewer.json', 'assets/icons/cassquery.icns')
+SOURCE_INPUTS = {**LOCKED_INPUTS, **{name: (ROOT / name).read_bytes() for name in NATIVE_SOURCE_NAMES},
+                 **{file.relative_to(ROOT).as_posix(): file.read_bytes() for file in (ROOT / 'tests').glob('test_*.py')},
+                 **{file.relative_to(ROOT).as_posix(): file.read_bytes() for file in (ROOT / 'tests').glob('*.cjs')}}
 SOURCE_FILES = [{"path": name, "bytes": len(data), "executable": False, "sha256": hashlib.sha256(data).hexdigest()}
-                for name, data in sorted(LOCKED_INPUTS.items())]
+                for name, data in sorted(SOURCE_INPUTS.items())]
 FINGERPRINT = hashlib.sha256(json.dumps({"source_sha": SHA, "files": SOURCE_FILES}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 VERSION = json.loads(LOCKED_INPUTS["package.json"])["version"]
 TAG = "v" + VERSION
@@ -39,6 +47,23 @@ PNG_BYTES = {}
 
 def record(name, data):
     return {"path": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def protocol_png(width, height, index=0):
+    """Complete RGB PNG bytes, cached by actual frame size; never native proof."""
+    key = width, height, index
+    if key not in PNG_BYTES:
+        def chunk(kind, data):
+            return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data) & 0xffffffff)
+        pattern = bytes(x * 37 % 256 for x in range(256))
+        rows = []
+        for y in range(height):
+            shift = ((y * 83 + index) * 173) % 256
+            row = pattern[shift:] + pattern[:shift]
+            rows.append(b'\x00' + (row * ((width * 3 + 255) // 256))[:width * 3])
+        PNG_BYTES[key] = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+                          + chunk(b'IDAT', zlib.compress(b''.join(rows))) + chunk(b'IEND', b''))
+    return PNG_BYTES[key]
 
 
 def candidate_bytes(arch, mutate=None, extra=None):
@@ -55,66 +80,185 @@ def candidate_bytes(arch, mutate=None, extra=None):
     def linked(name, report_dir):
         return {**record(name, files[name]), "path": str(Path(name).relative_to(report_dir))}
 
-    def png(index):
-        if index in PNG_BYTES:
-            return PNG_BYTES[index]
-        def chunk(kind, data):
-            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
-        raw = b"".join(b"\x00" + bytes((x * 37 + y * 83 + index) % 256 for x in range(300)) for y in range(100))
-        PNG_BYTES[index] = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 100, 100, 8, 2, 0, 0, 0))
-                            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
-        return PNG_BYTES[index]
+    resources = '/protocol-only/CassQuery.app/Contents/Resources'
+    started = {'wall_time_ms': 1000, 'monotonic_ms': 1000}
+    finished = {'wall_time_ms': 5000, 'monotonic_ms': 5000}
+    source_records = {r['path']: r for r in SOURCE_FILES}
+    tree = [{'path': '.', 'kind': 'directory', 'mode': 493}]
+    for name in ('Contents/MacOS/CassQuery', 'Contents/Resources/worker/cassquery-worker'):
+        tree.append({'path': name, 'kind': 'file', 'mode': 493, 'bytes': 24,
+                     'sha256': hashlib.sha256(('protocol-only-' + arch + name).encode()).hexdigest()})
+    icon = source_records['assets/icons/cassquery.icns']
+    tree.append({'path': 'Contents/Resources/icon.icns', 'kind': 'file', 'mode': 420,
+                 'bytes': icon['bytes'], 'sha256': icon['sha256']})
+    tree.sort(key=lambda r: r['path'])
+    inventory = {'records': tree, 'entries': len(tree), 'bytes': sum(r.get('bytes', 0) for r in tree),
+                 'sha256': hashlib.sha256(json.dumps(tree, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+    bundle = {'bundle_id': 'com.cassquery.desktop', 'architecture': arch, 'version': VERSION,
+              'bundle_sha256': inventory['sha256'], 'icon': {**icon, 'path': resources + '/icon.icns'},
+              'machos': [{'path': r['path'], 'architectures': [arch], 'sha256': r['sha256']} for r in tree if r['mode'] == 493 and r['kind'] == 'file'],
+              'source_files': [{**source_records[name], 'path': '/protocol-source/' + name} for name in NATIVE_SOURCE_NAMES if name != 'assets/icons/cassquery.icns']}
 
-    matrix = [{"theme": theme, "width": width, "state": state, "status": "checked",
-               "vertices": 10, "meshes": 1, "clipped": 0, "nonfinite": 0, "overflow": False,
-               "bad": [], "overlaps": [], "errors": [], "realized_theme": theme, "controls_checked": 3,
-               "gates_pass": True, "tier": "certified", "viewport": [width, 700], "diag": "",
-               "background": "black" if theme == "dark" else "white",
-               "step_pressed": ["true", "false"] if state == "assembled" else ["false", "true"],
-               "explode": "0%" if state == "assembled" else "100%",
-               "canvas": {"width": width, "height": 700, "client_width": width, "client_height": 700}}
-              for theme in ("dark", "light") for width in (450, 700, 1000, 1320) for state in ("assembled", "apart")]
+    def prefixed(value, prefix):
+        if isinstance(value, dict):
+            return {k: prefix + '/' + v if k == 'path' and isinstance(v, str) and not v.startswith('/') else prefixed(v, prefix) for k, v in value.items()}
+        if isinstance(value, list):
+            return [prefixed(v, prefix) for v in value]
+        return value
+
+    def raw_renderer(directory, bundled):
+        images, matrix = [], []
+        def image(name, width, height, index):
+            path = directory + '/' + name
+            files[path] = protocol_png(width, height, index)
+            return {**linked(path, directory), 'width': width, 'height': height}
+        camera_checks = []
+        direction = [0.95, -1.35, 0.62]
+        length = sum(v * v for v in direction) ** 0.5
+        direction = [v / length for v in direction]
+        base_camera = {'direction': direction, 'target': [0, 0, 0], 'center': [0, 0, 0], 'radius': 10}
+        for index, mode in enumerate(('orbit', 'pan')):
+            dragged = copy.deepcopy(base_camera)
+            if mode == 'orbit':
+                dragged['direction'] = [1, 0, 0]
+            else:
+                dragged['target'] = [1, 0, 0]
+            drag_image = image(mode + '-drag.png', 1320, 700, 80 + index * 2)
+            reset_image = image(mode + '-reset.png', 1320, 700, 81 + index * 2)
+            images.extend((drag_image, reset_image))
+            camera_checks.append({'mode': mode, 'status': 'checked',
+                'method': 'native pointer drag then Reset; observed at 700ms and 3s',
+                'before': copy.deepcopy(base_camera), 'after_drag': dragged,
+                'after_reset_700': copy.deepcopy(base_camera), 'after_reset_settled': copy.deepcopy(base_camera),
+                'drag_image': drag_image, 'reset_image': reset_image})
+        for index, (theme, width, state) in enumerate((t, w, s) for t in ('dark', 'light') for w in (450, 700, 1000, 1320) for s in ('assembled', 'apart')):
+            captured = image(f'{theme}-{width}-{state}.png', width, 700, index)
+            images.append(captured)
+            matrix.append({'theme': theme, 'width': width, 'state': state, 'status': 'checked',
+                'vertices': 30, 'triangles': 10, 'degenerate': 0, 'meshes': 3, 'clipped': 0, 'nonfinite': 0, 'overflow': False,
+                'bad': [], 'overlaps': [], 'errors': [], 'realized_theme': theme, 'controls_checked': 15,
+                'gates_pass': True, 'tier': 'certified', 'viewport': [width, 700], 'diag': '',
+                'background': 'black' if theme == 'dark' else 'white', 'full_size': [width, 700], 'scroll_regions': [], 'vertical_scroll': False,
+                'step_pressed': ['true', 'false'] if state == 'assembled' else ['false', 'true'],
+                'explode': '0%' if state == 'assembled' else '100%', 'hash': 'protocol-certified-geometry',
+                'canvas': {'width': width, 'height': 700, 'client_width': width, 'client_height': 700}, 'image': captured})
+        for index, name in enumerate(('assembled', 'apart') if bundled else ('assembled', 'apart', 'save-camera', 'save-certified', 'gate-failed')):
+            images.append(image(name + '.png', 1320, 700, 14 + index if name in ('assembled', 'apart') else 40 + index))
+        names = ['renderer-start', 'certified-ready', 'production-controls', 'native-matrix']
+        if not bundled:
+            names += ['save-certified', 'failed-gate-retained']
+        names += ['renderer-complete', 'worker-shutdown']
+        offset = 0 if bundled else 5000
+        launch_started = {key: value + offset for key, value in started.items()}
+        launch_finished = {key: value + offset for key, value in finished.items()}
+        executed = [{'bytes': source_records[name]['bytes'], 'path': name, 'sha256': source_records[name]['sha256']}
+                    for name in evidence.NATIVE_SOURCE_PATHS]
+        native_source = {'files': executed, 'fingerprint': hashlib.sha256(json.dumps({'files': executed}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()}
+        raw = {**identity, 'matrix': matrix, 'images': images, 'camera_checks': camera_checks, 'native_source': native_source,
+            'lifecycle': {'pass': True, 'close_reopen': True, 'secondary_exit': 0, 'secondary_pid': 12,
+                'second_instance_events': 1, 'worker_pid_before': 11, 'worker_pid_after': 11},
+            'worker_pid': 11, 'app_pid': 10, 'packaged': True, 'bundled_worker': True, 'worker_shutdown': True,
+            'challenge': 'fixture', 'errors': [], 'resources_path': resources, 'worker_executable': resources + '/worker/cassquery-worker',
+            'render_backend_requested': 'metal-requested',
+            'graphics': {'runtime': {'electron': '45.0.0', 'chromium': 'protocol-fixture', 'node': '22.23.4', 'platform': 'darwin', 'architecture': arch},
+                'display': {'scale_factor': 1, 'bounds': {'x': 0, 'y': 0, 'width': 1920, 'height': 1080},
+                    'work_area': {'x': 0, 'y': 0, 'width': 1920, 'height': 1080}, 'window_bounds': {'x': 0, 'y': 0, 'width': 1320, 'height': 700}},
+                'gpu': {'protocol_fixture_only': True},
+                'webgl': {'context': 'webgl2', 'vendor': 'protocol-vendor', 'renderer': 'protocol-renderer', 'version': 'WebGL 2.0',
+                    'shading_language': 'WebGL GLSL ES 3.00', 'unmasked_vendor': 'protocol-vendor', 'unmasked_renderer': 'protocol-renderer',
+                    'is_context_lost': False, 'drawing_buffer': [1000, 700], 'viewport': [1320, 700], 'dpr': 1}},
+            'started': {'wall_time_ms': 1100 + offset, 'monotonic_ms': 1100 + offset}, 'finished': {'wall_time_ms': 4000 + offset, 'monotonic_ms': 4000 + offset},
+            'checkpoints': [{'name': name, 'wall_time_ms': 1200 + offset + i * 200, 'monotonic_ms': 1200 + offset + i * 200} for i, name in enumerate(names)],
+            'checks': ['bundled default certified demo'] if bundled else sorted(evidence.NATIVE_CHECKS),
+            'screenshots': ['assembled.png', 'apart.png'],
+            'worker_status': {'api_version': 2, 'load_errors': [], 'projects': [{'name': 'TESTPLATE', 'root': resources + '/worker/_internal/testpart'}]},
+            'launch': {'started': launch_started, 'finished': launch_finished, 'exit': 0, 'path': '/usr/bin:/bin:/usr/sbin:/sbin', 'project_override': None if bundled else '/public-protocol/demo'}}
+        if not bundled:
+            saved_camera = copy.deepcopy(base_camera)
+            saved_camera['direction'] = [1, 0, 0]
+            raw['camera_save'] = {'method': 'native orbit to non-default direction; observe settled camera before saving',
+                'before_drag': copy.deepcopy(base_camera), 'before_save': saved_camera, 'after_save': copy.deepcopy(saved_camera),
+                'image': next(image for image in images if image['path'] == 'save-camera.png')}
+            state = {'vertices': 30, 'triangles': 10, 'degenerate': 0, 'clipped': 0, 'nonfinite': 0, 'diag': '', 'tier': 'certified', 'gates_pass': True, 'hash': 'protocol-certified-geometry'}
+            raw['save_state'] = state
+            raw['failure_state'] = dict(state)
+        evidence.validate_native_renderer(raw, expected_sha=SHA, expected_arch=arch, expected_version=VERSION,
+                                          bundled=bundled, started=launch_started, finished=launch_finished)
+        return raw
 
     def renderer(directory):
-        images = []
-        for i in range(18):
-            path = directory + f"/frame-{i}.png"
-            files[path] = png(i)
-            images.append({**linked(path, directory), "width": 100, "height": 100})
-        native = {**identity, "matrix": copy.deepcopy(matrix), "images": images,
-                  "lifecycle": {"pass": True, "close_reopen": True, "secondary_exit": 0, "secondary_pid": 12,
-                                "second_instance_events": 1, "worker_pid_before": 11, "worker_pid_after": 11},
-                  "worker_pid": 11, "app_pid": 10, "packaged": True, "bundled_worker": True,
-                  "worker_shutdown": True, "challenge": "fixture", "errors": []}
-        put(directory + "/renderer.json", native)
+        cold = raw_renderer(directory + '/bundled', True)
+        put(directory + '/bundled/renderer.json', cold)
+        raw = raw_renderer(directory, False)
+        runtime_path = directory + '/worker-runtime.json'
+        runtime = {'schema': 1, 'pid': 11, 'challenge': 'fixture', 'frozen': True, 'executable': raw['worker_executable'],
+                   'resource_root': resources + '/worker/_internal', 'wall_time_ms': 8000, 'monotonic_ms': 8000}
+        put(runtime_path, runtime)
+        put(directory + '/bundle-before.json', inventory)
+        put(directory + '/bundle-after.json', inventory)
+        native = {**raw, 'images': prefixed(cold['images'], 'bundled') + raw['images'],
+            'renderer_started': raw['started'], 'renderer_finished': raw['finished'], 'renderer_checkpoints': raw['checkpoints'],
+            'started': {'wall_time_ms': 900, 'monotonic_ms': 900}, 'finished': {'wall_time_ms': 11000, 'monotonic_ms': 11000},
+            'checkpoints': [{'name': 'native-start', 'wall_time_ms': 950, 'monotonic_ms': 950},
+                {'name': 'bundled-launch-complete', 'wall_time_ms': 5100, 'monotonic_ms': 5100},
+                {'name': 'native-complete', 'wall_time_ms': 10900, 'monotonic_ms': 10900}],
+            'bundled_report': linked(directory + '/bundled/renderer.json', directory),
+            'worker_runtime': runtime, 'worker_runtime_evidence': linked(runtime_path, directory),
+            'bundle_before': linked(directory + '/bundle-before.json', directory), 'bundle_after': linked(directory + '/bundle-after.json', directory),
+            'bundle': bundle}
+        put(directory + '/renderer.json', native)
         return native
 
-    renderer(f"evidence/mac-{arch}")
-    for extension in ("zip", "dmg"):
-        directory = f"evidence/{extension}-{arch}"
-        launches = {}
-        for launch in (("mounted", "copied") if extension == "dmg" else ("extracted", "copied")):
-            native = renderer(directory + "/" + launch)
-            launches[launch] = {"matrix": copy.deepcopy(matrix),
-                                "native_report": linked(directory + "/" + launch + "/renderer.json", directory)}
-        asset = f"dist/mac-app/CassQuery-{VERSION}-mac-{arch}.{extension}"
-        put(directory + "/package.json", {**identity, "asset": record(asset, files[asset]),
-                                         "launches": launches, "temp_root_removed": True, "detach_completed": True})
+    renderer(f'evidence/mac-{arch}')
+    for extension in ('zip', 'dmg'):
+        directory = f'evidence/{extension}-{arch}'
+        launches, aggregate = {}, []
+        for label in (('mounted', 'copied') if extension == 'dmg' else ('extracted', 'copied')):
+            native = renderer(directory + '/' + label)
+            launches[label] = {'matrix': prefixed(native['matrix'], label), 'images': prefixed(native['images'], label), 'bundle': bundle,
+                              'native_report': linked(directory + '/' + label + '/renderer.json', directory)}
+            aggregate.extend(launches[label]['images'])
+        put(directory + '/checked-inventory.json', inventory)
+        put(directory + '/bundle-inventory.json', inventory)
+        asset = f'dist/mac-app/CassQuery-{VERSION}-mac-{arch}.{extension}'
+        put(directory + '/package.json', {**identity, 'asset': record(asset, files[asset]), 'images': aggregate,
+            'checked_inventory': linked(directory + '/checked-inventory.json', directory),
+            'bundle_inventory': linked(directory + '/bundle-inventory.json', directory), 'checked_bundle_sha256': inventory['sha256'],
+            'launches': launches, 'temp_root_removed': True, 'detach_completed': True})
     stages = []
-    for stage in ("syntax", "node", "python", "release-contract", "brand-exports"):
-        path = "evidence/" + stage + ".log"
-        files[path] = b"bounded successful protocol fixture, not actual CI\n"
-        stages.append({"name": stage, "exit": 0, **linked(path, "evidence")})
-    put("evidence/preflight.json", {**identity, "source_fingerprint": FINGERPRINT, "after_fingerprint": FINGERPRINT,
-                                    "clean": True, "failures": 0, "skipped": 0, "tests": 20, "stages": stages,
-                                    "started_at": 1, "completed_at": 2})
-    runtime_path = f"evidence/worker-{arch}-runtime.json"
-    runtime = {"pid": 11, "challenge": "fixture", "frozen": True}
+    python_counts = {'schema': 1, 'tests': 4, 'collected': 4, 'failures': 0, 'skipped': 0,
+                     'files': sorted(name for name in SOURCE_INPUTS if name.startswith('tests/test_') and name.endswith('.py'))}
+    put('evidence/python-counts.json', python_counts)
+    for index, stage in enumerate(('syntax', 'node', 'python', 'release-contract', 'brand-exports')):
+        path = 'evidence/' + stage + '.log'
+        if stage == 'node':
+            text = 'TAP version 13\n' + ''.join(f'ok {i} - synthetic protocol fixture {i}\n' for i in range(1, 5))
+            text += '1..4\n# tests 4\n# suites 0\n# pass 4\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n# duration_ms 250\n'
+        elif stage == 'python':
+            text = 'Synthetic protocol fixture, not actual CI\nRan 4 tests in 0.100s\n\nOK\n'
+        else:
+            text = 'bounded successful protocol fixture, not actual CI\n'
+        files[path] = text.encode()
+        item = {'name': stage, 'exit': 0, **linked(path, 'evidence'), 'started_at': 10 + index,
+                'completed_at': 10.25 + index, 'duration_s': 0.25}
+        if stage in ('node', 'python'):
+            item.update(tests=4, failures=0, skipped=0)
+        if stage == 'node':
+            item['files'] = sorted(name for name in SOURCE_INPUTS if name.startswith('tests/') and name.endswith('.cjs'))
+        if stage == 'python':
+            item['counts'] = linked('evidence/python-counts.json', 'evidence')
+        stages.append(item)
+    put('evidence/preflight.json', {**identity, 'source_fingerprint': FINGERPRINT, 'after_fingerprint': FINGERPRINT,
+        'clean': True, 'failures': 0, 'skipped': 0, 'tests': 8, 'stages': stages, 'started_at': 9, 'completed_at': 16})
+    runtime_path = f'evidence/worker-{arch}-runtime.json'
+    runtime = {'schema': 1, 'pid': 11, 'challenge': 'fixture', 'frozen': True, 'executable': '/protocol-only/cassquery-worker',
+               'resource_root': '/protocol-only/_internal', 'wall_time_ms': 2000, 'monotonic_ms': 2000}
     put(runtime_path, runtime)
     ids = ('units', 'watertight', 'volume', 'thin-extent', 'triangulation', 'payload-roundtrip', 'budget-tris', 'budget-bytes')
-    put(f"evidence/worker-{arch}.json", {**identity, "gates": {"pass": True, "checks": [{"id": gate, "status": "pass"} for gate in ids]},
-                                         "worker_pid": 11, "challenge": "fixture", "worker_runtime": runtime,
-                                         "worker_shutdown": True, "runtime_evidence": linked(runtime_path, "evidence")})
+    put(f'evidence/worker-{arch}.json', {**identity, 'gates': {'pass': True, 'checks': [{'id': gate, 'status': 'pass'} for gate in ids]},
+        'worker_pid': 11, 'challenge': 'fixture', 'worker_runtime': runtime, 'executable': {'path': runtime['executable']},
+        'checkpoints': [{'name': 'worker-smoke-start', **started}, {'name': 'worker-smoke-complete', **finished}],
+        'worker_shutdown': True, 'runtime_evidence': linked(runtime_path, 'evidence')})
     components = []
     wheels = json.loads(LOCKED_INPUTS["packaging/wheel-manifest.json"])["wheels"]
     for line in LOCKED_INPUTS["requirements-build.txt"].decode().splitlines():
@@ -176,10 +320,15 @@ class FakeAPI:
         self.run = {"id": RUN_ID, "run_attempt": 1, "repository": repo, "head_repository": repo,
                     "head_sha": SHA, "event": "push", "head_branch": "main", "status": "completed",
                     "conclusion": "success", "path": m.CANDIDATE_WORKFLOW, "workflow_id": 5}
-        self.jobs = [{"id": 20 + i, "name": name, "status": "completed", "conclusion": "success",
+        self.jobs = [{"id": 20 + i, "run_id": RUN_ID, "head_sha": SHA, "run_attempt": 1, "head_branch": "main", "name": name, "status": "completed", "conclusion": "success",
                       "steps": [{"name": step, "status": "completed", "conclusion": "success"}
                                 for step in evidence.REQUIRED_STEPS]}
                      for i, name in enumerate(("candidate (macos-15, arm64)", "candidate (macos-15-intel, x64)"))]
+        self.integration_run = {**copy.deepcopy(self.run), 'id': 101, 'run_number': 11, 'workflow_id': 7,
+                                'path': '.github/workflows/integration.yml'}
+        self.integration_jobs = [{'id': 31, 'run_id': 101, 'head_sha': SHA, 'run_attempt': 1, 'head_branch': 'main',
+                                 'name': 'integration', 'status': 'completed', 'conclusion': 'success',
+                                 'steps': [{'name': step, 'status': 'completed', 'conclusion': 'success'} for step in evidence.INTEGRATION_STEPS]}]
         self.archives = {}
         self.originals = {}
         self.artifacts = []
@@ -234,6 +383,14 @@ class FakeAPI:
             return {"ref": "refs/tags/" + TAG, "object": {"type": self.tag_type, "sha": self.tag_sha}}
         if tail.startswith("/git/tags/"):
             return {"sha": self.tag_sha, "tag": TAG, "object": {"type": "commit", "sha": self.tag_commit}}
+        if tail == '/actions/workflows/integration.yml':
+            return {'id': 7, 'path': '.github/workflows/integration.yml'}
+        if tail == '/actions/workflows/7/runs':
+            return {'workflow_runs': [copy.deepcopy(self.integration_run)], 'total_count': 1}
+        if tail == '/actions/runs/101':
+            return copy.deepcopy(self.integration_run)
+        if tail == f"/actions/runs/101/attempts/{self.integration_run['run_attempt']}/jobs":
+            return {'jobs': copy.deepcopy(self.integration_jobs), 'total_count': len(self.integration_jobs)}
         if tail == "/actions/workflows/macos-candidate.yml":
             return {"id": 5, "path": m.CANDIDATE_WORKFLOW}
         if tail == "/actions/workflows/release.yml":
@@ -435,7 +592,7 @@ class PromotionTests(unittest.TestCase):
         changes = [lambda: setattr(self.api, "environment", None),
                    lambda: self.api.environment.update(protection_rules=[]),
                    lambda: self.api.environment["protection_rules"][0].update(reviewers=[]),
-                   lambda: self.api.environment["protection_rules"][0].update(prevent_self_review=False),
+                   lambda: self.api.environment["protection_rules"][0].update(prevent_self_review=None),
                    lambda: self.api.environment.update(deployment_branch_policy=None),
                    lambda: self.api.policies[0].update(name="*"),
                    lambda: self.api.policies[0].update(type="branch"),
@@ -591,7 +748,7 @@ class PromotionTests(unittest.TestCase):
 
     def test_reported_tag_policy_without_reviewers_blocks_before_download_or_write(self):
         self.api.environment["protection_rules"] = [{"type": "branch_policy"}]
-        with self.assertRaisesRegex(ValueError, "independent review"):
+        with self.assertRaisesRegex(ValueError, "configured reviewers"):
             self.prepare()
         self.assertFalse(self.writes())
         self.assertFalse(any(method == "DOWNLOAD" for method, path in self.api.calls))

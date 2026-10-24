@@ -25,13 +25,32 @@ python -m pip check''',
     'Assemble native app without publishing': 'npx electron-builder --config packaging/electron-builder.json --mac --dir --${{ matrix.arch }} --publish never',
     'Render the actual bundled application': '''APP=$(printf '%s\\n' dist/mac-app/mac*/CassQuery.app)
 python tools/macos_smoke.py --app "$APP" --output evidence/mac-${{ matrix.arch }}''',
-    'Package checked app': '''npx electron-builder --config packaging/electron-builder.json --mac --${{ matrix.arch }} --prepackaged "$(printf '%s\\n' dist/mac-app/mac*/CassQuery.app)" --publish never''',
+    'Package checked app': '''python - <<'PY'
+import json, os, re
+from pathlib import Path
+version = json.loads(Path('package.json').read_text())['version']
+arch = os.environ['CASSQUERY_ARCH']
+if not re.fullmatch(r'\\d+\\.\\d+\\.\\d+', version) or arch not in ('arm64', 'x64'):
+    raise RuntimeError('Invalid owned package name')
+directory = Path('dist/mac-app')
+if directory.resolve() != Path.cwd() / directory:
+    raise RuntimeError('Package output is redirected outside its owned path')
+files = [directory / f'CassQuery-{version}-mac-{arch}.{extension}'
+         for extension in ('zip', 'dmg', 'zip.blockmap', 'dmg.blockmap')]
+if any(file.is_symlink() or (file.exists() and not file.is_file()) for file in files):
+    raise RuntimeError('Refusing to remove a nonregular package output')
+for file in files:
+    file.unlink(missing_ok=True)
+PY
+npx electron-builder --config packaging/electron-builder.json --mac --${{ matrix.arch }} --prepackaged "$(printf '%s\\n' dist/mac-app/mac*/CassQuery.app)" --publish never''',
     'Verify and launch the final ZIP': '''ARCH=${{ matrix.arch }}
 if [ "$ARCH" = x64 ]; then ARCH=x86_64; fi
-python tools/zip_smoke.py --zip "$(printf '%s\\n' dist/mac-app/*.zip)" --arch "$ARCH" --output evidence/zip-${{ matrix.arch }}''',
+APP=$(printf '%s\\n' dist/mac-app/mac*/CassQuery.app)
+python tools/zip_smoke.py --zip "$(printf '%s\\n' dist/mac-app/*.zip)" --arch "$ARCH" --output evidence/zip-${{ matrix.arch }} --checked-app "$APP" --checked-inventory evidence/mac-${{ matrix.arch }}/bundle-before.json''',
     'Verify and launch the final DMG': '''ARCH=${{ matrix.arch }}
 if [ "$ARCH" = x64 ]; then ARCH=x86_64; fi
-python tools/dmg_smoke.py --dmg "$(printf '%s\\n' dist/mac-app/*.dmg)" --arch "$ARCH" --output evidence/dmg-${{ matrix.arch }}''',
+APP=$(printf '%s\\n' dist/mac-app/mac*/CassQuery.app)
+python tools/dmg_smoke.py --dmg "$(printf '%s\\n' dist/mac-app/*.dmg)" --arch "$ARCH" --output evidence/dmg-${{ matrix.arch }} --checked-app "$APP" --checked-inventory evidence/mac-${{ matrix.arch }}/bundle-before.json''',
     'Candidate identity and hashes': '''python tools/sbom.py --output evidence/sbom.json
 python tools/release_evidence.py stage --arch ${{ matrix.arch }} --output dist/candidate-${{ matrix.arch }}''',
 }
@@ -89,7 +108,8 @@ def check(root=ROOT, python_manifest=None):
     assert document['permissions'] == {'contents': 'read'}, 'excess workflow permissions'
     job = document['jobs']['candidate']
     assert job['env'].get('CSC_FOR_PULL_REQUEST') == 'true', 'PR ad-hoc sealing must not be skipped'
-    assert job['env'].get('CASSQUERY_ANGLE') == 'metal' and 'CASSQUERY_SOFTWARE_GL' not in job['env'], 'macOS CI must use explicit ANGLE Metal, not forced Vulkan SwiftShader'
+    assert job['env'].get('CASSQUERY_ANGLE') == 'swiftshader' and 'CASSQUERY_SOFTWARE_GL' not in job['env'], 'macOS CI must explicitly exercise the bundled software renderer'
+    assert builder.get('afterPack') == './tools/package_renderer.cjs', 'software renderer discovery closure must be installed before sealing'
     assert job['env'].get('CSC_IDENTITY_AUTO_DISCOVERY') == 'false', 'candidate must not discover owner signing identity'
     assert job.get('continue-on-error', False) is False and 'if' not in job, 'candidate job can bypass gates'
     assert job.get('permissions', document['permissions']) == {'contents': 'read'}, 'candidate permissions exceed read-only'

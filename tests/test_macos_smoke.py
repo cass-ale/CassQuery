@@ -1,5 +1,6 @@
 """Native evidence boundary regressions; no app/keychain/process operations."""
 import copy
+import hashlib
 import importlib.util
 import json
 import os
@@ -11,6 +12,7 @@ from unittest.mock import patch
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tools'))
 VERSION = json.loads((ROOT / 'package.json').read_text())['version']
 spec = importlib.util.spec_from_file_location('assurance_macos', ROOT / 'tools/macos_smoke.py')
 module = importlib.util.module_from_spec(spec)
@@ -42,25 +44,68 @@ class SmokeEvidenceTests(unittest.TestCase):
                     matrix.append({'theme': theme, 'realized_theme': theme, 'background': theme,
                         'width': width, 'state': state, 'status': 'checked', 'viewport': [width, 700],
                         'full_size': [width, 700], 'scroll_regions': [], 'vertical_scroll': False,
-                        'vertices': 30, 'meshes': 3, 'controls_checked': 15, 'clipped': 0, 'nonfinite': 0,
+                        'vertices': 30, 'triangles': 10, 'degenerate': 0, 'meshes': 3, 'controls_checked': 15, 'clipped': 0, 'nonfinite': 0,
                         'overflow': False, 'bad': [], 'overlaps': [], 'errors': [], 'diag': '', 'tier': 'certified',
                         'gates_pass': True, 'step_pressed': ['true', 'false'] if state == 'assembled' else ['false', 'true'],
                         'explode': '0%' if state == 'assembled' else '100%',
                         'canvas': {'width': width, 'height': 600, 'client_width': width, 'client_height': 600}, 'image': image})
         for name in ('assembled', 'apart', 'save-certified', 'gate-failed'):
             file = self.output / f'{name}.png'
-            Image.new('RGB', (1320, 700), (50, 60, 70)).save(file)
+            if name in ('assembled', 'apart'):
+                file.write_bytes((self.output / f'light-1320-{name}.png').read_bytes())
+            else:
+                Image.new('RGB', (1320, 700), (50, 60, 70)).save(file)
             images.append(module.image_evidence(file))
+        for name in ('orbit-drag', 'orbit-reset', 'pan-drag', 'pan-reset', 'save-camera'):
+            file = self.output / f'{name}.png'
+            Image.new('RGB', (1320, 700), (100 + len(images), 60, 70)).save(file)
+            images.append(module.image_evidence(file))
+        by_name = {Path(image['path']).name: image for image in images}
+        default = (0.95, -1.35, 0.62)
+        length = sum(v * v for v in default) ** 0.5
+        home = {'direction': [v / length for v in default], 'target': [0, 0, 0], 'center': [0, 0, 0], 'radius': 2}
+        orbit = {'direction': [1, 0, 0], 'target': [0, 0, 0], 'center': [0, 0, 0], 'radius': 2}
+        pan = {**home, 'target': [1, 0, 0]}
         self.report = {'schema': 1, 'pass': True, 'challenge': 'current-run', 'app_pid': 12345,
             'worker_pid': 54321, 'packaged': True, 'bundled_worker': True, 'worker_shutdown': True,
             'version': VERSION, 'architecture': 'arm64', 'source_sha': None, 'resources_path': str(self.resources),
+            'render_backend_requested': 'desktop-default',
+            # Synthetic telemetry is only a schema fixture, never device evidence.
+            'graphics': {'runtime': {'electron': '45.0.0', 'chromium': '154.0.0.0', 'node': '26.0.0',
+                                     'platform': 'darwin', 'architecture': 'arm64'},
+                         'display': {'bounds': {'x': 0, 'y': 0, 'width': 1320, 'height': 900},
+                                     'work_area': {'x': 0, 'y': 0, 'width': 1320, 'height': 900},
+                                     'scale_factor': 2,
+                                     'window_bounds': {'x': 0, 'y': 0, 'width': 1320, 'height': 740}},
+                         'gpu': {'gpuDevice': [{'active': True, 'vendorId': 0, 'deviceId': 0}]},
+                         'webgl': {'context': 'webgl2', 'vendor': 'fixture vendor', 'renderer': 'fixture renderer',
+                                   'version': 'WebGL 2.0 fixture', 'shading_language': 'WebGL GLSL ES 3.00 fixture',
+                                   'unmasked_vendor': 'fixture vendor', 'unmasked_renderer': 'fixture hardware',
+                                   'is_context_lost': False, 'drawing_buffer': [2640, 1400], 'viewport': [1320, 700], 'dpr': 2}},
             'worker_executable': str(self.resources / 'worker/cassquery-worker'), 'errors': [],
             'started': {'wall_time_ms': 1100, 'monotonic_ms': 1100}, 'checkpoints': checkpoints,
             'finished': {'wall_time_ms': 4000, 'monotonic_ms': 4000}, 'checks': list(module.CHECKS),
             'lifecycle': {'pass': True, 'secondary_pid': 22222, 'secondary_exit': 0, 'second_instance_events': 1,
                           'close_reopen': True, 'worker_pid_before': 54321, 'worker_pid_after': 54321},
             'matrix': matrix, 'images': images,
+            'camera_checks': [{'mode': mode, 'status': 'checked',
+                               'method': 'native pointer drag then Reset; observed at 700ms and 3s',
+                               'before': copy.deepcopy(home), 'after_drag': copy.deepcopy(orbit if mode == 'orbit' else pan),
+                               'after_reset_700': copy.deepcopy(home), 'after_reset_settled': copy.deepcopy(home),
+                               'drag_image': by_name[f'{mode}-drag.png'], 'reset_image': by_name[f'{mode}-reset.png']}
+                              for mode in ('orbit', 'pan')],
+            'camera_save': {'method': 'native orbit to non-default direction; observe settled camera before saving',
+                            'before_drag': copy.deepcopy(home), 'before_save': copy.deepcopy(orbit),
+                            'after_save': {**copy.deepcopy(orbit), 'radius': 3}, 'image': by_name['save-camera.png']},
+            'save_state': {'vertices': 30, 'triangles': 10, 'degenerate': 0, 'clipped': 0, 'nonfinite': 0, 'tier': 'certified',
+                           'gates_pass': True, 'hash': 'certified-save', 'diag': ''},
+            'failure_state': {'vertices': 30, 'triangles': 10, 'degenerate': 0, 'clipped': 0, 'nonfinite': 0, 'tier': 'certified',
+                              'gates_pass': True, 'hash': 'certified-save', 'diag': 'deliberate failed gate'},
             'screenshots': [str(self.output / 'assembled.png'), str(self.output / 'apart.png')]}
+        source = {'files': [{'bytes': (ROOT / name).stat().st_size, 'path': name, 'sha256': module.sha256(ROOT / name)}
+                            for name in module.SHELL_FILES]}
+        source['fingerprint'] = hashlib.sha256(json.dumps(source, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        self.report['native_source'] = source
 
     def validate(self, report=None, bundled=False):
         with patch.dict(os.environ, {}, clear=True):
@@ -129,7 +174,10 @@ class SmokeEvidenceTests(unittest.TestCase):
     def test_bundled_default_rejects_external_project(self):
         report = copy.deepcopy(self.report)
         report['checks'] = ['bundled default certified demo']
-        report['images'] = report['images'][:-2]
+        report['images'] = [image for image in report['images']
+                            if Path(image['path']).name not in ('save-camera.png', 'save-certified.png', 'gate-failed.png')]
+        for key in ('camera_save', 'save_state', 'failure_state'):
+            report.pop(key)
         report['worker_status'] = {'api_version': 2, 'load_errors': [], 'projects': [{'name': 'TESTPLATE', 'root': str(self.resources / 'worker/_internal/testpart')}]}
         self.validate(report, bundled=True)
         report['worker_status']['projects'][0]['root'] = '/external/demo'
@@ -179,7 +227,7 @@ raise SystemExit(1)
                     os.kill(pid, 9)
                     self.fail('failed native launch left its child running')
 
-    def test_native_renderer_is_explicit_metal_not_vulkan_fallback(self):
+    def test_native_renderer_accepts_explicit_packaged_swiftshader_and_metal(self):
         with patch.dict(os.environ, {'CASSQUERY_ANGLE': 'metal'}, clear=True):
             env, backend = module.renderer_environment({'PATH': '/usr/bin:/bin'})
             self.assertEqual(env['CASSQUERY_ANGLE'], 'metal')
@@ -190,9 +238,79 @@ raise SystemExit(1)
             self.assertNotIn('CASSQUERY_SOFTWARE_GL', env)
             self.assertNotIn('CASSQUERY_ANGLE', env)
             self.assertEqual(backend, 'desktop-default')
-        for values in ({'CASSQUERY_SOFTWARE_GL': '1'}, {'CASSQUERY_ANGLE': 'swiftshader'}, {'CASSQUERY_ANGLE': 'vulkan'}):
+        with patch.dict(os.environ, {'CASSQUERY_ANGLE': 'swiftshader'}, clear=True):
+            env, backend = module.renderer_environment({})
+            self.assertEqual(env['CASSQUERY_ANGLE'], 'swiftshader')
+            self.assertEqual(backend, 'swiftshader-requested')
+        for values in ({'CASSQUERY_SOFTWARE_GL': '1'}, {'CASSQUERY_ANGLE': 'vulkan'},
+                       {'CASSQUERY_ANGLE': 'swiftshader', 'CASSQUERY_SOFTWARE_GL': '1'}):
             with self.subTest(values=values), patch.dict(os.environ, values, clear=True), self.assertRaises(RuntimeError):
                 module.renderer_environment({})
+
+    def test_save_failure_semantics_use_the_shared_strict_validator(self):
+        from release_evidence import validate_native_renderer
+        for key in ('save_state', 'failure_state'):
+            for change in ({'vertices': 0}, {'vertices': True}, {'tier': 'preview'}, {'gates_pass': False}, {'hash': ''}):
+                report = copy.deepcopy(self.report); report[key].update(change)
+                with self.subTest(key=key, change=change):
+                    with self.assertRaises(RuntimeError):
+                        self.validate(report)
+                    with self.assertRaises(ValueError):
+                        validate_native_renderer(report, expected_sha=None, expected_arch='arm64', expected_version=VERSION,
+                                                 bundled=False, started=self.started, finished=self.finished)
+        report = copy.deepcopy(self.report); report['failure_state']['hash'] = 'wrong retained hash'
+        with self.assertRaises(RuntimeError): self.validate(report)
+
+    def test_requested_software_needs_actual_unmasked_webgl_observation(self):
+        report = copy.deepcopy(self.report)
+        report['render_backend_requested'] = 'swiftshader-requested'
+        report['graphics']['webgl']['unmasked_renderer'] = 'ANGLE (fixture SwiftShader driver)'
+        with patch.dict(os.environ, {'CASSQUERY_ANGLE': 'swiftshader'}, clear=True):
+            module.validate_renderer(report, self.output, 'current-run', 12345, self.app, VERSION,
+                                     'arm64', self.started, self.finished, bundled=False)
+            for observed in ('', 'ANGLE (fixture hardware)', None):
+                bad = copy.deepcopy(report); bad['graphics']['webgl']['unmasked_renderer'] = observed
+                with self.subTest(observed=observed), self.assertRaises(RuntimeError):
+                    module.validate_renderer(bad, self.output, 'current-run', 12345, self.app, VERSION,
+                                             'arm64', self.started, self.finished, bundled=False)
+        with self.assertRaises(RuntimeError): self.validate(report)  # Claim differs from actual requested env.
+
+    def test_native_camera_input_reset_and_save_semantics_fail_closed(self):
+        mutations = [
+            lambda r: r.update(camera_checks=[]),
+            lambda r: r['camera_checks'][0].update(after_drag=copy.deepcopy(r['camera_checks'][0]['before'])),
+            lambda r: r['camera_checks'][1].update(after_drag=copy.deepcopy(r['camera_checks'][1]['before'])),
+            lambda r: r['camera_checks'][0]['after_reset_700'].update(direction=[1, 0, 0]),
+            lambda r: r['camera_checks'][1]['after_reset_settled'].update(target=[1, 0, 0]),
+            lambda r: r['camera_save'].update(before_save=copy.deepcopy(r['camera_save']['before_drag'])),
+            lambda r: r['camera_save']['after_save'].update(direction=[0, 1, 0]),
+            lambda r: r['matrix'][0].update(triangles=11),
+            lambda r: r['matrix'][0].update(degenerate=1),
+        ]
+        for mutation in mutations:
+            report = copy.deepcopy(self.report); mutation(report)
+            with self.subTest(mutation=mutation), self.assertRaises(RuntimeError):
+                self.validate(report)
+
+    def test_native_source_tuple_is_bound_to_actual_checked_shell(self):
+        for change in ('missing', 'different-source'):
+            report = copy.deepcopy(self.report)
+            if change == 'missing':
+                report.pop('native_source')
+            else:
+                report['native_source']['files'][0]['sha256'] = '0' * 64
+                identity = {'files': report['native_source']['files']}
+                report['native_source']['fingerprint'] = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            with self.subTest(change=change), self.assertRaises(RuntimeError):
+                self.validate(report)
+
+    def test_nonsymlink_app_root_failure_overwrites_prior_pass(self):
+        target = self.root / 'other.app'; target.mkdir()
+        self.app.symlink_to(target)
+        file = self.output / 'renderer.json'; file.write_text('{"schema":1,"pass":true}')
+        with self.assertRaisesRegex(RuntimeError, 'nonsymlink app root'):
+            module.run_smoke(self.app, self.output, 'arm64')
+        self.assertIs(json.loads(file.read_text())['pass'], False)
 
     def test_native_failure_overwrites_stale_pass(self):
         file = self.output / 'renderer.json'

@@ -24,7 +24,7 @@ jobs:
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
       CASSQUERY_ARCH: ${{ matrix.arch }}
-      CASSQUERY_ANGLE: 'metal' # Explicit macOS ANGLE backend; no Vulkan/software fallback.
+      CASSQUERY_ANGLE: 'swiftshader' # Explicit packaged driver; actual WebGL software observation required.
       CSC_FOR_PULL_REQUEST: 'true' # Secret-free ad-hoc identity only.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -66,17 +66,37 @@ jobs:
           APP=$(printf '%s\n' dist/mac-app/mac*/CassQuery.app)
           python tools/macos_smoke.py --app "$APP" --output evidence/mac-${{ matrix.arch }}
       - name: Package checked app
-        run: npx electron-builder --config packaging/electron-builder.json --mac --${{ matrix.arch }} --prepackaged "$(printf '%s\n' dist/mac-app/mac*/CassQuery.app)" --publish never
+        run: |
+          python - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          version = json.loads(Path('package.json').read_text())['version']
+          arch = os.environ['CASSQUERY_ARCH']
+          if not re.fullmatch(r'\d+\.\d+\.\d+', version) or arch not in ('arm64', 'x64'):
+              raise RuntimeError('Invalid owned package name')
+          directory = Path('dist/mac-app')
+          if directory.resolve() != Path.cwd() / directory:
+              raise RuntimeError('Package output is redirected outside its owned path')
+          files = [directory / f'CassQuery-{version}-mac-{arch}.{extension}'
+                   for extension in ('zip', 'dmg', 'zip.blockmap', 'dmg.blockmap')]
+          if any(file.is_symlink() or (file.exists() and not file.is_file()) for file in files):
+              raise RuntimeError('Refusing to remove a nonregular package output')
+          for file in files:
+              file.unlink(missing_ok=True)
+          PY
+          npx electron-builder --config packaging/electron-builder.json --mac --${{ matrix.arch }} --prepackaged "$(printf '%s\n' dist/mac-app/mac*/CassQuery.app)" --publish never
       - name: Verify and launch the final ZIP
         run: |
           ARCH=${{ matrix.arch }}
           if [ "$ARCH" = x64 ]; then ARCH=x86_64; fi
-          python tools/zip_smoke.py --zip "$(printf '%s\n' dist/mac-app/*.zip)" --arch "$ARCH" --output evidence/zip-${{ matrix.arch }}
+          APP=$(printf '%s\n' dist/mac-app/mac*/CassQuery.app)
+          python tools/zip_smoke.py --zip "$(printf '%s\n' dist/mac-app/*.zip)" --arch "$ARCH" --output evidence/zip-${{ matrix.arch }} --checked-app "$APP" --checked-inventory evidence/mac-${{ matrix.arch }}/bundle-before.json
       - name: Verify and launch the final DMG
         run: |
           ARCH=${{ matrix.arch }}
           if [ "$ARCH" = x64 ]; then ARCH=x86_64; fi
-          python tools/dmg_smoke.py --dmg "$(printf '%s\n' dist/mac-app/*.dmg)" --arch "$ARCH" --output evidence/dmg-${{ matrix.arch }}
+          APP=$(printf '%s\n' dist/mac-app/mac*/CassQuery.app)
+          python tools/dmg_smoke.py --dmg "$(printf '%s\n' dist/mac-app/*.dmg)" --arch "$ARCH" --output evidence/dmg-${{ matrix.arch }} --checked-app "$APP" --checked-inventory evidence/mac-${{ matrix.arch }}/bundle-before.json
       - name: Candidate identity and hashes
         run: |
           python tools/sbom.py --output evidence/sbom.json

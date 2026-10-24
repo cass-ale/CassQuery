@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       candidate_run_id:
-        description: Successful main-push candidate run at this exact source SHA
+        description: Successful exact-SHA native candidate; latest main-push integration must also pass
         required: true
         type: string
       tag:
@@ -55,7 +55,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     # prepare fails before this reference can auto-create an absent/unprotected env.
-    # The owner must configure required reviewers, prevent-self-review and v* tags only.
+    # Owner configures required reviewers and v* tags; self-review follows that policy.
+    # Publication still requires recorded approval by a currently eligible reviewer.
     environment: releases
     permissions:
       contents: read

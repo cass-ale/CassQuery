@@ -78,12 +78,12 @@ class EvidenceTests(unittest.TestCase):
                 evidence.relative_file(root, 'link')
 
     def test_actual_ci_steps_not_just_green_workflow(self):
-        run = {'repository': {'full_name': evidence.REPOSITORY}, 'head_repository': {'full_name': evidence.REPOSITORY}, 'head_sha': SHA,
+        run = {'id': 100, 'run_attempt': 1, 'repository': {'full_name': evidence.REPOSITORY}, 'head_repository': {'full_name': evidence.REPOSITORY}, 'head_sha': SHA,
                'event': 'push', 'head_branch': 'main', 'path': '.github/workflows/macos-candidate.yml',
                'status': 'completed', 'conclusion': 'success'}
-        jobs = [{'name': name, 'status': 'completed', 'conclusion': 'success',
+        jobs = [{'id': 20 + i, 'run_id': 100, 'head_sha': SHA, 'name': name, 'status': 'completed', 'conclusion': 'success',
                  'steps': [{'name': step, 'status': 'completed', 'conclusion': 'success'} for step in evidence.REQUIRED_STEPS]}
-                for name in ('candidate (macos-15, arm64)', 'candidate (macos-15-intel, x64)')]
+                for i, name in enumerate(('candidate (macos-15, arm64)', 'candidate (macos-15-intel, x64)'))]
         evidence.verify_run(run, jobs, SHA)
         for conclusion in ('skipped', 'failure', 'cancelled', None):
             bad = copy.deepcopy(jobs)
@@ -161,8 +161,8 @@ class EvidenceTests(unittest.TestCase):
         module_spec.loader.exec_module(png)
         from test_release_publish import candidate_bytes
         data, files = candidate_bytes('arm64')
-        image = next(value for name, value in files.items() if name.endswith('.png'))
-        self.assertEqual(png.dimensions(image), (100, 100))
+        image = files['evidence/mac-arm64/bundled/dark-450-assembled.png']
+        self.assertEqual(png.dimensions(image), (450, 700))
         with self.assertRaises(ValueError):
             png.dimensions(image[:33])
 
@@ -182,3 +182,246 @@ class EvidenceTests(unittest.TestCase):
             self.assertNotEqual(before['fingerprint'], after['fingerprint'])
             (root / 'extra').write_text('new')
             self.assertNotEqual(after['fingerprint'], evidence.source_snapshot(root)['fingerprint'])
+
+
+class NativeConformanceTests(unittest.TestCase):
+    """Actual verifier + physical rehashed protocol evidence, never native proof."""
+
+    def setUp(self):
+        import test_release_publish as fixtures
+        self.fixtures = fixtures
+        _, self.files = fixtures.candidate_bytes('arm64')
+        self.scratch = tempfile.TemporaryDirectory(prefix='cq-conformance-')
+        self.addCleanup(self.scratch.cleanup)
+        self.root = Path(self.scratch.name).resolve()
+        self.reset()
+        self.verify()  # One complete positive; reset restores these exact bytes for each mutation.
+
+    def reset(self):
+        for name, data in self.files.items():
+            file = self.root / name
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.write_bytes(data)
+
+    def verify(self):
+        return evidence.verify_candidate(self.root, expected_sha=self.fixtures.SHA,
+            expected_run_id=self.fixtures.RUN_ID, expected_attempt=1, expected_arch='arm64', expected_version=self.fixtures.VERSION)
+
+    def report(self, name):
+        return json.loads((self.root / name).read_text())
+
+    def put(self, name, value):
+        (self.root / name).write_text(json.dumps(value, indent=2) + '\n')
+
+    def refresh(self):
+        # Rehash physical linked children bottom-up, then the complete candidate.
+        def links(value, directory):
+            if isinstance(value, dict):
+                if isinstance(value.get('path'), str) and 'sha256' in value:
+                    path = directory / value['path']
+                    if path.is_file() and path.resolve().is_relative_to(self.root):
+                        value['sha256'] = evidence.digest(path)
+                        if 'bytes' in value:
+                            value['bytes'] = path.stat().st_size
+                for item in value.values():
+                    links(item, directory)
+            elif isinstance(value, list):
+                for item in value:
+                    links(item, directory)
+        files = [p for p in (self.root / 'evidence').rglob('*.json') if p.name != 'source-before.json']
+        for file in sorted(files, key=lambda p: (len(p.parts), p.name not in ('renderer.json', 'package.json', 'preflight.json', 'worker-arm64.json')), reverse=True):
+            value = json.loads(file.read_text())
+            links(value, file.parent)
+            file.write_text(json.dumps(value, indent=2) + '\n')
+        manifest = self.report('candidate.json')
+        manifest['files'] = [evidence.file_record(self.root, name) for name in sorted(self.files) if name != 'candidate.json']
+        records = {record['path']: record for record in manifest['files']}
+        manifest['gates'] = {name: records[path.format(arch='arm64')] for name, path in evidence.GATES.items()}
+        manifest['assets'] = [records[asset['path']] for asset in manifest['assets']]
+        self.put('candidate.json', manifest)
+
+    def test_complete_producer_protocol_and_all_physical_images_pass(self):
+        self.verify()
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('portable_png_test', ROOT / 'tools/png_evidence.py')
+        png = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(png)
+        for name, data in self.files.items():
+            if name.endswith('.png'):
+                width, height = png.dimensions(data)
+                self.assertGreaterEqual(width, 450)
+                self.assertEqual(height, 700)
+
+    def test_actual_raw_contract_is_shared_and_portable(self):
+        report = self.report('evidence/mac-arm64/renderer.json')
+        report.update(started=report['renderer_started'], finished=report['renderer_finished'], checkpoints=report['renderer_checkpoints'])
+        report['images'] = [image for image in report['images'] if not image['path'].startswith('bundled/')]
+        evidence.validate_native_renderer(report, expected_sha=self.fixtures.SHA, expected_arch='arm64', expected_version=self.fixtures.VERSION,
+            bundled=False, started=report['launch']['started'], finished=report['launch']['finished'])
+        # Pure helper neither imports Pillow nor performs a native operation.
+        with mock.patch.dict('sys.modules', {'PIL': None}):
+            evidence.validate_native_matrix(report['matrix'])
+
+    def test_physically_rehashed_renderer_contradictions_fail(self):
+        name = 'evidence/mac-arm64/renderer.json'
+        mutations = [
+            ('missing document geometry', lambda r: [row.pop(k) for row in r['matrix'] for k in ('full_size', 'scroll_regions', 'vertical_scroll')]),
+            ('document not captured', lambda r: r['matrix'][0].update(full_size=[450, 900])),
+            ('missing scroll controls', lambda r: r['matrix'][0].update(scroll_regions=[{'id': 'ASIDE', 'client_height': 500, 'scroll_height': 700}])),
+            ('missing image links', lambda r: [row.pop('image') for row in r['matrix']]),
+            ('same theme colors', lambda r: [row.update(background='same') for row in r['matrix']]),
+            ('boolean execution counts', lambda r: r['matrix'][0].update(vertices=True, meshes=True, controls_checked=True)),
+            ('boolean projection/canvas', lambda r: r['matrix'][0].update(clipped=False, nonfinite=False, canvas={'width': True, 'height': True, 'client_width': True, 'client_height': True})),
+            ('missing drawn triangles', lambda r: r['matrix'][0].pop('triangles')),
+            ('inconsistent drawn references', lambda r: r['matrix'][0].update(triangles=99)),
+            ('degenerate eligible triangles', lambda r: r['matrix'][0].update(degenerate=1)),
+            ('boolean degenerate count', lambda r: r['matrix'][0].update(degenerate=False)),
+            ('renderer errors', lambda r: r.update(errors=['renderer crashed'])),
+            ('not packaged/frozen', lambda r: r.update(packaged=False, bundled_worker=False)),
+            ('not shut down', lambda r: r.update(worker_shutdown=False)),
+            ('missing worker PID', lambda r: r.pop('worker_pid')),
+            ('boolean app PID', lambda r: r.update(app_pid=True)),
+            ('missing challenge', lambda r: r.pop('challenge')),
+            ('wrong executable', lambda r: r.update(worker_executable='/usr/bin/python3')),
+            ('missing clocks', lambda r: r.update(renderer_checkpoints=[])),
+            ('stale clocks', lambda r: r['renderer_checkpoints'][0].update(monotonic_ms=0)),
+            ('missing graphics', lambda r: r.pop('graphics')),
+            ('lost WebGL context', lambda r: r['graphics']['webgl'].update(is_context_lost=True)),
+            ('unobserved software backend', lambda r: r.update(render_backend_requested='swiftshader-requested')),
+            ('missing camera input evidence', lambda r: r.pop('camera_checks')),
+            ('unmoved orbit', lambda r: r['camera_checks'][0]['after_drag'].update(direction=r['camera_checks'][0]['before']['direction'])),
+            ('unmoved pan', lambda r: r['camera_checks'][1]['after_drag'].update(target=r['camera_checks'][1]['before']['target'])),
+            ('reset retained orbit at700ms', lambda r: r['camera_checks'][0]['after_reset_700'].update(direction=[1, 0, 0])),
+            ('reset retained pan at3s', lambda r: r['camera_checks'][1]['after_reset_settled'].update(target=[1, 0, 0])),
+            ('save used default camera', lambda r: r['camera_save']['before_save'].update(direction=r['camera_save']['before_drag']['direction'])),
+            ('save stole settled camera', lambda r: r['camera_save']['after_save'].update(direction=r['camera_save']['before_drag']['direction'])),
+            ('missing settled save capture', lambda r: r['camera_save'].pop('image')),
+            ('missing executed source tuple', lambda r: r.pop('native_source')),
+            ('invalid source fingerprint', lambda r: r['native_source'].update(fingerprint='0' * 64)),
+            ('missing checks', lambda r: r.update(checks=[])),
+            ('missing wrapper clocks', lambda r: r.update(checkpoints=[])),
+            ('wrapper child bounds disagree', lambda r: r['started'].update(monotonic_ms=7000)),
+            ('wrong worker lineage', lambda r: r['lifecycle'].update(worker_pid_after=999)),
+            ('missing screenshot aliases', lambda r: r.update(screenshots=[])),
+            ('save state has no geometry', lambda r: r['save_state'].update(vertices=0)),
+            ('failure state has no geometry', lambda r: r['failure_state'].update(vertices=0)),
+            ('failure retained wrong hash', lambda r: r['failure_state'].update(hash='different')),
+        ]
+        for label, change in mutations:
+            with self.subTest(label=label):
+                self.reset()
+                report = self.report(name)
+                change(report)
+                self.put(name, report)
+                self.refresh()
+                with self.assertRaises(ValueError):
+                    self.verify()
+
+    def test_physical_tiny_png_rehashed_top_and_package_child_fails_geometry(self):
+        import random
+        import struct
+        import zlib
+        rng = random.Random(9)
+        raw = b''.join(b'\0' + rng.randbytes(300) for _ in range(100))
+        def chunk(kind, data):
+            return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data) & 0xffffffff)
+        data = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 100, 100, 8, 2, 0, 0, 0))
+                + chunk(b'IDAT', zlib.compress(raw)) + chunk(b'IEND', b''))
+        self.assertGreater(len(data), 1000)
+        self.assertEqual(len(zlib.decompress(zlib.compress(raw))), 30100)
+        for directory in ('evidence/mac-arm64', 'evidence/zip-arm64/extracted'):
+            with self.subTest(directory=directory):
+                self.reset()
+                basename = 'dark-1320-assembled.png'
+                (self.root / directory / basename).write_bytes(data)
+                report = self.report(directory + '/renderer.json')
+                row = next(row for row in report['matrix'] if row['theme'] == 'dark' and row['width'] == 1320 and row['state'] == 'assembled')
+                row['image'].update(width=100, height=100)
+                for image in report['images']:
+                    if image['path'] == basename:
+                        image.update(width=100, height=100)
+                self.put(directory + '/renderer.json', report)
+                if directory.endswith('/extracted'):
+                    package = self.report('evidence/zip-arm64/package.json')
+                    for row in package['launches']['extracted']['matrix']:
+                        if row['image']['path'] == 'extracted/' + basename:
+                            row['image'].update(width=100, height=100)
+                    for image in package['images'] + package['launches']['extracted']['images']:
+                        if image['path'] == 'extracted/' + basename:
+                            image.update(width=100, height=100)
+                    self.put('evidence/zip-arm64/package.json', package)
+                self.refresh()
+                with self.assertRaisesRegex(ValueError, 'cover viewport/full document'):
+                    self.verify()
+
+    def test_rehashed_linked_cold_runtime_inventory_and_package_contradictions_fail(self):
+        mutations = [
+            ('evidence/mac-arm64/bundled/renderer.json', lambda r: r.update(**{'pass': False})),
+            ('evidence/mac-arm64/worker-runtime.json', lambda r: r.update(frozen=False)),
+            ('evidence/mac-arm64/bundle-after.json', lambda r: r['records'][1].update(sha256='0' * 64)),
+            ('evidence/zip-arm64/extracted/renderer.json', lambda r: r.update(architecture='x64', version='99.0.0')),
+            ('evidence/zip-arm64/package.json', lambda r: r.update(images=[])),
+            ('evidence/zip-arm64/package.json', lambda r: r['launches']['extracted'].update(images=[])),
+            ('evidence/zip-arm64/package.json', lambda r: r.update(checked_bundle_sha256='0' * 64)),
+            ('evidence/zip-arm64/checked-inventory.json', lambda r: r.update(sha256='0' * 64)),
+            ('evidence/sbom.json', lambda r: r['components'][0].update(purl='pkg:pypi/wrong@99.0.0')),
+            ('evidence/sbom.json', lambda r: next(c for c in r['components'] if c['purl'].startswith('pkg:npm/')).update(purl='pkg:npm/wrong@99.0.0')),
+        ]
+        for name, change in mutations:
+            with self.subTest(name=name):
+                self.reset()
+                report = self.report(name)
+                change(report)
+                self.put(name, report)
+                self.refresh()
+                with self.assertRaises(ValueError):
+                    self.verify()
+
+    def test_frozen_worker_missing_identity_cannot_satisfy_none_equality(self):
+        for change in (lambda r: (r.pop('pid'), r.pop('challenge')),
+                       lambda r: r.update(executable='/usr/bin/python3', resource_root='/external', monotonic_ms=0)):
+            self.reset()
+            path = 'evidence/worker-arm64-runtime.json'
+            proof = self.report(path)
+            change(proof)
+            self.put(path, proof)
+            worker = self.report('evidence/worker-arm64.json')
+            worker['worker_runtime'] = proof
+            if 'pid' not in proof:
+                worker.pop('worker_pid')
+                worker.pop('challenge')
+            self.put('evidence/worker-arm64.json', worker)
+            self.refresh()
+            with self.assertRaises(ValueError):
+                self.verify()
+
+    def test_executed_source_tuple_is_bound_even_when_fingerprint_recomputed(self):
+        report = self.report('evidence/mac-arm64/renderer.json')
+        changed = copy.deepcopy(report['native_source'])
+        changed['files'][-1]['sha256'] = '0' * 64
+        changed['fingerprint'] = hashlib.sha256(json.dumps({'files': changed['files']}, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        for name in ('evidence/mac-arm64/renderer.json', 'evidence/mac-arm64/bundled/renderer.json'):
+            value = self.report(name)
+            value['native_source'] = changed
+            self.put(name, value)
+        self.refresh()
+        with self.assertRaisesRegex(ValueError, 'executed native source differs from original source'):
+            self.verify()
+
+    def test_common_job_identity_and_complete_envelopes(self):
+        api = self.fixtures.FakeAPI()
+        evidence.verify_run(api.run, {'jobs': api.jobs, 'total_count': 2}, self.fixtures.SHA)
+        evidence.verify_integration_run(api.integration_run, {'jobs': api.integration_jobs, 'total_count': 1}, self.fixtures.SHA)
+        for run, jobs, verify in ((api.run, api.jobs, evidence.verify_run),
+                                  (api.integration_run, api.integration_jobs, evidence.verify_integration_run)):
+            for change in (lambda rows: rows[0].update(run_id=999), lambda rows: rows[0].update(head_sha='f' * 40),
+                           lambda rows: rows[0].update(id=True), lambda rows: rows[0].update(run_attempt=2),
+                           lambda rows: rows[0]['steps'][0].update(conclusion='skipped')):
+                rows = copy.deepcopy(jobs)
+                change(rows)
+                with self.assertRaises(ValueError):
+                    verify(run, rows, self.fixtures.SHA)
+            with self.assertRaises(ValueError):
+                verify(run, {'jobs': jobs, 'total_count': len(jobs) + 1}, self.fixtures.SHA)
+            with self.assertRaises(ValueError):
+                verify(run, {'jobs': jobs, 'total_count': len(jobs), 'complete': False}, self.fixtures.SHA)

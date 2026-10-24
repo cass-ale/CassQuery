@@ -9,6 +9,7 @@ const http = require('node:http');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
 const { createHash } = require('node:crypto');
+const { crc32, inflateSync } = require('node:zlib');
 
 const GATES = ['units', 'watertight', 'volume', 'thin-extent', 'triangulation',
   'payload-roundtrip', 'budget-tris', 'budget-bytes'];
@@ -16,16 +17,61 @@ const REQUIRED_CHECKS = Object.freeze({
   'live-truth': ['default-demo', 'eight-cad-gates', 'dom-rebuild-http', 'save-preview-certified',
     'camera-direction', 'failed-gates-retain-bytes-and-model'],
   'interaction-order': ['step-buttons-keyboard', 'rapid-aba-variant', 'xray-materials',
-    'explode-transforms', 'pointer-pick-hide-show'],
+    'explode-transforms', 'pointer-pick-hide-show', 'http-view-screenshot'],
   'isolation-reconnect': ['malformed-manifest-isolation', 'syntax-error-no-model',
     'error-recovery', 'project-switch-stale-response', 'reconnect-hello-snapshot'],
   'boundary': ['malformed-json', 'host-origin', 'static-traversal', 'websocket-origin',
     'mutation-witness'],
 });
 const REQUIRED_SHOTS = ['01-default-certified.png', '02-live-preview.png', '03-live-certified.png',
-  '04-unit-failure-retained.png', '05-xray.png', '06-exploded.png', '07-syntax-no-model.png', '08-reconnect-snapshot.png'];
+  '04-unit-failure-retained.png', '05-xray.png', '06-exploded.png', '07-syntax-no-model.png', '08-reconnect-snapshot.png',
+  '09-protocol-shot.png'];
 const digest = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const readJSON = (file) => JSON.parse(fs.readFileSync(file, 'utf8'));
+
+// Bounded decoding of Chromium's RGB/RGBA, 8-bit, non-interlaced PNG captures.
+// A signature/digest alone accepts a truncated or fabricated non-image as evidence.
+function pngDimensions(bytes) {
+  assert.ok(bytes.length <= 32 * 1024 ** 2 && bytes.subarray(0, 8).toString('hex') === '89504e470d0a1a0a', 'invalid/excessive PNG');
+  let offset = 8, header, ended = false, dataEnded = false;
+  const packed = [];
+  while (offset < bytes.length) {
+    assert.ok(offset + 12 <= bytes.length, 'truncated PNG chunk');
+    const length = bytes.readUInt32BE(offset), end = offset + 12 + length;
+    assert.ok(end <= bytes.length, 'truncated PNG data');
+      assert.ok(bytes.subarray(offset + 4, offset + 8).every((b) => b >= 65 && b <= 90 || b >= 97 && b <= 122), 'invalid PNG chunk type');
+      const kind = bytes.toString('ascii', offset + 4, offset + 8);
+    assert.match(kind, /^[A-Za-z]{4}$/, 'invalid PNG chunk type');
+    const content = bytes.subarray(offset + 8, end - 4);
+    assert.equal(crc32(bytes.subarray(offset + 4, end - 4)), bytes.readUInt32BE(end - 4), 'PNG checksum mismatch');
+    assert.ok(header || kind === 'IHDR', 'PNG missing initial header');
+    if (kind === 'IHDR') {
+      assert.ok(!header && length === 13, 'invalid PNG header');
+      const width = content.readUInt32BE(0), height = content.readUInt32BE(4), channels = { 2: 3, 6: 4 }[content[9]];
+      assert.ok(width > 0 && width <= 16384 && height > 0 && height <= 16384 && content[8] === 8 && channels &&
+        content[10] === 0 && content[11] === 0 && content[12] === 0, 'unsupported PNG capture format');
+      header = { width, height, channels };
+    } else if (kind === 'IDAT') {
+      assert.equal(dataEnded, false, 'noncontiguous PNG image data'); packed.push(content);
+    } else if (kind === 'IEND') {
+      assert.ok(length === 0 && end === bytes.length, 'invalid PNG end'); ended = true; break;
+    } else {
+      if (packed.length) dataEnded = true;
+      if (kind === 'PLTE') assert.ok(!packed.length && length > 0 && length <= 768 && length % 3 === 0, 'invalid PNG palette');
+      else assert.ok(kind.charCodeAt(0) & 32, 'unsupported critical PNG chunk');
+    }
+    offset = end;
+  }
+  const compressed = Buffer.concat(packed);
+  assert.ok(header && compressed.length && ended, 'incomplete PNG');
+  const stride = header.width * header.channels + 1, expected = stride * header.height;
+  assert.ok(expected <= 128 * 1024 ** 2, 'PNG decoded size exceeds bound');
+  const decoded = inflateSync(compressed, { maxOutputLength: expected + 1, info: true });
+  assert.equal(decoded.buffer.length, expected, 'PNG deflate length mismatch');
+  assert.equal(decoded.engine.bytesWritten, compressed.length, 'PNG trailing deflate data');
+  for (let row = 0; row < header.height; row++) assert.ok(decoded.buffer[row * stride] <= 4, 'invalid PNG row filter');
+  return { width: header.width, height: header.height };
+}
 
 // Evidence validation is independent of producer check.pass labels.
 function validateEvidence(id, e) {
@@ -34,6 +80,10 @@ function validateEvidence(id, e) {
   const vector = (value, positive = false) => {
     assert.ok(Array.isArray(value) && value.length === 3);
     for (const number of value) { finite(number); if (positive) assert.ok(number > 0); }
+  };
+  const sameVector = (actual, expected) => {
+    vector(actual); vector(expected);
+    assert.ok(actual.every((value, i) => Math.abs(value - expected[i]) < 1e-8), 'view command vector mismatch');
   };
   const parts = (value) => {
     assert.ok(Array.isArray(value));
@@ -97,7 +147,10 @@ function validateEvidence(id, e) {
     case 'xray-materials':
       parts(e.parts);
       for (const part of e.parts) {
-        assert.equal(part.opacity, part.name === 'Cap' ? 1 : 0.2); assert.equal(part.depthWrite, part.name === 'Cap'); }
+        assert.equal(part.opacity, part.name === 'Cap' ? 1 : 0.2); assert.equal(part.depthWrite, part.name === 'Cap');
+        assert.equal(part.transparent, part.name !== 'Cap'); }
+      parts(e.off_parts);
+      for (const part of e.off_parts) { assert.equal(part.opacity, 1); assert.equal(part.depthWrite, true); assert.equal(part.transparent, false); }
       break;
     case 'explode-transforms':
       assert.equal(e.keyboard_range_input, 'End'); parts(e.parts);
@@ -113,7 +166,36 @@ function validateEvidence(id, e) {
       parts(e.hidden.parts); parts(e.shown.parts);
       for (const part of [...e.hidden.parts, ...e.shown.parts]) visible(part);
       assert.ok(e.hidden.parts.find((p) => p.name === 'Cap').visible.every((v) => v === false));
-      assert.ok(e.shown.parts.every((p) => p.visible.every((v) => v === true))); break;
+      assert.ok(e.shown.parts.every((p) => p.visible.every((v) => v === true)));
+      model(e.rebuilt_hidden, 'certified', 42); hash(e.prior_hidden_hash);
+      assert.notEqual(e.rebuilt_hidden.hash, e.prior_hidden_hash);
+      for (const part of e.rebuilt_hidden.parts) {
+        visible(part); assert.ok(part.visible.every((v) => v === (part.name !== 'Cap')));
+      }
+      assert.equal(e.show_all_reachable, true); break;
+    case 'http-view-screenshot': {
+      assert.deepEqual(e.statuses, [202, 200, 200]); assert.deepEqual(e.rejected_statuses, [400, 400]);
+      assert.equal(e.held_actual_variant, true); assert.equal(e.renderer_posts_before_release, 0);
+      const command = { project: 'TESTPLATE', step: 'apart', variant: 'lifted', explode: 0.5, xray: true,
+        camera: { position: [150, -170, 110], target: [0, 0, 24] } };
+      assert.deepEqual(e.request, command);
+      model(e.visible, 'certified', 42); assert.equal(e.visible.variant, 'lifted');
+      sameVector(e.visible.camera, command.camera.position); sameVector(e.visible.target, command.camera.target);
+      for (const part of e.visible.parts) {
+        visible(part); assert.ok(part.visible.every(Boolean));
+        assert.equal(part.opacity, part.name === 'Cap' ? 1 : 0.2); assert.equal(part.depthWrite, part.name === 'Cap');
+        assert.ok(Array.isArray(part.positions) && part.positions.length > 0);
+        for (const position of part.positions) assert.deepEqual(position, [0, 0, { Base: 0, Post: 11, Cap: 24 }[part.name]]);
+      }
+      assert.ok(e.worker_frames.some((m) => m.type === 'command' && Object.keys(command).every((k) =>
+        JSON.stringify(m[k]) === JSON.stringify(command[k]))));
+      assert.ok(e.worker_frames.some((m) => m.type === 'screenshot' && m.project === command.project && m.id === e.shot.id));
+      assert.equal(e.shot.project, 'TESTPLATE'); assert.equal(e.shot.file, '09-protocol-shot.png');
+      assert.equal(e.shot.renderer_id, e.shot.id); assert.equal(e.shot.renderer_sha256, e.shot.sha256);
+      assert.match(e.shot.id, /^TESTPLATE-[a-f0-9]{32}$/); assert.match(e.shot.sha256, /^[a-f0-9]{64}$/);
+      for (const key of ['width', 'height']) assert.ok(Number.isInteger(e.canvas[key]) && e.canvas[key] > 0 && e.shot[key] === e.canvas[key]);
+      break;
+    }
     case 'malformed-manifest-isolation':
       assert.equal(e.api_version, 2); assert.deepEqual(e.projects, ['TESTPLATE', 'SECONDPLATE']);
       assert.equal(e.errors.length, 1); assert.match(e.errors[0].error, /JSONDecodeError/); break;
@@ -191,9 +273,16 @@ function validateReport(report, directory) {
     assert.match(shot.sha256, /^[a-f0-9]{64}$/);
     const file = fs.realpathSync(path.resolve(directory, shot.file));
     assert.ok(file.startsWith(evidenceRoot + path.sep), 'evidence escaped output');
+    assert.ok(fs.statSync(file).size <= 32 * 1024 ** 2, 'excessive PNG evidence');
     const bytes = fs.readFileSync(file);
-    assert.equal(bytes.subarray(0, 8).toString('hex'), '89504e470d0a1a0a', 'not PNG');
+    const dimensions = pngDimensions(bytes);
     assert.equal(digest(bytes), shot.sha256, 'screenshot digest mismatch');
+    assert.equal(dimensions.width, shot.width, 'screenshot width mismatch');
+    assert.equal(dimensions.height, shot.height, 'screenshot height mismatch');
+    if (shot.file === '09-protocol-shot.png') {
+      const protocol = report.scenarios.find((s) => s.id === 'interaction-order').checks.find((c) => c.id === 'http-view-screenshot').evidence;
+      assert.equal(shot.sha256, protocol.shot.sha256); assert.equal(shot.width, protocol.canvas.width); assert.equal(shot.height, protocol.canvas.height);
+    } else assert.ok(shot.width >= 1320 && shot.height >= 900, 'screenshot does not cover source viewport');
   }
   assert.equal(report.source.chromium_sandbox, true);
   assert.match(report.source.worker_sha256, /^[a-f0-9]{64}$/);
@@ -201,7 +290,7 @@ function validateReport(report, directory) {
   return true;
 }
 
-function request(origin, target, { method = 'GET', body, headers = {} } = {}) {
+function request(origin, target, { method = 'GET', body, headers = {}, timeoutMs = 5000 } = {}) {
   return new Promise((resolve, reject) => {
     const data = body === undefined ? null : Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
     const req = http.request(new URL(origin), { path: target, method,
@@ -217,7 +306,7 @@ function request(origin, target, { method = 'GET', body, headers = {} } = {}) {
       });
       res.on('error', reject);
     });
-    req.setTimeout(5000, () => req.destroy(new Error(`HTTP timeout ${target}`)));
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`HTTP timeout ${target}`)));
     req.on('error', reject);
     req.end(data);
   });
@@ -388,7 +477,7 @@ async function run(options = {}) {
         badge: document.getElementById('tierbadge').textContent,
         diagnostic: document.getElementById('diag').textContent,
         parts: variant ? [...variant.parts].map(([name, part]) => ({ name,
-          opacity: part.mat.opacity, depthWrite: part.mat.depthWrite,
+          opacity: part.mat.opacity, transparent: part.mat.transparent, depthWrite: part.mat.depthWrite,
           visible: part.meshes.map((m) => m.visible), positions: part.meshes.map((m) => m.position.toArray()) })) : [],
         bounds: variant?.bounds || null };
     });
@@ -396,7 +485,7 @@ async function run(options = {}) {
   async function screenshot(file, description) {
     await page.screenshot({ path: path.join(output, file), fullPage: true });
     const bytes = fs.readFileSync(path.join(output, file));
-    report.screenshots.push({ file, description, sha256: digest(bytes) });
+    report.screenshots.push({ file, description, sha256: digest(bytes), ...pngDimensions(bytes) });
   }
   function retainedFiles(worker, name) {
     const directory = path.join(worker.data, 'payloads');
@@ -607,9 +696,11 @@ async function run(options = {}) {
         assert.equal(part.opacity, part.name === 'Cap' ? 1 : 0.2);
         assert.equal(part.depthWrite, part.name === 'Cap');
       }
-      check('xray-materials', { parts: xray.parts });
       await screenshot('05-xray.png', 'Real X-ray button makes Base/Post ghost materials while Cap stays opaque in the public CAD assembly.');
       await page.locator('#xraybtn').click();
+      const xrayOff = await observe();
+      assert.ok(xrayOff.parts.every((p) => p.opacity === 1 && p.depthWrite && !p.transparent));
+      check('xray-materials', { parts: xray.parts, off_parts: xrayOff.parts });
       await page.locator('#explode').press('End');
       await page.waitForFunction(() => document.getElementById('explodeval').textContent === '100%');
       const exploded = await observe();
@@ -634,11 +725,85 @@ async function run(options = {}) {
       await page.locator('#selhide').click();
       const hidden = await observe();
       assert.ok(hidden.parts.find((p) => p.name === 'Cap').visible.every((v) => !v));
+      // A changed CAD hash must not discard an inspection choice that a same-hash rebuild keeps.
+      edit(entry, '.circle(4)', '.circle(4.25)');
+      const hiddenStatus = await until('hidden part rebuilt with fresh geometry', async () => {
+        const st = await status(worker, 'TESTPLATE');
+        return st.state === 'certified' && st.hashes.certified !== hidden.hash ? st : false;
+      }, 45000);
+      await shown('TESTPLATE', 'certified', hiddenStatus.hashes.certified);
+      const rebuiltHidden = await observe();
+      assert.ok(rebuiltHidden.parts.find((p) => p.name === 'Cap').visible.every((v) => !v));
+      const showAllReachable = await page.locator('#selshow').isVisible() && await page.locator('#selshow').isEnabled();
+      assert.equal(showAllReachable, true);
       await page.locator('#selshow').click();
       const shownAgain = await observe();
       assert.ok(shownAgain.parts.every((p) => p.visible.every(Boolean)));
-      check('pointer-pick-hide-show', { actual_pointer: point, picked: 'Cap', hidden, shown: shownAgain });
+      check('pointer-pick-hide-show', { actual_pointer: point, picked: 'Cap', hidden, shown: shownAgain,
+        prior_hidden_hash: hidden.hash, rebuilt_hidden: rebuiltHidden, show_all_reachable: showAllReachable });
       await steps.nth(0).click();
+      // Fresh renderer forces a real lazy-variant HTTP request. The command and shot travel
+      // through the worker, not __cq actions or a forged WebSocket/PNG fixture.
+      await page.reload(); await shown('TESTPLATE');
+      let releaseCommandVariant, requestedCommandVariant;
+      const heldCommand = new Promise((resolve) => { releaseCommandVariant = resolve; });
+      const requestedCommand = new Promise((resolve) => { requestedCommandVariant = resolve; });
+      await page.route('**/payload/*-certified-lifted-*.json', async (route) => {
+        requestedCommandVariant(); await heldCommand; await route.continue();
+      });
+      const rendererPosts = [];
+      const recordShot = (r) => {
+        if (r.url().endsWith('/api/shot') && r.method() === 'POST') {
+          const body = r.postDataJSON();
+          rendererPosts.push({ id: body.id, project: body.project,
+            sha256: digest(Buffer.from(body.data.split(',')[1], 'base64')) });
+        }
+      };
+      page.on('request', recordShot);
+      try {
+        const wireStart = report.websocket_frames.length;
+        const command = { project: 'TESTPLATE', step: 'apart', variant: 'lifted', explode: 0.5, xray: true,
+          camera: { position: [150, -170, 110], target: [0, 0, 24] } };
+        const commanded = await request(worker.origin, '/api/view', { method: 'POST', body: command });
+        assert.equal(commanded.status, 202); assert.deepEqual(commanded.json, { accepted: true });
+        await Promise.race([requestedCommand, pause(10000).then(() => { throw new Error('wire command did not request real lazy variant'); })]);
+        const rendererResponse = page.waitForResponse((r) => r.url().endsWith('/api/shot') && r.request().method() === 'POST');
+        rendererResponse.catch(() => {}); // Preserve the primary error if the outer scenario fails first.
+        const screenshotResponse = request(worker.origin, '/api/screenshot', { method: 'POST', body: { project: 'TESTPLATE' }, timeoutMs: 30000 });
+        screenshotResponse.catch(() => {});
+        await until('worker screenshot request reached renderer while command is pending', () =>
+          report.websocket_frames.slice(wireStart).some((m) => m.type === 'screenshot' && m.project === 'TESTPLATE'));
+        assert.equal(rendererPosts.length, 0, 'screenshot captured before lazy command completed');
+        releaseCommandVariant();
+        const shotResponse = await screenshotResponse, rendered = await rendererResponse;
+        assert.equal(shotResponse.status, 200); assert.equal(rendered.status(), 200);
+        const shotPath = fs.realpathSync(shotResponse.json.path), shotRoot = fs.realpathSync(path.join(worker.data, 'evidence/shots'));
+        assert.ok(shotPath.startsWith(shotRoot + path.sep)); assert.equal(shotResponse.json.project, 'TESTPLATE');
+        const bytes = fs.readFileSync(shotPath), dimensions = pngDimensions(bytes), file = '09-protocol-shot.png';
+        fs.writeFileSync(path.join(output, file), bytes);
+        const shot = { file, project: shotResponse.json.project, id: path.basename(shotPath, '.png'), sha256: digest(bytes),
+          ...dimensions, renderer_id: rendererPosts[0].id, renderer_sha256: rendererPosts[0].sha256 };
+        assert.equal(rendererPosts.length, 1); assert.equal(shot.renderer_sha256, shot.sha256);
+        const canvas = await page.locator('#stage canvas').evaluate((c) => ({ width: c.width, height: c.height }));
+        assert.deepEqual(dimensions, canvas);
+        const visible = await observe();
+        assert.equal(visible.variant, 'lifted');
+        for (const key of ['camera', 'target']) assert.ok(visible[key].every((v, i) =>
+          Math.abs(v - command.camera[key === 'camera' ? 'position' : 'target'][i]) < 1e-8), 'settled wire camera differs from command');
+        const rejected = [
+          await request(worker.origin, '/api/view', { method: 'POST', body: { project: 'TESTPLATE', camera: [] } }),
+          await request(worker.origin, '/api/shot', { method: 'POST', body: { id: 'unrequested-shot', project: 'TESTPLATE', data: 'data:image/png;base64,' + bytes.toString('base64') } }),
+        ];
+        assert.deepEqual(rejected.map((r) => r.status), [400, 400]);
+        report.screenshots.push({ file, description: 'Actual HTTP view command waits for lazy pose; worker screenshot receives the renderer PNG through /api/shot at the settled camera/X-ray/explode state.', sha256: shot.sha256, ...dimensions });
+        check('http-view-screenshot', { statuses: [commanded.status, shotResponse.status, rendered.status()],
+          rejected_statuses: rejected.map((r) => r.status), held_actual_variant: true, renderer_posts_before_release: 0,
+          request: command, visible, canvas, shot, worker_frames: report.websocket_frames.slice(wireStart) });
+      } finally {
+        releaseCommandVariant(); page.off('request', recordShot);
+        await page.unroute('**/payload/*-certified-lifted-*.json');
+      }
+      await page.locator('#steps button').first().click();
     });
     await stopWorker(worker);
     const second = path.join(temporary, 'second'), bad = path.join(temporary, 'malformed');
@@ -802,7 +967,7 @@ async function run(options = {}) {
   return report;
 }
 
-module.exports = { GATES, REQUIRED_CHECKS, validateEvidence, validateReport, run };
+module.exports = { GATES, REQUIRED_CHECKS, pngDimensions, validateEvidence, validateReport, run };
 if (require.main === module) {
   const args = process.argv.slice(2);
   if (args[0] === '--validate-report' && args.length === 2) {

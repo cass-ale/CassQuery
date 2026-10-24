@@ -24,6 +24,8 @@ OWNER = "cass-ale"
 PREFIX = f"/repos/{REPOSITORY}"
 WORKFLOW = ".github/workflows/release.yml"
 CANDIDATE_WORKFLOW = ".github/workflows/macos-candidate.yml"
+INTEGRATION_WORKFLOW = ".github/workflows/integration.yml"
+MAX_QUALIFICATION_ROWS = 200
 ARCHES = ("arm64", "x64")
 MAX_JSON = 8 * 1024 * 1024
 MAX_ARCHIVE = 2 * 1024 ** 3
@@ -114,7 +116,9 @@ class GitHub:
             raise ReleaseError("GitHub network request failed") from error
 
     def json(self, path, *, method="GET", payload=None, missing=False):
-        require(path.startswith(PREFIX + "/") and not any(c in path for c in "\r\n#"), "invalid API path")
+        team_path = re.fullmatch(rf"/orgs/{re.escape(OWNER)}/teams/[A-Za-z0-9-]+(?:/members)?(?:\?per_page=100&page=[0-9]+)?", path)
+        require((path.startswith(PREFIX + "/") or (team_path and method == "GET" and payload is None))
+                and not any(c in path for c in "\r\n#"), "invalid API path")
         with self._open("https://api.github.com" + path, method=method,
                         data=None if payload is None else json.dumps(payload).encode()) as response:
             if response.status == 404 and missing and method == "GET":
@@ -128,8 +132,9 @@ class GitHub:
             except (ValueError, UnicodeError) as error:
                 raise ReleaseError("invalid GitHub JSON") from error
 
-    def items(self, path, key=None):
+    def items(self, path, key=None, *, limit=10000):
         """Enumerate bounded pages; never follow an API-supplied URL/Link."""
+        require(type(limit) is int and 0 < limit <= 10000, "invalid API inventory limit")
         result = []
         total = None
         for page in range(1, 101):
@@ -140,11 +145,12 @@ class GitHub:
             require(all(isinstance(x, dict) for x in rows), "invalid API row")
             if key is not None:
                 count = response.get("total_count")
-                require(type(count) is int and count >= 0, "missing API total_count")
+                require(type(count) is int and 0 <= count <= limit, "missing/excessive API total_count")
                 require(total is None or total == count, "API inventory changed while paginating")
                 total = count
             result.extend(rows)
-            if len(rows) < 100:
+            require(len(result) <= limit, "API inventory exceeds item limit")
+            if len(rows) < 100 or (total is not None and len(result) == total):
                 require(total is None or total == len(result), "truncated API inventory")
                 return result
         raise ReleaseError("API inventory exceeds pagination limit")
@@ -297,8 +303,8 @@ def protected_environment(api):
     rules = environment.get("protection_rules")
     require(isinstance(rules, list) and all(isinstance(x, dict) for x in rules), "unreadable environment protection")
     reviewers = [x for x in rules if x.get("type") == "required_reviewers"]
-    require(len(reviewers) == 1 and reviewers[0].get("prevent_self_review") is True,
-            "release environment requires independent review (prevent_self_review=true)")
+    require(len(reviewers) == 1 and type(reviewers[0].get("prevent_self_review")) is bool,
+            "release environment requires configured reviewers and an explicit self-review policy")
     entries = reviewers[0].get("reviewers")
     require(isinstance(entries, list) and 1 <= len(entries) <= 6, "release environment has no required reviewers")
     for entry in entries:
@@ -370,9 +376,77 @@ def candidate_run(api, run_id, expected_sha):
     workflow = api.json(PREFIX + "/actions/workflows/macos-candidate.yml")
     require(workflow.get("path") == CANDIDATE_WORKFLOW and run.get("workflow_id") == positive_id(workflow.get("id")),
             "candidate must use the trusted workflow")
-    jobs = api.items(PREFIX + f"/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs")
+    jobs = api.items(PREFIX + f"/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs", limit=MAX_QUALIFICATION_ROWS)
     verify_run(run, jobs, expected_sha)
     return run
+
+
+def integration_run(api, expected_sha, expected=None):
+    """Select the newest exact-source push, never an older successful fallback."""
+    from release_evidence import verify_integration_run
+    sha40(expected_sha)
+    workflow = api.json(PREFIX + "/actions/workflows/integration.yml")
+    workflow_id = positive_id(workflow.get("id"))
+    require(workflow.get("path") == INTEGRATION_WORKFLOW, "wrong trusted integration workflow")
+    runs = api.items(PREFIX + f"/actions/workflows/{workflow_id}/runs?head_sha={expected_sha}&event=push",
+                     "workflow_runs", limit=MAX_QUALIFICATION_ROWS)
+    require(runs, "no exact-source integration run")
+    identifiers = [positive_id(run.get("id")) for run in runs]
+    numbers = [positive_id(run.get("run_number")) for run in runs]
+    require(len(set(identifiers)) == len(runs) and len(set(numbers)) == len(runs),
+            "duplicate integration run inventory")
+    require(all(run.get("workflow_id") == workflow_id and run.get("path") == INTEGRATION_WORKFLOW
+                and run.get("head_sha") == expected_sha and run.get("event") == "push"
+                and run.get("head_branch") == "main" for run in runs), "untrusted integration run inventory")
+    selected = runs[numbers.index(max(numbers))]
+    run_id = selected["id"]
+    run = api.json(PREFIX + f"/actions/runs/{run_id}")
+    require(run.get("id") == run_id and run.get("workflow_id") == workflow_id
+            and run.get("run_number") == selected["run_number"], "integration run identity changed")
+    attempt = positive_id(run.get("run_attempt"))
+    require(run.get("status") == "completed" and run.get("conclusion") == "success",
+            "latest integration run is not successful and terminal")
+    jobs = api.items(PREFIX + f"/actions/runs/{run_id}/attempts/{attempt}/jobs", "jobs",
+                     limit=MAX_QUALIFICATION_ROWS)
+    verify_integration_run(run, jobs, expected_sha)
+    # The API's current run must still name the attempt whose jobs were read.
+    current = api.json(PREFIX + f"/actions/runs/{run_id}")
+    require(current.get("id") == run_id and current.get("workflow_id") == workflow_id
+            and current.get("run_number") == selected["run_number"]
+            and current.get("run_attempt") == attempt, "integration attempt changed while verifying")
+    verify_integration_run(current, jobs, expected_sha)
+    identity = {"run_id": run_id, "run_attempt": attempt, "workflow_id": workflow_id,
+                "repository_id": positive_id(current.get("repository", {}).get("id")),
+                "head_repository_id": positive_id(current.get("head_repository", {}).get("id"))}
+    require(expected is None or identity == expected, "latest integration run/attempt changed; fresh qualification required")
+    return identity
+
+
+def authorized_reviewer(api, environment, user):
+    """Bind approval to a current reviewer ID, including verified team membership."""
+    user_id = positive_id(user.get("id"))
+    entries = next(rule["reviewers"] for rule in environment["protection_rules"]
+                   if rule.get("type") == "required_reviewers")
+    if any(entry["type"] == "User" and entry["reviewer"]["id"] == user_id for entry in entries):
+        return True
+    for entry in entries:
+        if entry["type"] != "Team":
+            continue
+        reviewer = entry["reviewer"]
+        slug = reviewer.get("slug")
+        require(isinstance(slug, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,99}", slug),
+                "required team lacks a safe slug")
+        path = f"/orgs/{OWNER}/teams/{slug}"
+        team = api.json(path)
+        require(team.get("id") == reviewer["id"] and team.get("slug") == slug
+                and team.get("organization", {}).get("login") == OWNER, "required team identity mismatch")
+        members = api.items(path + "/members", limit=MAX_QUALIFICATION_ROWS)
+        member_ids = [positive_id(member.get("id")) for member in members]
+        require(len(member_ids) == len(set(member_ids)), "duplicate required-team membership inventory")
+        if any(member.get("type") == "User" and member.get("id") == user_id
+               and member.get("login") == user.get("login") for member in members):
+            return True
+    return False
 
 
 def prepare(api, work, *, run_id, tag, expected_sha, allow_ad_hoc=False):
@@ -388,6 +462,7 @@ def prepare(api, work, *, run_id, tag, expected_sha, allow_ad_hoc=False):
     tag_sha = tag_identity(api, tag, expected_sha)
     draft = release_history(api, tag, expected_sha)
     run = candidate_run(api, run_id, expected_sha)
+    integration = integration_run(api, expected_sha)
     artifacts = api.items(PREFIX + f"/actions/runs/{run_id}/artifacts", "artifacts")
     require(len(artifacts) == len(ARCHES), "candidate requires exactly two architecture artifacts")
     names = [x.get("name") for x in artifacts]
@@ -442,6 +517,8 @@ def prepare(api, work, *, run_id, tag, expected_sha, allow_ad_hoc=False):
     sums.write_text("".join(f"{inventory[name]['sha256']}  {name}\n" for name in sorted(inventory)), encoding="ascii")
     inventory[sums.name] = {"path": sums, **digest(sums)}
     body = (f"Candidate run: https://github.com/{REPOSITORY}/actions/runs/{run_id}\n"
+            f"Integration run: https://github.com/{REPOSITORY}/actions/runs/{integration['run_id']}\n"
+            f"Integration attempt: {integration['run_attempt']}\n"
             f"Source: {expected_sha}\nCandidate attempt: {run['run_attempt']}\nAnnotated tag object: {tag_sha}\n"
             "Distribution: ad-hoc, non-hardened; no Developer ID, notarization or Gatekeeper claim.\n"
             "ZIP/DMG and candidate manifests are promoted unchanged, without rebuilding.\n")
@@ -450,8 +527,9 @@ def prepare(api, work, *, run_id, tag, expected_sha, allow_ad_hoc=False):
     require(tag_identity(api, tag, expected_sha) == tag_sha, "tag moved during candidate verification")
     # Detect a rerun/superseding attempt or a changed conclusion during downloads.
     require(candidate_run(api, run_id, expected_sha)["run_attempt"] == run["run_attempt"], "candidate attempt changed")
+    integration_run(api, expected_sha, integration)
     return {"run_id": run_id, "attempt": run["run_attempt"], "sha": expected_sha,
-            "source_fingerprint": source_fingerprint,
+            "source_fingerprint": source_fingerprint, "integration": integration,
             "tag": tag, "tag_sha": tag_sha, "body": body, "inventory": inventory, "draft": draft}
 
 
@@ -487,7 +565,7 @@ def workflow_context(api, plan, env=None):
             and current.get("path") == WORKFLOW and trusted.get("path") == WORKFLOW
             and current.get("workflow_id") == positive_id(trusted.get("id")), "untrusted publication workflow run")
     environment = protected_environment(api)
-    jobs = api.items(PREFIX + f"/actions/runs/{current_id}/attempts/1/jobs", "jobs")
+    jobs = api.items(PREFIX + f"/actions/runs/{current_id}/attempts/1/jobs", "jobs", limit=MAX_QUALIFICATION_ROWS)
     for name, step_name in (("prepare", "Verify candidate and protection"), ("approve", "Recheck protected approval boundary")):
         matching = [x for x in jobs if x.get("name") == name]
         require(len(matching) == 1 and matching[0].get("status") == "completed"
@@ -500,9 +578,19 @@ def workflow_context(api, plan, env=None):
     relevant = [review for review in reviews if isinstance(review, dict) and any(
         isinstance(x, dict) and x.get("id") == environment["id"] and x.get("name") == "releases"
         for x in review.get("environments", []))]
-    require(relevant and all(x.get("state") == "approved" and x.get("user", {}).get("type") == "User"
-                             and x.get("user", {}).get("login") not in (None, OWNER) for x in relevant),
-            "independent protected environment approval is required")
+    prevent_self_review = next(rule["prevent_self_review"] for rule in environment["protection_rules"]
+                               if rule.get("type") == "required_reviewers")
+    require(relevant and all(review.get("state") == "approved" and review.get("user", {}).get("type") == "User"
+                             and isinstance(review["user"].get("login"), str) and review["user"]["login"]
+                             and (not prevent_self_review or review["user"]["login"] != OWNER)
+                             and (review["user"]["login"] != OWNER or (
+                                 type(current.get("actor", {}).get("id")) is int and current["actor"]["id"] > 0
+                                 and review["user"].get("id") == current["actor"]["id"]
+                                 and current.get("triggering_actor", {}).get("id") == current["actor"]["id"]))
+                             and authorized_reviewer(api, environment, review["user"]) for review in relevant),
+            "configured protected environment approval is required")
+    require(candidate_run(api, plan["run_id"], plan["sha"])["run_attempt"] == plan["attempt"], "candidate attempt changed")
+    integration_run(api, plan["sha"], plan["integration"])
     return inputs["mode"]
 
 
@@ -540,8 +628,8 @@ def execute(api, plan, work, *, mode, env=None):
     draft = release_history(api, plan["tag"], plan["sha"])
     if draft is None:
         # All authorization/source/native/evidence checks happened before this first write.
-        require(workflow_context(api, plan, env) == mode, "authorization changed before draft creation")
         require(tag_identity(api, plan["tag"], plan["sha"]) == plan["tag_sha"], "tag moved before draft creation")
+        require(workflow_context(api, plan, env) == mode, "authorization changed before draft creation")
         draft = api.json(PREFIX + "/releases", method="POST", payload={
             "tag_name": plan["tag"], "target_commitish": plan["sha"], "name": plan["tag"],
             "body": plan["body"], "draft": True, "prerelease": False, "generate_release_notes": False})
@@ -551,10 +639,10 @@ def execute(api, plan, work, *, mode, env=None):
     before.mkdir()
     existing = draft_assets(api, plan, release_id, before, complete=False)
     for name in sorted(set(plan["inventory"]) - existing):
-        require(workflow_context(api, plan, env) == mode, "authorization changed before asset upload")
         draft_state(api, plan, release_id)
         record = plan["inventory"][name]
         require(digest(record["path"]) == {"bytes": record["bytes"], "sha256": record["sha256"]}, "candidate changed before upload")
+        require(workflow_context(api, plan, env) == mode, "authorization changed before asset upload")
         uploaded = api.upload(release_id, name, record["path"])
         require(uploaded.get("name") == name and uploaded.get("state") == "uploaded"
                 and uploaded.get("size") == record["bytes"], "asset upload response mismatch")
@@ -571,13 +659,14 @@ def execute(api, plan, work, *, mode, env=None):
     draft_state(api, plan, release_id)
     if mode == "publish":
         # No deletes, no overwrites, no rebuilds. A failure leaves a draft for inspection.
+        require(workflow_context(api, plan, env) == mode, "authorization changed before publication")
         released = api.json(PREFIX + f"/releases/{release_id}", method="PATCH", payload={"draft": False, "make_latest": "true"})
         require(released.get("id") == release_id and released.get("draft") is False
                 and released.get("tag_name") == plan["tag"], "publication response mismatch")
         require(tag_identity(api, plan["tag"], plan["sha"]) == plan["tag_sha"], "tag moved after publication")
     return {"release_id": release_id, "draft": mode == "draft", "source_sha": plan["sha"],
             "candidate_run_id": plan["run_id"], "candidate_run_attempt": plan["attempt"],
-            "verified_assets": sorted(plan["inventory"])}
+            "integration": plan["integration"], "verified_assets": sorted(plan["inventory"])}
 
 
 def main():
@@ -599,8 +688,8 @@ def main():
                 result = execute(api, plan, work, mode=args.mode)
             else:
                 result = {"verified_only": True, "source_sha": plan["sha"], "candidate_run_id": plan["run_id"],
-                          "candidate_run_attempt": plan["attempt"], "assets": sorted(plan["inventory"]),
-                          "contents_writes": 0}
+                          "candidate_run_attempt": plan["attempt"], "integration": plan["integration"],
+                          "assets": sorted(plan["inventory"]), "contents_writes": 0}
             print(json.dumps(result, indent=2))
     except (ReleaseError, AssertionError, ValueError, KeyError, TypeError, OSError, zipfile.BadZipFile) as error:
         print(f"Release promotion blocked: {error}", file=sys.stderr)

@@ -26,6 +26,173 @@ class PackageAssuranceTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix='cq-package-unit-')
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        self.checked_app = self.root / 'source/CassQuery.app'
+        contents = self.checked_app / 'Contents'
+        contents.mkdir(parents=True)
+        (contents / 'Info.plist').write_bytes(plistlib.dumps({}))
+        binary = contents / 'MacOS/CassQuery'
+        binary.parent.mkdir()
+        binary.write_bytes(b'checked fixture binary')
+        binary.chmod(0o755)
+        self.baseline = native.inventory(self.checked_app)
+        self.checked_file = self.root / 'checked-before.json'
+        native.write_report(self.checked_file, self.baseline)
+        self.checked = {'checked_app': self.checked_app, 'checked_inventory': self.checked_file}
+
+    def test_inventory_root_mode_and_containment_precede_every_hash(self):
+        original = native.inventory(self.checked_app)
+        self.assertEqual(next(r for r in original['records'] if r['path'] == '.'),
+                         {'path': '.', 'kind': 'directory', 'mode': self.checked_app.stat().st_mode & 0o7777})
+        mode = self.checked_app.stat().st_mode & 0o7777
+        self.checked_app.chmod(0o700 if mode != 0o700 else 0o755)
+        self.assertNotEqual(native.inventory(self.checked_app), original)
+        self.checked_app.chmod(mode)
+        outside = self.root / 'public-fixture'; outside.write_bytes(b'public fixture')
+        (self.checked_app / 'Contents/escape').symlink_to(outside)
+        with patch.object(native, 'sha256') as hashed:
+            with self.assertRaisesRegex(RuntimeError, 'symlink escapes'):
+                native.verify_bundle(self.checked_app, 'arm64', VERSION)
+        hashed.assert_not_called()
+
+    def test_vulkan_alias_requires_exact_internal_relative_driver(self):
+        repo, app, packed = self.fake_bundle()
+        libraries = app / 'Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries'
+        loader = libraries / 'libvulkan.dylib'
+        with patch.object(native, 'ROOT', repo), patch.object(native, 'source_files', return_value=[]), \
+             patch.object(native, 'asar_contents', return_value=packed), patch.object(native.subprocess, 'run'), \
+             patch.object(native.subprocess, 'check_output', return_value='arm64'):
+            native.verify_bundle(app, 'arm64', VERSION)
+            loader.unlink()
+            with self.assertRaisesRegex(RuntimeError, 'Vulkan discovery alias'):
+                native.verify_bundle(app, 'arm64', VERSION)
+            loader.write_bytes((libraries / 'libvk_swiftshader.dylib').read_bytes())
+            with self.assertRaisesRegex(RuntimeError, 'Vulkan discovery alias'):
+                native.verify_bundle(app, 'arm64', VERSION)
+            loader.unlink(); loader.symlink_to('../Libraries/libvk_swiftshader.dylib')
+            with self.assertRaisesRegex(RuntimeError, 'Vulkan discovery alias'):
+                native.verify_bundle(app, 'arm64', VERSION)
+
+    def test_checked_app_inventory_preserves_exact_bytes_and_rejects_mutation(self):
+        output = self.root / 'binding'; output.mkdir()
+        # JSON whitespace is not part of the semantic tree, but retained evidence
+        # must preserve the exact native-before file, not regenerate its bytes.
+        self.checked_file.write_text(json.dumps(self.baseline) + '\n\n')
+        baseline, record = native.checked_bundle_inventory(self.checked_app, self.checked_file, output)
+        self.assertEqual(baseline, self.baseline)
+        self.assertEqual((output / 'checked-inventory.json').read_bytes(), self.checked_file.read_bytes())
+        self.assertEqual(record['sha256'], native.sha256(self.checked_file))
+        (self.checked_app / 'Contents/MacOS/CassQuery').write_bytes(b'different checked binary')
+        with self.assertRaisesRegex(RuntimeError, 'changed since'):
+            native.checked_bundle_inventory(self.checked_app, self.checked_file, output)
+
+    def test_zip_mac_normalization_types_link_graph_and_cycles(self):
+        bad = [
+            [('CassQuery.app/Contents/caf\u00e9', b'one', stat.S_IFREG),
+             ('CassQuery.app/Contents/cafe\u0301', b'two', stat.S_IFREG)],
+            [('CassQuery.app/Contents/\u0390', b'one', stat.S_IFREG),
+             ('CassQuery.app/Contents/\u03aa\u0301', b'two', stat.S_IFREG)],
+            [('CassQuery.app/Contents/CASE', b'one', stat.S_IFREG),
+             ('CassQuery.app/Contents/case', b'two', stat.S_IFREG)],
+            [('CassQuery.app/Contents/file/', b'payload', stat.S_IFREG)],
+            [('CassQuery.app/Contents/dir', b'', stat.S_IFDIR)],
+            [('CassQuery.app/Contents/file', b'one', stat.S_IFREG),
+             ('CassQuery.app/Contents/file/child', b'two', stat.S_IFREG)],
+            [('CassQuery.app/Contents/deep', b'..', stat.S_IFLNK),
+             ('CassQuery.app/Contents/escape', b'deep/../outside', stat.S_IFLNK)],
+            [('CassQuery.app/Contents/a', b'b', stat.S_IFLNK),
+             ('CassQuery.app/Contents/b', b'a', stat.S_IFLNK)],
+            [('CassQuery.app/Contents/link', b'MacOS', stat.S_IFLNK),
+             ('CassQuery.app/Contents/link/child', b'two', stat.S_IFREG)],
+        ]
+        for extras in bad:
+            with self.subTest(extras=extras), self.assertRaises(RuntimeError):
+                zipped.validate_archive(self.make_zip(extras))
+        valid = [('CassQuery.app/Contents/a', b'b', stat.S_IFLNK),
+                 ('CassQuery.app/Contents/b', b'MacOS/CassQuery', stat.S_IFLNK)]
+        self.assertEqual(zipped.validate_archive(self.make_zip(valid))['entries'], 4)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'requires actual Mac filename normalization')
+    def test_greek_casefold_collision_rejected_before_real_ditto_overwrite(self):
+        import subprocess
+        first, second = '\u0390', '\u03aa\u0301'
+        self.assertEqual(zipped.archive_key(first), zipped.archive_key(second))
+        file = self.make_zip([('CassQuery.app/Contents/' + first, b'first', stat.S_IFREG | 0o644),
+                              ('CassQuery.app/Contents/' + second, b'second', stat.S_IFREG | 0o644)])
+        with self.assertRaisesRegex(RuntimeError, 'Duplicate/noncanonical'):
+            zipped.validate_archive(file)
+        # Deliberate tiny unsafe-name fixture only: independently demonstrate
+        # the actual consumer collision without launching any app or mounting.
+        destination = self.root / 'greek'; destination.mkdir()
+        subprocess.run(['ditto', '-x', '-k', str(file), str(destination)], check=True, timeout=20)
+        contents = destination / 'CassQuery.app/Contents'
+        self.assertTrue(os.path.samefile(contents / first, contents / second))
+        self.assertEqual((contents / first).read_bytes(), b'second')
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'requires real unprivileged Mac ditto')
+    def test_real_zip_extraction_rejects_stale_app_before_any_launch(self):
+        import subprocess
+        for stale in (True, False):
+            file = self.root / f'real-{stale}.zip'
+            with zipfile.ZipFile(file, 'w') as archive:
+                for relative in ('Contents/Info.plist', 'Contents/MacOS/CassQuery'):
+                    source = self.checked_app / relative
+                    member = zipfile.ZipInfo('CassQuery.app/' + relative)
+                    member.create_system = 3
+                    member.external_attr = source.stat().st_mode << 16
+                    data = b'stale archive binary' if stale and relative.endswith('/CassQuery') else source.read_bytes()
+                    archive.writestr(member, data)
+            self.assertEqual(zipped.validate_archive(file)['entries'], 2)
+            output = self.root / f'real-out-{stale}'
+            apps = []
+            def launch(app, directory, *_args):
+                # Only archive/copy I/O is real here; no simulated native result
+                # may be treated as real-device launch/signing evidence.
+                self.assertEqual(native.inventory(app), self.baseline)
+                apps.append(app)
+                return {'native_report': {}, 'images': [], 'matrix': [], 'checked': []}
+            with patch.object(zipped, 'verify_bundle', side_effect=lambda app, *_args: ({}, native.inventory(app))), \
+                 patch.object(zipped, 'check_launch', side_effect=launch):
+                if stale:
+                    with self.assertRaisesRegex(RuntimeError, 'source-checked prepackaged'):
+                        zipped.run_package(file, output, 'arm64', **self.checked)
+                else:
+                    result = zipped.run_package(file, output, 'arm64', **self.checked)
+                    self.assertEqual(result['checked_bundle_sha256'], self.baseline['sha256'])
+                    self.assertEqual((output / 'checked-inventory.json').read_bytes(), self.checked_file.read_bytes())
+            self.assertEqual(len(apps), 0 if stale else 2)
+            if apps:
+                self.assertTrue(all(not app.exists() for app in apps))
+            self.assertIs(json.loads((output / 'package.json').read_text())['pass'], not stale)
+
+    def test_dmg_report_write_failure_allocates_no_scratch(self):
+        output = self.root / 'bad-report'; (output / 'package.json').mkdir(parents=True)
+        with patch.object(dmg.tempfile, 'mkdtemp') as allocated, patch.object(dmg.subprocess, 'run') as executed:
+            with self.assertRaises(IsADirectoryError):
+                dmg.run_package(self.root / 'missing.dmg', output, 'arm64', **self.checked)
+        allocated.assert_not_called()
+        executed.assert_not_called()
+
+    def test_workflow_cleanup_removes_only_exact_regular_owned_outputs(self):
+        import subprocess
+        import textwrap
+        text = (ROOT / '.github/workflows/macos-candidate.yml').read_text()
+        code = textwrap.dedent(text.split("python - <<'PY'\n", 1)[1].split('\n          PY', 1)[0])
+        (self.root / 'package.json').write_text(json.dumps({'version': VERSION}))
+        directory = self.root / 'dist/mac-app'; directory.mkdir(parents=True)
+        owned = [directory / f'CassQuery-{VERSION}-mac-arm64.{ext}' for ext in ('zip', 'dmg', 'zip.blockmap', 'dmg.blockmap')]
+        other = directory / f'CassQuery-{VERSION}-mac-x64.zip'; other.write_bytes(b'keep other arch')
+        env = {**os.environ, 'CASSQUERY_ARCH': 'arm64'}
+        for file in owned: file.write_bytes(b'old package')
+        subprocess.run([sys.executable, '-c', code], cwd=self.root, env=env, check=True, timeout=20)
+        self.assertTrue(all(not file.exists() for file in owned))
+        self.assertEqual(other.read_bytes(), b'keep other arch')
+        for file in owned[1:]: file.write_bytes(b'keep on refused cleanup')
+        owned[0].symlink_to(other)
+        result = subprocess.run([sys.executable, '-c', code], cwd=self.root, env=env, capture_output=True, timeout=20)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(owned[0].is_symlink())
+        self.assertTrue(all(file.exists() for file in owned[1:]))
+        self.assertEqual(other.read_bytes(), b'keep other arch')
 
     def test_architecture_normalization_and_optimized_python_fail_closed(self):
         self.assertEqual(native.architecture('x86_64'), 'x64')
@@ -64,8 +231,11 @@ class PackageAssuranceTests(unittest.TestCase):
         (resources / 'icon.icns').write_bytes((repo / 'assets/icons/cassquery.icns').read_bytes())
         (resources / 'source').mkdir()
         (resources / 'source/worker.py').write_bytes((repo / 'worker.py').read_bytes())
-        for name in ('Contents/MacOS/CassQuery', 'Contents/Resources/worker/cassquery-worker', 'Contents/Resources/worker/_internal/lazy-extension.so'):
+        for name in ('Contents/MacOS/CassQuery', 'Contents/Resources/worker/cassquery-worker', 'Contents/Resources/worker/_internal/lazy-extension.so',
+                     'Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries/libvk_swiftshader.dylib'):
             file = app / name; file.parent.mkdir(parents=True, exist_ok=True); file.write_bytes(bytes.fromhex('cffaedfe') + b'native'); file.chmod(0o755)
+        libraries = app / 'Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries'
+        (libraries / 'libvulkan.dylib').symlink_to('libvk_swiftshader.dylib')
         packed = {'package.json': json.dumps({'version': VERSION}).encode()}
         packed.update({name: (repo / name).read_bytes() for name in ('shell/main.js', 'shell/runtime.cjs', 'shell/smoke.cjs', 'shell/renderer_config.cjs')})
         return repo, app, packed
@@ -85,7 +255,7 @@ class PackageAssuranceTests(unittest.TestCase):
              patch.object(native, 'asar_contents', return_value=packed), patch.object(native.subprocess, 'run'), \
              patch.object(native.subprocess, 'check_output', return_value='arm64'):
             identity, _ = native.verify_bundle(app, 'arm64', VERSION)
-        self.assertEqual(len(identity['machos']), 3)
+        self.assertEqual(len(identity['machos']), 4)
         (app / 'Contents/Resources/icon.icns').write_bytes(b'wrong')
         with patch.object(native, 'ROOT', repo), self.assertRaisesRegex(RuntimeError, 'icon'):
             native.verify_bundle(app, 'arm64', VERSION)
@@ -134,7 +304,7 @@ class PackageAssuranceTests(unittest.TestCase):
             output = self.root / name; output.mkdir()
             (output / 'package.json').write_text('{"schema":1,"pass":true}')
             with self.assertRaises(RuntimeError):
-                tool.run_package(self.root / argument, output, 'arm64')
+                tool.run_package(self.root / argument, output, 'arm64', **self.checked)
             report = json.loads((output / 'package.json').read_text())
             self.assertIs(report['pass'], False); self.assertIn('error', report)
         output = self.root / 'worker.json'; output.write_text('{"schema":1,"pass":true}')
@@ -146,7 +316,7 @@ class PackageAssuranceTests(unittest.TestCase):
         file = self.root / 'candidate.dmg'; file.write_bytes(b'final exact dmg bytes')
         output = self.root / 'dmg'; output.mkdir()
         (output / 'package.json').write_text('{"schema":1,"pass":true}')
-        baseline = {'sha256': 'bundle', 'entries': 0, 'bytes': 0, 'records': []}
+        baseline = self.baseline
         order = []
         def run(command, **_kwargs):
             order.append(command[0] + ':' + command[1])
@@ -170,9 +340,9 @@ class PackageAssuranceTests(unittest.TestCase):
              patch.object(dmg, 'check_launch', side_effect=launch):
             if detach_error or launch_error or cancelled:
                 with self.assertRaises(RuntimeError):
-                    dmg.run_package(file, output, 'arm64')
+                    dmg.run_package(file, output, 'arm64', **self.checked)
             else:
-                dmg.run_package(file, output, 'arm64')
+                dmg.run_package(file, output, 'arm64', **self.checked)
         report = json.loads((output / 'package.json').read_text())
         if report.get('retained_temp_root'):
             shutil.rmtree(report['retained_temp_root'])  # Mock mount only, never a real volume.
@@ -201,7 +371,7 @@ class PackageAssuranceTests(unittest.TestCase):
 
     def test_zip_extraction_copy_launch_parity_and_final_hash_fail_closed(self):
         file = self.make_zip()
-        baseline = {'sha256': 'bundle', 'entries': 0, 'bytes': 0, 'records': []}
+        baseline = self.baseline
         for failure in (None, 'copy', 'launch', 'changed-asset'):
             output = self.root / ('zip-' + str(failure)); output.mkdir()
             labels = []
@@ -219,9 +389,9 @@ class PackageAssuranceTests(unittest.TestCase):
                  patch.object(zipped, 'check_launch', side_effect=launch):
                 if failure:
                     with self.assertRaises(RuntimeError):
-                        zipped.run_package(file, output, 'x86_64')
+                        zipped.run_package(file, output, 'x86_64', **self.checked)
                 else:
-                    zipped.run_package(file, output, 'x86_64')
+                    zipped.run_package(file, output, 'x86_64', **self.checked)
             report = json.loads((output / 'package.json').read_text())
             self.assertIs(report['pass'], failure is None)
             self.assertEqual(report['architecture'], 'x64')

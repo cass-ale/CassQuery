@@ -4,7 +4,8 @@
   "description": "A local desktop viewer for CadQuery projects \u2014 live preview tier, certified gated builds, semantic payloads, and a loopback agent protocol.",
   "main": "shell/main.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "check": "node --check shell/main.js && python3 -m py_compile worker.py",
+    "test": "npm run check",
     "app": "electron shell/main.js"
   },
   "keywords": [],

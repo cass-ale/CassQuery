@@ -1,4 +1,7 @@
 const { app, BrowserWindow } = require('electron');
+// software GL where no GPU exists (headless VMs); harmless on real hardware
+app.commandLine.appendSwitch('use-angle', 'swiftshader');
+app.commandLine.appendSwitch('enable-unsafe-swiftshader');
 const fs = require('fs');
 const http = require('http');
 const os = require('os');
@@ -6,7 +9,19 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const HOME = os.homedir();
+const REPO = path.join(__dirname, '..');
+const WORKER = path.join(REPO, 'worker.py');
 let worker = null;
+let tried = { python: null, worker: WORKER };
+
+function findPython() {
+  if (process.env.CASSQUERY_PYTHON) return process.env.CASSQUERY_PYTHON;
+  const venv = process.platform === 'win32'
+    ? path.join(REPO, '.venv', 'Scripts', 'python.exe')
+    : path.join(REPO, '.venv', 'bin', 'python');
+  if (fs.existsSync(venv)) return venv;
+  return process.platform === 'win32' ? 'python' : 'python3';
+}
 
 function getPort() {
   if (process.env.CASSQUERY_PORT) return parseInt(process.env.CASSQUERY_PORT, 10);
@@ -29,29 +44,38 @@ function checkStatus(port, timeoutMs = 1500) {
 }
 
 async function ensureWorker(port) {
-  if (await checkStatus(port)) return;
-  const python = process.env.CASSQUERY_PYTHON || path.join(HOME, 'workspace/.venv-cadquery/bin/python');
-  const projects = [
-    path.join(HOME, 'workspace/goals/bard-ring-design'),
-    path.join(HOME, 'workspace/goals/ifrit-ring-design/repo'),
-    path.join(HOME, 'workspace/cassquery/testpart'),
-  ].join(path.delimiter);
-  worker = spawn(python, [path.join(HOME, 'workspace/cassquery/worker.py')], {
-    env: { ...process.env, CASSQUERY_PROJECTS: projects },
-    detached: false,
-    stdio: 'inherit',
-  });
-  worker.on('error', () => { worker = null; });
+  if (await checkStatus(port)) return true;
+  const python = findPython();
+  tried = { python, worker: WORKER };
+  const env = { ...process.env };
+  if (!env.CASSQUERY_PROJECTS) env.CASSQUERY_PROJECTS = path.join(REPO, 'testpart');
+  let spawnFailed = false;
+  worker = spawn(python, [WORKER], { env, detached: false, stdio: 'inherit' });
+  worker.on('error', () => { spawnFailed = true; worker = null; });
   const deadline = Date.now() + 30000;
-  while (Date.now() < deadline) {
-    if (await checkStatus(port)) return;
+  while (Date.now() < deadline && !spawnFailed) {
+    if (await checkStatus(port)) return true;
     await new Promise((r) => setTimeout(r, 500));
   }
+  return checkStatus(port);
+}
+
+function errorPage() {
+  const html = `<!doctype html><meta charset="utf-8"><title>CassQuery — worker did not start</title>
+<body style="font-family:system-ui;background:#131315;color:#f0ede6;margin:48px;line-height:1.55">
+<h1 style="font-size:20px">The CassQuery worker did not start</h1>
+<p>Tried Python: <code>${tried.python}</code><br>Worker: <code>${tried.worker}</code></p>
+<p>Fix it one of two ways:</p>
+<ul>
+<li>Set <code>CASSQUERY_PYTHON</code> to a Python with CadQuery 2.5+ and websockets installed, then relaunch.</li>
+<li>Start the worker yourself in a terminal — <code>${tried.python} ${tried.worker}</code> — then relaunch.</li>
+</ul></body>`;
+  return 'data:text/html;charset=utf-8,' + encodeURIComponent(html);
 }
 
 app.whenReady().then(async () => {
   const port = getPort();
-  await ensureWorker(port);
+  const up = await ensureWorker(port);
   const win = new BrowserWindow({ width: 1320, height: 880 });
   const shot = process.env.CASSQUERY_SHOT;
   if (shot) {
@@ -59,6 +83,7 @@ app.whenReady().then(async () => {
     const schedule = () => {
       if (scheduled) return;
       scheduled = true;
+      const delay = parseInt(process.env.CASSQUERY_SHOT_DELAY || '6000', 10);
       setTimeout(async () => {
         try {
           const img = await win.webContents.capturePage();
@@ -67,13 +92,13 @@ app.whenReady().then(async () => {
         } finally {
           app.quit();
         }
-      }, 6000);
+      }, delay);
     };
     win.webContents.once('did-finish-load', schedule);
     win.webContents.once('did-fail-load', schedule);
     setTimeout(schedule, 15000); // shortcut: error pages may fire neither reliably, screenshot whatever is shown
   }
-  win.loadURL(`http://127.0.0.1:${port}/`).catch(() => {});
+  win.loadURL(up ? `http://127.0.0.1:${port}/` : errorPage()).catch(() => {});
 });
 
 app.on('will-quit', () => {

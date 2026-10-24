@@ -8,11 +8,34 @@ certified builds run the §6 gates and are the only payloads carrying
 step states. Failed builds announce nothing; the last certified model
 stays live. No authentication in v1 (loopback only; deferred to v2).
 
-Run:  CASSQUERY_PROJECTS=/path/projA:/path/projB python worker.py
+Run:  python worker.py [project_dir ...] [--port N]
+      (or CASSQUERY_PROJECTS=/path/projA:/path/projB python worker.py;
+      with neither, the bundled testpart demo is served)
 """
-import asyncio, base64, hashlib, importlib.util, json, os, sys, threading, time, traceback
+import asyncio, base64, hashlib, importlib, importlib.util, json, os, sys, threading, time, traceback
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
+
+def _preflight():
+    # Fail before serving if this interpreter cannot build: a missing
+    # websockets used to kill the announce thread silently, and a missing
+    # cadquery only surfaced as an opaque per-build error.
+    missing = []
+    for name in ("numpy", "cadquery", "OCP", "websockets"):
+        try:
+            importlib.import_module(name)
+        except Exception:
+            missing.append(name)
+    if missing:
+        print(f"CassQuery worker cannot start: {sys.executable} is missing: "
+              f"{', '.join(missing)}.\n"
+              "Install CadQuery 2.5+ (and websockets) into a virtualenv and run "
+              "this worker with that interpreter; the Electron shell picks its "
+              "interpreter from CASSQUERY_PYTHON.", file=sys.stderr)
+        raise SystemExit(1)
+
+
+_preflight()
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -202,15 +225,18 @@ def _b64(arr):
 
 
 def _pack_solid(wv, wt):
-    """Positions quantized to int16 per solid (offset + scale): step size is
+    """Positions quantized to uint16 per solid (offset + scale): step size is
     extent/65535 (~0.0004 mm on a 28 mm part), far below tessellation error;
-    gates always run on the unquantized arrays."""
+    gates always run on the unquantized arrays. (uint16, not int16: the full
+    0..65535 range is used — int16 silently wrapped the upper half of every
+    axis and folded the geometry; caught by the IFRIT step screenshots,
+    2026-10-24, and now covered by the payload-roundtrip gate check.)"""
     if len(wv) == 0:
         return {"positions": "", "indices": "", "qoffset": [0, 0, 0], "qscale": 1.0}
     lo = wv.min(axis=0)
     ext = float((wv.max(axis=0) - lo).max()) or 1.0
     scale = ext / 65535.0
-    q = np.round((wv - lo) / scale).astype(np.int16)
+    q = np.round((wv - lo) / scale).astype(np.uint16)
     u16 = len(wv) <= 65535
     return {"positions": _b64(q),
             "indices": _b64(wt.astype(np.uint16 if u16 else np.uint32)),
@@ -232,6 +258,9 @@ class Project:
     def __init__(self, root):
         self.root = root
         self.manifest = json.load(open(os.path.join(root, "viewer.json")))
+        for key in ("name", "entry"):
+            if key not in self.manifest:
+                raise ValueError(f"viewer.json is missing required key '{key}'")
         self.name = self.manifest["name"]
         self.gen = 0
         self.state = "idle"
@@ -355,7 +384,18 @@ class Project:
                             md = min(wv.max(axis=0) - wv.min(axis=0)) if len(wv) else 0.0
                             if abs(md - bd) > 0.02:
                                 diag.append(f"neutral/{n}/solid{si}: thin extent mesh {md:.3f} vs BREP {bd:.3f} mm")
-                    solids_out.append(_pack_solid(wv, wt))
+                    packed = _pack_solid(wv, wt)
+                    if tier == "certified" and len(wv):
+                        # payload roundtrip: the packed bytes must decode
+                        # back to the gated mesh (catches encoding bugs the
+                        # geometry gates cannot see — they run pre-pack)
+                        q = np.frombuffer(base64.b64decode(packed["positions"]),
+                                          dtype=np.uint16).astype(np.float64)
+                        dec = q.reshape(-1, 3) * packed["qscale"] + np.array(packed["qoffset"])
+                        err = float(np.abs(dec - wv).max()) if len(dec) == len(wv) else 1e9
+                        if err > 2 * packed["qscale"]:
+                            diag.append(f"{vname}/{n}/solid{si}: payload roundtrip error {err:.4f} mm")
+                    solids_out.append(packed)
                     if len(wv):
                         lo, hi = wv.min(axis=0), wv.max(axis=0)
                         for k in range(3):
@@ -411,6 +451,7 @@ class Project:
                 {"id": "volume", "status": "fail" if any("mesh volume" in d for d in diag) else "pass"},
                 {"id": "thin-extent", "status": "fail" if any("thin extent" in d for d in diag) else "pass"},
                 {"id": "triangulation", "status": "fail" if any("triangulation" in d for d in diag) else "pass"},
+                {"id": "payload-roundtrip", "status": "fail" if any("roundtrip" in d for d in diag) else "pass"},
                 {"id": "budget-tris", "status": "pass" if worst_tris <= TRI_BUDGET else "fail",
                  "value": worst_tris, "budget": TRI_BUDGET, "scope": "per variant"},
                 {"id": "budget-bytes", "status": "pass" if worst_bytes <= BYTE_BUDGET else "fail",
@@ -449,6 +490,7 @@ class Project:
 
 
 PROJECTS = {}
+LOAD_ERRORS = []
 WS_CLIENTS = set()
 WS_LOOP = None
 SHOTS_PENDING = {}
@@ -480,10 +522,17 @@ def run_build(p, tier):
         h, summary = p.build(tier)
     except Exception:
         tb = traceback.format_exc()
-        set_state(p, "error", tb.strip().splitlines()[-1] if tb.strip() else "build failed")
+        last = tb.strip().splitlines()[-1] if tb.strip() else "build failed"
+        # Point at the deepest frame inside the project's own files: that is
+        # where the user's code failed, not the worker's tessellation stack.
+        own = [f for f in traceback.extract_tb(sys.exc_info()[2])
+               if os.path.abspath(f.filename).startswith(os.path.abspath(p.root) + os.sep)]
+        detail = (f"{os.path.basename(own[-1].filename)}:{own[-1].lineno}: {last}"
+                  if own else last)
+        set_state(p, "error", detail)
         p.log("build-failed", tb[-1500:])
         broadcast({"type": "build_failed", "project": p.name, "tier": tier,
-                   "error": tb.strip().splitlines()[-1] if tb.strip() else "?"})
+                   "error": last, "detail": detail})
         return False
     if tier == "certified":
         p.gates = summary["gates"]
@@ -623,7 +672,8 @@ class Handler(BaseHTTPRequestHandler):
             if name:
                 p = self._project(name)
                 return p and self._send(200, p.status())
-            return self._send(200, [p.status() for p in PROJECTS.values()])
+            return self._send(200, {"projects": [p.status() for p in PROJECTS.values()],
+                                    "load_errors": LOAD_ERRORS})
         if u.path == "/api/manifest":
             p = self._project((q.get("project") or [""])[0])
             return p and self._send(200, p.manifest)
@@ -714,25 +764,61 @@ def find_port(start):
     raise RuntimeError("no free port")
 
 
-def main():
+def _split_projects(value):
+    # os.pathsep is the platform separator (';' on Windows, ':' elsewhere);
+    # commas keep working as a convenience separator.
     roots = []
-    for chunk in os.environ.get("CASSQUERY_PROJECTS", "").replace(",", ":").split(":"):
+    for chunk in value.replace(",", os.pathsep).split(os.pathsep):
         if chunk.strip():
             roots.append(os.path.expanduser(chunk.strip()))
+    return roots
+
+
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="worker.py",
+        description="CassQuery worker: warm CadQuery build server (loopback only).")
+    ap.add_argument("projects", nargs="*", metavar="PROJECT_DIR",
+                    help="project directories to serve (default: CASSQUERY_PROJECTS, "
+                         "else the bundled testpart demo)")
+    ap.add_argument("--port", type=int, default=None,
+                    help="HTTP port (default: CASSQUERY_PORT or 3939; scans upward if busy)")
+    args = ap.parse_args(argv)
+
+    roots = [os.path.expanduser(r) for r in args.projects] or \
+        _split_projects(os.environ.get("CASSQUERY_PROJECTS", ""))
+    defaulted = not roots
+    if defaulted:
+        roots = [os.path.join(HERE, "testpart")]
+    loaded = []
     for r in roots:
-        p = Project(r)
+        try:
+            p = Project(r)
+        except Exception as e:
+            # One bad project must not take the whole worker down.
+            reason = f"{type(e).__name__}: {e}"
+            LOAD_ERRORS.append({"path": r, "error": reason})
+            print(f"CassQuery: skipping project {r}: {reason}", flush=True)
+            continue
         if p.manifest.get("live"):
             p.preview_dirty = True
             p.certified_due = True
         PROJECTS[p.name] = p
-    port = find_port(int(os.environ.get("CASSQUERY_PORT", "3939")))
+        loaded.append(r)
+    if defaulted:
+        print("CassQuery: no projects configured — serving the bundled testpart "
+              "demo. Pass project directories as arguments or set "
+              "CASSQUERY_PROJECTS (os.pathsep-separated) to serve your own.",
+              flush=True)
+    port = find_port(args.port or int(os.environ.get("CASSQUERY_PORT", "3939")))
     json.dump({"port": port, "pid": os.getpid(), "started": time.time()},
               open(os.path.expanduser("~/.cassquery.json"), "w"))
     threading.Thread(target=ws_thread, args=(port + 1000,), daemon=True).start()
     threading.Thread(target=build_thread, daemon=True).start()
-    threading.Thread(target=watcher, args=(roots,), daemon=True).start()
+    threading.Thread(target=watcher, args=(loaded,), daemon=True).start()
     print(f"CassQuery worker on http://127.0.0.1:{port} (ws {port + 1000}), "
-          f"projects: {', '.join(PROJECTS)}", flush=True)
+          f"projects: {', '.join(PROJECTS) or '(none)'}", flush=True)
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 

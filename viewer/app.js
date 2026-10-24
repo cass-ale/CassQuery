@@ -37,6 +37,7 @@ let currentStep = -1;
 let explodeAmt = 0, explodeTarget = 0;
 let xrayOn = false;
 let camAnim = null;
+let wsDown = false;          // websocket was open, then dropped
 const shownHashes = {};      // project -> {preview, certified}
 
 // ---------- small helpers ----------
@@ -51,10 +52,10 @@ function b64indices(s) {
   return s.itype === "u16" ? new Uint16Array(u8.buffer) : new Uint32Array(u8.buffer);
 }
 function b64positions(s) {
-  // positions arrive as int16 quantized (qoffset + q * qscale)
+  // positions arrive as uint16 quantized (qoffset + q * qscale)
   const bin = atob(s.positions), u8 = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-  const q = new Int16Array(u8.buffer);
+  const q = new Uint16Array(u8.buffer);
   const out = new Float32Array(q.length);
   for (let i = 0; i < q.length; i++) out[i] = s.qoffset[i % 3] + q[i] * s.qscale;
   return out;
@@ -246,17 +247,41 @@ function goStep(i, animate) {
 async function loadProject(name) {
   current = name;
   currentStep = -1;
-  manifest = await api(`/api/manifest?project=${name}`);
+  try {
+    manifest = await api(`/api/manifest?project=${name}`);
+  } catch (e) {
+    document.getElementById("diag").textContent =
+      `Could not load ${name}: ${e.message || e}`;
+    return;
+  }
+  hideStageMsg();
   document.querySelectorAll("#projects button").forEach((b) =>
     b.setAttribute("aria-pressed", String(b.dataset.name === name)));
   renderSteps();
   const st = projects.find((p) => p.name === name) || {};
   const tier = st.hashes && st.hashes.certified ? "certified" : "preview";
   if (st.hashes && st.hashes[tier]) {
-    await fetchPayload(name, tier, st.hashes[tier]);
+    try {
+      await fetchPayload(name, tier, st.hashes[tier]);
+    } catch (e) {
+      document.getElementById("diag").textContent =
+        `Could not load the ${tier} model for ${name}: ${e.message || e}`;
+    }
+    if (st.state && st.state.startsWith("building")) setStale(st.state.replace("-", " "));
   } else {
     disposeModel();
-    setBadge(null, "no model yet");
+    // Reflect the project's real state instead of a bare "no model" while
+    // the first build is already running.
+    if (st.state && st.state.startsWith("building")) {
+      setBadge(null, "building…");
+      setStale(st.state.replace("-", " "));
+    } else if (st.state === "error") {
+      setBadge(null, "build failed");
+      const err = (st.history || []).filter((h) => h.event === "error").pop();
+      if (err) document.getElementById("diag").textContent = "Build error: " + err.detail;
+    } else {
+      setBadge(null, "no model yet");
+    }
     document.getElementById("caption").textContent =
       "No build yet. Use Rebuild certified to build this project.";
   }
@@ -270,6 +295,7 @@ async function fetchPayload(name, tier, hash) {
   shownHashes[name] = { ...(shownHashes[name] || {}), [tier]: hash };
   const keepDir = camera.position.clone().sub(controls.target);
   await buildModel(payload);
+  hideStageMsg();
   if (keepDir.lengthSq() > 0) {
     const b = model.bounds;
     const dist = 2.5 * b.radius;
@@ -299,6 +325,17 @@ function setBadge(tier, text) {
 }
 function setStale(text) {
   document.getElementById("buildline").innerHTML = `<span class="spin"></span> ${text}`;
+}
+function showStageMsg(title, detail) {
+  const el = document.getElementById("stage-msg");
+  el.innerHTML = "";
+  const s = document.createElement("strong");
+  s.textContent = title;
+  el.append(s, document.createTextNode(detail || ""));
+  el.hidden = false;
+}
+function hideStageMsg() {
+  document.getElementById("stage-msg").hidden = true;
 }
 
 // ---------- picking ----------
@@ -354,10 +391,23 @@ document.getElementById("buildbtn").addEventListener("click", async () => {
   await fetch("/api/rebuild", { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ project: current, tier: manifest.on_demand ? "certified" : "both" }) });
 });
+window.addEventListener("keydown", (e) => {
+  if (e.target.closest("input, textarea, select, [contenteditable]")) return;
+  if (e.key === "ArrowRight") goStep(currentStep + 1, true);
+  else if (e.key === "ArrowLeft") goStep(currentStep - 1, true);
+});
 
 // ---------- websocket: announces + agent commands ----------
 function connectWS() {
   const ws = new WebSocket(`ws://${location.hostname}:${httpPort + 1000}`);
+  let wasOpen = false;
+  ws.onopen = () => {
+    wasOpen = true;
+    if (wsDown) {
+      wsDown = false;
+      document.getElementById("buildline").textContent = "";
+    }
+  };
   ws.onmessage = async (ev) => {
     const m = JSON.parse(ev.data);
     if (m.type === "announce" && m.project === current) {
@@ -378,7 +428,7 @@ function connectWS() {
       document.getElementById("diag").textContent =
         (m.gates.diagnostics || []).slice(0, 6).join("\n");
     } else if (m.type === "build_failed" && m.project === current) {
-      document.getElementById("diag").textContent = "Build error: " + m.error;
+      document.getElementById("diag").textContent = "Build error: " + (m.detail || m.error);
       setStale("build failed");
     } else if (m.type === "manifest" && m.project === current) {
       manifest = await api(`/api/manifest?project=${current}`);
@@ -403,17 +453,27 @@ function connectWS() {
         body: JSON.stringify({ id: m.id, project: current, data }) });
     }
   };
-  ws.onclose = () => setTimeout(connectWS, 2000);
+  ws.onclose = () => {
+    if (wasOpen && !wsDown) {
+      wsDown = true;
+      document.getElementById("buildline").textContent = "disconnected — reconnecting";
+    }
+    setTimeout(connectWS, 2000);
+  };
 }
 
 // ---------- main loop ----------
+let lastW = 0, lastH = 0;
 function resize() {
   const w = stage.clientWidth, h = stage.clientHeight;
-  if (w && h && (renderer.domElement.width !== Math.floor(w * renderer.getPixelRatio()) || true)) {
-    renderer.setSize(w, h);
-    camera.aspect = w / h;
-    camera.updateProjectionMatrix();
-  }
+  if (!w || !h) return;
+  const pw = Math.floor(w * renderer.getPixelRatio());
+  const ph = Math.floor(h * renderer.getPixelRatio());
+  if (pw === lastW && ph === lastH) return; // no layout work when nothing changed
+  lastW = pw; lastH = ph;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
 }
 function tick(now) {
   requestAnimationFrame(tick);
@@ -438,7 +498,19 @@ window.__cq = { camera, controls, scene, get model() { return model; }, goStep }
 
 // ---------- boot ----------
 (async () => {
-  projects = await api("/api/projects");
+  try {
+    projects = await api("/api/projects");
+  } catch (e) {
+    showStageMsg("Can't reach the CassQuery worker",
+      `Tried ${location.origin}/api/projects — is the worker running?`);
+    requestAnimationFrame(tick);
+    return;
+  }
+  if (!projects.length) {
+    showStageMsg("No projects configured",
+      "This worker was started without projects. Restart it with project " +
+      "directories as arguments, or with CASSQUERY_PROJECTS set.");
+  }
   const nav = document.getElementById("projects");
   for (const p of projects) {
     const b = document.createElement("button");

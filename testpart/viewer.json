@@ -1,1 +1,86 @@
-{"chips":["3 bodies","test part"],"entry":"part_entry.py:build","explode":{"Base":[0,0,0],"Cap":[0,0,30],"Post":[0,0,14]},"live":true,"materials":{"Base":{"finish":"brushed","material":"316L","xray":"ghost"},"Cap":{"finish":"polished","material":"316L","xray":"opaque"},"Post":{"finish":"brushed","material":"316L","xray":"ghost"}},"name":"TESTPLATE","on_demand":false,"steps":[{"camera":null,"caption":"Three parts, as designed.","explode":0,"id":"assembled","label":"Assembled","variant":"neutral","xray":false},{"camera":null,"caption":"Post and cap lifted clear of the base.","explode":1,"id":"apart","label":"Take it apart","variant":"neutral","xray":false}]}
+{
+ "chips": [
+  "3 bodies",
+  "test part"
+ ],
+ "entry": "part_entry.py:build",
+ "explode": {
+  "Base": [
+   0,
+   0,
+   0
+  ],
+  "Cap": [
+   0,
+   0,
+   48
+  ],
+  "Post": [
+   0,
+   0,
+   22
+  ]
+ },
+ "live": true,
+ "materials": {
+  "Base": {
+   "finish": "brushed",
+   "material": "316L",
+   "xray": "ghost"
+  },
+  "Cap": {
+   "finish": "polished",
+   "material": "316L",
+   "xray": "opaque"
+  },
+  "Post": {
+   "finish": "brushed",
+   "material": "316L",
+   "xray": "ghost"
+  }
+ },
+ "name": "TESTPLATE",
+ "on_demand": false,
+ "steps": [
+  {
+   "camera": {
+    "position": [
+     70,
+     -95,
+     58
+    ],
+    "target": [
+     0,
+     0,
+     20
+    ]
+   },
+   "caption": "Three parts, as designed.",
+   "explode": 0,
+   "id": "assembled",
+   "label": "Assembled",
+   "variant": "neutral",
+   "xray": false
+  },
+  {
+   "camera": {
+    "position": [
+     70,
+     -95,
+     58
+    ],
+    "target": [
+     0,
+     0,
+     20
+    ]
+   },
+   "caption": "Post and cap lifted clear of the base.",
+   "explode": 1,
+   "id": "apart",
+   "label": "Take it apart",
+   "variant": "neutral",
+   "xray": false
+  }
+ ]
+}

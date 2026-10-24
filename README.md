@@ -46,20 +46,47 @@ A project is any directory with:
 
 ## Run it
 
-Requirements: Python with CadQuery 2.5+ available, Node.js 22+.
+Requirements: Python with CadQuery 2.5+ and websockets available, Node.js 22+.
+
+### Try the demo
 
 ```bash
-# the worker (serves the viewer at http://127.0.0.1:<port>)
-CASSQUERY_PROJECTS=/path/to/projectA:/path/to/projectB python worker.py
-
-# or the desktop shell (spawns the worker itself)
+git clone https://github.com/cass-ale/CassQuery.git
+cd CassQuery
+python3 -m venv .venv
+.venv/bin/pip install "cadquery>=2.5" websockets   # Windows: .venv\Scripts\pip
 npm install
-npm run app        # CASSQUERY_PYTHON overrides the Python it looks for
+npm run app
 ```
+
+The shell opens on the bundled demo project (`testpart/`, a plate with holes and a boss) with zero configuration: it finds the repo-local `.venv`, spawns the worker with the demo as the only project, and the first certified build runs on its own. `CASSQUERY_PYTHON` overrides the Python the shell looks for; `CASSQUERY_PROJECTS` (os.pathsep-separated — `;` on Windows, `:` elsewhere) replaces the demo with your own projects.
+
+### Run the worker directly
+
+```bash
+# project directories as arguments…
+.venv/bin/python worker.py /path/to/projectA /path/to/projectB
+
+# …or by environment
+CASSQUERY_PROJECTS=/path/to/projectA:/path/to/projectB .venv/bin/python worker.py
+
+# neither → the bundled testpart demo is served, and the worker says so
+```
+
+Then open the viewer at the URL the worker prints. The port is **3939** unless it is busy — the worker scans upward for a free port, prints the one it took, and writes `{port, pid}` to `~/.cassquery.json`, which is how the shell (and agents) find a running worker. `--port N` or `CASSQUERY_PORT=N` pins a starting port. With no arguments at all the worker still serves: the demo appears instead of an empty viewer. A project whose `viewer.json` is missing or invalid is skipped with a one-line error (also listed under `load_errors` in `GET /api/status`); the rest keep serving.
+
+## Troubleshooting
+
+- **"The CassQuery worker did not start" in the shell, or a startup error naming missing modules** — the Python in use has no CadQuery (or no websockets). The worker checks for numpy, CadQuery/OCP, and websockets before serving and exits with the list of what is missing. Point `CASSQUERY_PYTHON` at an interpreter that has them (the demo's `.venv`, if you made one).
+- **The viewer opens on a different port than 3939** — 3939 was busy; the worker scanned upward. The printed URL and `~/.cassquery.json` always carry the real port.
+- **Empty viewer / "No projects configured"** — the worker was started without projects and every configured project failed to load, or none was configured. Check the worker's console for the per-project skip reasons, and `load_errors` in `GET /api/status`.
+- **A project is missing from the switcher** — its `viewer.json` failed to load (missing file, invalid JSON, or a missing `name`/`entry` key). The skip reason is printed at startup and kept in `load_errors`.
 
 ## Status
 
-v1, in active development. Windows and macOS are the target desktops; it runs unpackaged in dev mode — no installers, signing, or onboarding, by design. The design projects it was built for are private; their models and payloads are not in this repository. The demo project (`testpart/`) and its payloads are the public proof of the loop.
+v1 is built and verified: both tiers live, all eight certified gates exercised (including a deliberate gate-failure run where the last certified model stayed on screen), the save → preview → certified loop proven end to end with render-checked screenshots, and the agent protocol driven headlessly against the running worker. Windows and macOS are the target desktops; it runs unpackaged in dev mode — no installers, signing, or onboarding, by design. The design projects it was built for are private; their models and payloads are not in this repository. The demo project (`testpart/`) and its payloads are the public proof of the loop.
+
+Working on this repo — human or agent? Read [AGENTS.md](AGENTS.md) first: it carries the depth standard and the verification laws this codebase is held to.
 
 ## License
 

@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import plistlib
 import stat
 import struct
 import sys
@@ -221,7 +222,18 @@ def candidate_bytes(arch, mutate=None, extra=None):
         put(directory + '/checked-inventory.json', inventory)
         put(directory + '/bundle-inventory.json', inventory)
         asset = f'dist/mac-app/CassQuery-{VERSION}-mac-{arch}.{extension}'
-        put(directory + '/package.json', {**identity, 'asset': record(asset, files[asset]), 'images': aggregate,
+        mount_proof = {}
+        if extension == 'dmg':
+            point = '/private/var/protocol-dmg/mounted'
+            device = '/dev/disk2s1'
+            files[directory + '/attach.plist'] = plistlib.dumps({'system-entities': [
+                {'dev-entry': device, 'mount-point': point}, {'dev-entry': '/dev/disk2'}]}, sort_keys=True)
+            files[directory + '/mount-info.plist'] = plistlib.dumps({'DeviceNode': device, 'MountPoint': point,
+                'WritableVolume': False, 'WritableMedia': True}, sort_keys=True)
+            mount_proof['mount'] = {'path': point, 'device': device, 'read_only_requested': True, 'read_only_verified': True,
+                'attach_evidence': linked(directory + '/attach.plist', directory),
+                'info_evidence': linked(directory + '/mount-info.plist', directory)}
+        put(directory + '/package.json', {**identity, **mount_proof, 'asset': record(asset, files[asset]), 'images': aggregate,
             'checked_inventory': linked(directory + '/checked-inventory.json', directory),
             'bundle_inventory': linked(directory + '/bundle-inventory.json', directory), 'checked_bundle_sha256': inventory['sha256'],
             'launches': launches, 'temp_root_removed': True, 'detach_completed': True})

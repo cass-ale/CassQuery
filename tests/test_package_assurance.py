@@ -58,6 +58,20 @@ INTEL_ATTACH_PLIST = b'''<?xml version="1.0" encoding="UTF-8"?>
 '''
 
 
+# Essential fields copied verbatim from both cf4469d diskutil replies. Full
+# original XML hashes are pinned here; no undocumented read-only key is invented.
+READONLY_INFO_FIXTURES = (
+    ('e5d22693513d8932ef69f3f19c7529258533ceea10fa35044200327d49839d51',
+     {'DeviceNode': '/dev/disk5s1',
+      'MountPoint': '/private/var/folders/nj/vtw8zd2j31d1gdrtntc5y4600000gn/T/cq-dmg-jz41pa57/mounted',
+      'WritableVolume': False, 'Writable': False, 'WritableMedia': False}),
+    ('9bd3efba173d3d077f81ec400899e78ad749f8a5e222a6dad2e6837f58fcf214',
+     {'DeviceNode': '/dev/disk2s1',
+      'MountPoint': '/private/var/folders/20/jp1_0n3n7kndh6rnbqb5344m0000gn/T/cq-dmg-3g7aa1j8/mounted',
+      'WritableVolume': False, 'Writable': False, 'WritableMedia': False}),
+)
+
+
 class PackageAssuranceTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix='cq-package-unit-')
@@ -381,7 +395,45 @@ class PackageAssuranceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'redirected'):
             dmg.mounted_device(plistlib.dumps(data), mount)
 
-    def exercise_dmg(self, detach_error=False, launch_error=False, cancelled=False, attach_case=None):
+    def test_actual_readonly_mount_info_primary_volume_and_identity(self):
+        for raw_sha, original in READONLY_INFO_FIXTURES:
+            with self.subTest(raw_sha=raw_sha):
+                data = copy.deepcopy(original)
+                mount, device = Path(data['MountPoint']).resolve(), data['DeviceNode']
+                dmg.validate_readonly_mount(data, mount, device)
+                minimal = {key: data[key] for key in ('DeviceNode', 'MountPoint', 'WritableVolume')}
+                dmg.validate_readonly_mount(minimal, mount, device)
+                # Read-only filesystems can coexist with writable underlying media.
+                data.update(Writable=True, WritableMedia=True)
+                dmg.validate_readonly_mount(data, mount, device)
+                if sys.platform == 'darwin':
+                    data['MountPoint'] = data['MountPoint'].replace('/private/var/', '/var/', 1)
+                    dmg.validate_readonly_mount(data, mount, device)
+                for value in (True, None, 0, 1, 'false', ''):
+                    bad = copy.deepcopy(original); bad['WritableVolume'] = value
+                    with self.subTest(value=value), self.assertRaises(RuntimeError):
+                        dmg.validate_readonly_mount(bad, mount, device)
+                for key in ('WritableVolume', 'DeviceNode', 'MountPoint'):
+                    bad = copy.deepcopy(original); bad.pop(key)
+                    with self.subTest(missing=key), self.assertRaises(RuntimeError):
+                        dmg.validate_readonly_mount(bad, mount, device)
+                for key, value in (('DeviceNode', '/dev/disk999'), ('MountPoint', str(mount) + '-foreign'), ('MountPoint', 'relative')):
+                    bad = copy.deepcopy(original); bad[key] = value
+                    with self.subTest(key=key, value=value), self.assertRaises(RuntimeError):
+                        dmg.validate_readonly_mount(bad, mount, device)
+                legacy = {'DeviceNode': device, 'MountPoint': str(mount), 'ReadOnlyVolume': True}
+                with self.assertRaises(RuntimeError): dmg.validate_readonly_mount(legacy, mount, device)
+                with self.assertRaises(RuntimeError): dmg.validate_readonly_mount([], mount, device)
+
+    def test_readonly_mount_info_rejects_retargeted_owned_path(self):
+        mount = self.root.resolve() / 'readonly-mount'; mount.mkdir()
+        foreign = self.root.resolve() / 'foreign-volume'; foreign.mkdir()
+        mount.rmdir(); mount.symlink_to(foreign, target_is_directory=True)
+        data = copy.deepcopy(READONLY_INFO_FIXTURES[1][1]); data['MountPoint'] = str(foreign)
+        with self.assertRaisesRegex(RuntimeError, 'redirected'):
+            dmg.validate_readonly_mount(data, mount, data['DeviceNode'])
+
+    def exercise_dmg(self, detach_error=False, launch_error=False, cancelled=False, attach_case=None, info_case=None):
         file = self.root / 'candidate.dmg'; file.write_bytes(b'final exact dmg bytes')
         output = self.root / 'dmg'; output.mkdir()
         (output / 'package.json').write_text('{"schema":1,"pass":true}')
@@ -414,7 +466,14 @@ class PackageAssuranceTests(unittest.TestCase):
         def capture(command, **_kwargs):
             self.dmg_commands.append(command)
             if command[0] == 'diskutil':
-                return plistlib.dumps({'ReadOnlyVolume': True})
+                data = copy.deepcopy(READONLY_INFO_FIXTURES[1][1])
+                data['MountPoint'] = command[-1]
+                if info_case == 'missing': data.pop('WritableVolume')
+                elif info_case == 'writable': data['WritableVolume'] = True
+                elif info_case == 'integer-zero': data['WritableVolume'] = 0
+                elif info_case == 'wrong-device': data['DeviceNode'] = '/dev/disk999'
+                elif info_case == 'wrong-mount': data['MountPoint'] += '-foreign'
+                return plistlib.dumps(data)
             mount = Path(command[command.index('-mountpoint') + 1])
             self.assertEqual(mount, owned / 'mounted')  # Canonical before OS call, not an echoed alias.
             data = plistlib.loads(INTEL_ATTACH_PLIST)
@@ -450,7 +509,7 @@ class PackageAssuranceTests(unittest.TestCase):
              patch.object(dmg.subprocess, 'run', side_effect=run), patch.object(dmg.subprocess, 'check_output', side_effect=capture), \
              patch.object(dmg, 'verify_bundle', side_effect=verify), patch.object(dmg, 'inventory', return_value=baseline), \
              patch.object(dmg, 'check_launch', side_effect=launch):
-            if detach_error or launch_error or cancelled or attach_case:
+            if detach_error or launch_error or cancelled or attach_case or info_case:
                 with self.assertRaises(RuntimeError):
                     dmg.run_package(file, output, 'arm64', **self.checked)
             else:
@@ -463,6 +522,21 @@ class PackageAssuranceTests(unittest.TestCase):
         elif owned.is_symlink():
             owned.unlink()  # Mock pre-attach root retarget, no real mount was attempted.
         return report, order
+
+    def test_invalid_readonly_info_is_retained_and_fails_before_bundle_launch(self):
+        for case in ('missing', 'writable', 'integer-zero', 'wrong-device', 'wrong-mount'):
+            with self.subTest(case=case):
+                report, order = self.exercise_dmg(info_case=case)
+                self.assertIs(report['pass'], False)
+                self.assertNotIn('bundle-verification', order)
+                self.assertFalse(any(item.startswith('launch:') for item in order))
+                self.assertIsNot(report['mount'].get('read_only_verified'), True)
+                record = report['mount']['info_evidence']
+                retained = self.root / 'dmg' / record['path']
+                self.assertEqual(record['sha256'], native.sha256(retained))
+                self.assertEqual(record['bytes'], retained.stat().st_size)
+                self.assertIs(report['detach_completed'], True)  # Mock cleanup, not native proof.
+                shutil.rmtree(self.root / 'dmg')
 
     def test_foreign_missing_duplicate_attach_never_detach_an_unproven_device(self):
         for case in ('foreign', 'missing-device', 'duplicate'):

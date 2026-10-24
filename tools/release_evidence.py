@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path, PurePosixPath
+import plistlib
 import re
 import shutil
 import subprocess
@@ -496,6 +497,40 @@ def verify_native_report(root, report_path, report, *, expected_sha, expected_ar
     return cold_images + warm_images
 
 
+def verify_dmg_mount(root, report_path, report, records):
+    """Portable replay of the producer's owned, read-only mounted-volume proof."""
+    mount = report.get('mount')
+    require(isinstance(mount, dict) and mount.get('read_only_requested') is True
+            and mount.get('read_only_verified') is True, 'missing verified read-only DMG mount proof')
+
+    def point(value):
+        require(isinstance(value, str) and PurePosixPath(value).is_absolute()
+                and value == PurePosixPath(value).as_posix() and '..' not in PurePosixPath(value).parts,
+                'invalid recorded DMG mount path')
+        # CI Mac /var is a known alias. Never resolve its absent path on the verifier host.
+        return '/private' + value if value.startswith('/var/') else value
+
+    owned = point(mount.get('path'))
+    device = mount.get('device')
+    require(isinstance(device, str) and re.fullmatch(r'/dev/disk\d+(?:s\d+)*', device), 'invalid owned DMG device')
+    evidence = {}
+    for key in ('attach_evidence', 'info_evidence'):
+        name = verify_record(root, report_path, mount.get(key))
+        manifest_record(root, records, name)
+        file = relative_file(root, name)
+        require(file.stat().st_size <= 16 * 1024 * 1024, 'DMG mount evidence exceeds limit')
+        evidence[key] = plistlib.loads(file.read_bytes())
+        require(isinstance(evidence[key], dict), 'invalid DMG mount evidence schema')
+    entities = evidence['attach_evidence'].get('system-entities')
+    require(isinstance(entities, list) and all(isinstance(entity, dict) for entity in entities), 'invalid DMG attach device inventory')
+    matches = [entity for entity in entities if isinstance(entity.get('mount-point'), str)
+               and point(entity['mount-point']) == owned]
+    require(len(matches) == 1 and matches[0].get('dev-entry') == device, 'DMG attach differs from unique owned device/mount')
+    info = evidence['info_evidence']
+    require(info.get('DeviceNode') == device and point(info.get('MountPoint')) == owned, 'DMG mount info device/path differs from owned mount')
+    require(info.get('WritableVolume') is False, 'DMG mounted volume is not verifiably read-only')
+
+
 def verify_candidate(root, manifest=None, *, expected_sha, expected_run_id, expected_arch,
                      expected_attempt=None, expected_version=None):
     root = Path(root)
@@ -612,6 +647,7 @@ def verify_candidate(root, manifest=None, *, expected_sha, expected_run_id, expe
                     and report.get('checked_bundle_sha256') == native_bundle_sha, 'package inventory differs from checked prepackaged app')
             require(report.get('temp_root_removed') is True, 'package cleanup not proven')
             if name == 'dmg':
+                verify_dmg_mount(root, required_path, report, records)
                 require(report.get('detach_completed') is True, 'DMG still mounted or detach skipped')
         images_identity(root, required_path, report.get('images', []), records, image_cache)
         require(type(report.get('run_attempt', 1)) is int and report.get('run_attempt', 1) == attempt, f'{name} attempt mismatch')

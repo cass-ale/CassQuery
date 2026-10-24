@@ -282,6 +282,58 @@ class NativeConformanceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.verify()
 
+    def test_dmg_readonly_proof_preserves_volume_semantics_and_mac_alias(self):
+        import plistlib
+        name = 'evidence/dmg-arm64/mount-info.plist'
+        file = self.root / name
+        data = plistlib.loads(file.read_bytes())
+        data.update(WritableMedia=True, Writable=True)
+        data['MountPoint'] = data['MountPoint'].replace('/private/var/', '/var/', 1)
+        file.write_bytes(plistlib.dumps(data, sort_keys=True))
+        self.refresh()
+        self.verify()
+
+    def test_dmg_requires_requested_and_verified_proof_flags(self):
+        name = 'evidence/dmg-arm64/package.json'
+        for change in (lambda r: r.pop('mount'), lambda r: r['mount'].pop('read_only_verified'),
+                       lambda r: r['mount'].update(read_only_verified=False),
+                       lambda r: r['mount'].update(read_only_verified=1),
+                       lambda r: r['mount'].update(read_only_requested=False)):
+            self.reset()
+            report = self.report(name)
+            change(report)
+            self.put(name, report)
+            self.refresh()
+            with self.assertRaisesRegex(ValueError, 'read-only DMG mount proof'):
+                self.verify()
+
+    def test_dmg_physical_plists_rehashed_writable_or_foreign_mounts_reject(self):
+        import plistlib
+        cases = [
+            ('mount-info.plist', lambda data: data.update(WritableVolume=True)),
+            ('mount-info.plist', lambda data: data.update(WritableVolume=0)),
+            ('mount-info.plist', lambda data: data.update(WritableVolume='false')),
+            ('mount-info.plist', lambda data: data.pop('WritableVolume')),
+            ('mount-info.plist', lambda data: data.update(DeviceNode='/dev/disk99s1')),
+            ('mount-info.plist', lambda data: data.pop('DeviceNode')),
+            ('mount-info.plist', lambda data: data.update(MountPoint='/private/var/foreign/mounted')),
+            ('mount-info.plist', lambda data: data.pop('MountPoint')),
+            ('attach.plist', lambda data: data['system-entities'][0].update(**{'dev-entry': '/dev/disk99s1'})),
+            ('attach.plist', lambda data: data['system-entities'][0].update(**{'mount-point': '/private/var/foreign/mounted'})),
+            ('attach.plist', lambda data: data['system-entities'].append(copy.deepcopy(data['system-entities'][0]))),
+            ('attach.plist', lambda data: data.update(**{'system-entities': [data['system-entities'][1]]})),
+        ]
+        for name, change in cases:
+            with self.subTest(name=name, change=change):
+                self.reset()
+                file = self.root / 'evidence/dmg-arm64' / name
+                data = plistlib.loads(file.read_bytes())
+                change(data)
+                file.write_bytes(plistlib.dumps(data, sort_keys=True))
+                self.refresh()  # Real changed plist and every link/inventory are rehashed.
+                with self.assertRaises(ValueError):
+                    self.verify()
+
     def test_actual_raw_contract_is_shared_and_portable(self):
         report = self.report('evidence/mac-arm64/renderer.json')
         report.update(started=report['renderer_started'], finished=report['renderer_finished'], checkpoints=report['renderer_checkpoints'])

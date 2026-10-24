@@ -41,6 +41,22 @@ def mounted_device(attached, mount):
     return device
 
 
+def validate_readonly_mount(data, mount, device):
+    """Bind diskutil's actual writable flags to the selected owned device/path."""
+    require(isinstance(data, dict), 'Invalid diskutil mount info')
+    owned = Path(mount)
+    require(owned.is_absolute() and not owned.is_symlink() and owned.resolve() == owned,
+            'Owned mount path redirected during read-only verification')
+    require(isinstance(device, str) and device and isinstance(data.get('DeviceNode'), str)
+            and data['DeviceNode'] == device, 'Read-only mount info device differs from owned device')
+    point = data.get('MountPoint')
+    require(isinstance(point, str) and Path(point).is_absolute() and Path(point).resolve() == owned,
+            'Read-only mount info path differs from owned mount')
+    require(data.get('WritableVolume') is False, 'Mounted DMG volume is not verifiably read-only')
+    # Writable/WritableMedia describe other layers and may remain true for a
+    # read-only volume. Retain raw info, but do not infer volume state from them.
+
+
 def run_package(dmg, output, arch, *, checked_app, checked_inventory):
     dmg, output, arch = Path(dmg).resolve(), Path(output).resolve(), architecture(arch)
     checked_app, checked_inventory = Path(checked_app), Path(checked_inventory)
@@ -80,9 +96,9 @@ def run_package(dmg, output, arch, *, checked_app, checked_inventory):
                            'attach_evidence': file_evidence(output / 'attach.plist')}
         disk = subprocess.check_output(['diskutil', 'info', '-plist', str(mount)], timeout=30)
         (output / 'mount-info.plist').write_bytes(disk)
-        require(plistlib.loads(disk).get('ReadOnlyVolume') is True, 'Mounted DMG volume is not read-only')
-        report['mount']['read_only_verified'] = True
         report['mount']['info_evidence'] = file_evidence(output / 'mount-info.plist')
+        validate_readonly_mount(plistlib.loads(disk), mount, device)
+        report['mount']['read_only_verified'] = True
         report['checkpoints'].append(checkpoint('mounted'))
         app = mount / 'CassQuery.app'
         _, mounted_inventory = verify_bundle(app, arch, version)

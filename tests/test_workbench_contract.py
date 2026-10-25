@@ -636,6 +636,41 @@ for(const field of ['model_hash','model_gen','model_built_at','theme','panel','s
             with self.subTest(kind=kind): self.assertNotEqual(self.validate(value).returncode, 0)
             if kind == 'missing-image': (self.output / shot['raster_attempts'][0]['image']['path']).write_bytes(parser_png())
 
+    def test_python_network_denial_is_explicit_github_ci_only(self):
+        # Modelled process receipts; actual prompt interaction must pass native CI.
+        from unittest.mock import patch
+        import workbench_native_smoke as native
+        flag = 'CASSQUERY_CI_DENY_PYTHON_LOCAL_NETWORK'
+        allowed = {flag: '1', 'GITHUB_ACTIONS': 'true', 'CI': 'true', 'RUNNER_OS': 'macOS'}
+        with patch.dict(native.os.environ, {}, clear=True), patch.object(native.subprocess, 'run') as run:
+            self.assertEqual(native.deny_ci_python_local_network(), {'status': 'not-requested'})
+            run.assert_not_called()
+        for key in ('GITHUB_ACTIONS', 'CI', 'RUNNER_OS'):
+            invalid = {**allowed, key: 'false'}
+            with self.subTest(key=key), patch.dict(native.os.environ, invalid, clear=True), \
+                    patch.object(native.platform, 'system', return_value='Darwin'), patch.object(native.subprocess, 'run') as run:
+                with self.assertRaises(RuntimeError): native.deny_ci_python_local_network()
+                run.assert_not_called()
+        for status in ('denied', 'not-present', 'unexpected'):
+            result = subprocess.CompletedProcess([], 0, status + '\n', '')
+            with self.subTest(status=status), patch.dict(native.os.environ, allowed, clear=True), \
+                    patch.object(native.platform, 'system', return_value='Darwin'), patch.object(native.subprocess, 'run', return_value=result) as run:
+                if status == 'unexpected':
+                    with self.assertRaises(RuntimeError): native.deny_ci_python_local_network()
+                else:
+                    self.assertEqual(native.deny_ci_python_local_network()['status'], status)
+                script = run.call_args.args[0][-1]
+                self.assertIn('com.apple.UserNotificationCenter', script)
+                self.assertIn('Allow “Python” to find devices on local networks?', script)
+                self.assertIn('if (count matches) is not 1 then error', script)
+                self.assertIn('if not enabled of denyButton then error', script)
+                self.assertIn('click denyButton', script)
+                self.assertNotIn('click button "Allow"', script)
+                self.assertEqual(run.call_args.kwargs['timeout'], 5)
+        with patch.dict(native.os.environ, allowed, clear=True), patch.object(native.platform, 'system', return_value='Darwin'), \
+                patch.object(native.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'Permission denied')):
+            with self.assertRaisesRegex(RuntimeError, 'Permission denied'): native.deny_ci_python_local_network()
+
     def test_native_trust_waits_for_matching_dialog_events(self):
         # MODELS ONLY: actual wrapper function, fixed OS script stub, virtual event clock; not native macOS proof.
         from unittest.mock import patch

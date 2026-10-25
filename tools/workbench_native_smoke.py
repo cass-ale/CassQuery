@@ -327,6 +327,63 @@ def status(port):
     return json.loads(data)
 
 
+def deny_ci_python_local_network():
+    """Owner-authorized denial of one exact system prompt, only on GitHub Mac runners."""
+    if os.environ.get('CASSQUERY_CI_DENY_PYTHON_LOCAL_NETWORK') != '1':
+        return {'status': 'not-requested'}
+    require(os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('CI') == 'true'
+            and os.environ.get('RUNNER_OS') == 'macOS' and platform.system() == 'Darwin',
+            'Python local-network consent handling is restricted to GitHub macOS CI')
+    script = '''tell application "System Events"
+  set matches to {}
+  set systemIDs to {"com.apple.UserNotificationCenter", "com.apple.CoreServicesUIAgent"}
+  repeat with systemID in systemIDs
+    set candidates to application processes whose bundle identifier is (contents of systemID)
+    if (count candidates) > 1 then error "Ambiguous system consent process"
+    repeat with targetProcess in candidates
+      if (count windows of targetProcess) > 8 then error "System consent window bound exceeded"
+      repeat with targetWindow in windows of targetProcess
+        set elements to entire contents of targetWindow
+        if (count elements) > 256 then error "System consent element bound exceeded"
+        set exactPrompt to false
+        set denyButtons to {}
+        repeat with itemElement in elements
+          if role of itemElement is "AXStaticText" then
+            set textValue to value of itemElement
+            if textValue is "Allow “Python” to find devices on local networks?" or textValue is "Allow \\"Python\\" to find devices on local networks?" then set exactPrompt to true
+          else if role of itemElement is "AXButton" then
+            set buttonName to name of itemElement
+            if buttonName is "Don't Allow" or buttonName is "Don’t Allow" then set end of denyButtons to itemElement
+          end if
+        end repeat
+        if exactPrompt then
+          if (count denyButtons) is not 1 then error "Exact Python consent deny control is missing or ambiguous"
+          set end of matches to {targetProcess, targetWindow, item 1 of denyButtons}
+        end if
+      end repeat
+    end repeat
+  end repeat
+  if (count matches) is 0 then return "not-present"
+  if (count matches) is not 1 then error "Ambiguous Python local-network consent prompt"
+  set matched to item 1 of matches
+  set denyButton to item 3 of matched
+  if not enabled of denyButton then error "Python local-network deny control disabled"
+  click denyButton
+  set closeDeadline to (current date) + 3
+  repeat while exists (item 2 of matched)
+    if (current date) >= closeDeadline then error "Python local-network consent prompt did not close"
+    delay 0.1
+  end repeat
+  return "denied"
+end tell'''
+    result = subprocess.run(['/usr/bin/osascript', '-e', script], capture_output=True, text=True, timeout=5)
+    require(result.returncode == 0, 'CI Python local-network denial failed: ' + result.stderr.strip()[:1000])
+    status = result.stdout.strip()
+    require(status in ('not-present', 'denied'), 'Unexpected CI local-network consent receipt')
+    return {'status': status, 'decision': 'deny', 'prompt': 'Python local-network access',
+            'scope': 'temporary GitHub macOS runner; owner authorized'}
+
+
 def os_input(pid, commands, *, deadline=None):
     require(type(pid) is int and pid > 0, 'Native input needs the owned app PID')
     timeout = 20 if deadline is None else min(20, deadline - time.monotonic())
@@ -434,6 +491,7 @@ def serve_native_actions(process, proof, challenge, user):
                 require(ledger['calls'][index].get('method') == 'showOpenDialog' and ledger['calls'][index].get('action_id') == identity
                         and ('openDirectory' if kind == 'folder' else 'openFile') in ledger['calls'][index].get('properties', []),
                         'Unrelated native panel before trusted selection')
+            response['local_network_consent'] = deny_ci_python_local_network()
             image = screenshot(proof / f'native-os-{identity}.png'); image['path'] = Path(image['path']).name; response['image'] = image
             commands = ''
             if kind == 'cancel':

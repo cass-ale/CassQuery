@@ -98,6 +98,9 @@ jobs:
           APP=$(printf '%s\n' dist/mac-app/mac*/CassQuery.app)
           python tools/dmg_smoke.py --dmg "$(printf '%s\n' dist/mac-app/*.dmg)" --arch "$ARCH" --output evidence/dmg-${{ matrix.arch }} --checked-app "$APP" --checked-inventory evidence/mac-${{ matrix.arch }}/bundle-before.json
       - name: Native workbench editor and file dialogs
+        env:
+          # Owner-authorized denial of the exact Python local-network prompt on disposable runners only.
+          CASSQUERY_CI_DENY_PYTHON_LOCAL_NETWORK: '1'
         run: |
           APP=$(printf '%s\n' dist/mac-app/mac*/CassQuery.app)
           python tools/workbench_native_smoke.py --app "$APP" --arch ${{ matrix.arch }} --output evidence/workbench-${{ matrix.arch }}

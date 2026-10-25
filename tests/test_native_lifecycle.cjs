@@ -7,34 +7,52 @@ const api=require('../shell/smoke.cjs');
 const graphics=require('../shell/renderer_config.cjs');
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
-test('native camera gesture carries coherent button state, observed capture and an event ledger through release',async()=>{
+test('native camera gesture carries coherent state and acknowledges its endpoint after normal coalescing',async()=>{
  const originalSource=fs.readFileSync(path.join(__dirname,'../shell/smoke.cjs'),'utf8');
- for(const mode of ['left','right','superseded','no-down','no-capture','lost-move','untrusted','no-release','covered','cleanup-error','delayed-right','late-down']){
-  const healthy=['left','right','superseded','delayed-right'].includes(mode);
-  // Scheduling headroom is only for healthy VM callbacks; negative deadlines stay deliberately short.
-  const source=originalSource.replaceAll(',2000)',healthy?',1000)':',20)');
+ const modes=['left','right','superseded','no-down','no-capture','lost-move','untrusted','no-release','covered','cleanup-error','delayed-right','late-down','release-deferred','coalesced-final','foreign-id','wrong-move-mask','missing-final','move-after-up','cancelled','journal-dropped','layout-change','gesture-deadline'];
+ for(const mode of modes){
+  const healthy=['left','right','superseded','delayed-right','release-deferred','coalesced-final'].includes(mode);
+  let source=originalSource.replace('phaseBudget=2000',healthy?'phaseBudget=1000':'phaseBudget=20');
   assert.notEqual(source,originalSource,'Native pointer timeout test seam must replace the production budget');
-  const canvasListeners=new Map(),docListeners=new Map(),sent=[];let captured=false,cleaned=false;
-  const canvas={getBoundingClientRect:()=>({left:0,top:0,right:400,bottom:300,width:400,height:300}),hasPointerCapture:()=>captured,
+  if(mode==='gesture-deadline')source=source.replace('gestureBudget=20000','gestureBudget=20');
+  const canvasListeners=new Map(),docListeners=new Map(),sent=[];let captured=false,cleaned=false,frames=0,pending=null,stamp=0;
+  const canvas={getBoundingClientRect:()=>({left:0,top:0,right:mode==='layout-change'&&frames>=5?399:400,bottom:300,width:400,height:300}),hasPointerCapture:()=>captured,
    addEventListener:(t,f)=>canvasListeners.set(t,f),removeEventListener:t=>canvasListeners.delete(t)};
   const document={querySelector:()=>canvas,elementFromPoint:()=>mode==='covered'?{}:canvas,hasFocus:()=>true,
    addEventListener:(t,f)=>docListeners.set(t,f),removeEventListener:t=>docListeners.delete(t)};
-  const renderer=vm.createContext({document,window:{},innerWidth:400,innerHeight:300,scrollX:0,scrollY:0});
-  const emit=(type,input,buttons)=>{const e={type,target:canvas,clientX:input.x,clientY:input.y,buttons,button:type==='pointermove'?-1:input.button==='right'?2:0,pointerId:1,isTrusted:mode!=='untrusted',movementX:8,movementY:3};docListeners.get(type)?.(e);canvasListeners.get(type)?.(e);};
+  const renderer=vm.createContext({document,window:{},performance,innerWidth:400,innerHeight:300,scrollX:0,scrollY:0,requestAnimationFrame:callback=>{frames++;if(mode==='gesture-deadline'){const end=performance.now()+35;while(performance.now()<end){}}callback(performance.now());}});
+  const emit=(type,input,buttons,coalesced=[])=>{const e={type,target:canvas,clientX:input.x,clientY:input.y,buttons,button:type==='pointermove'?-1:input.button==='right'?2:0,pointerId:mode==='foreign-id'&&type==='pointermove'?2:1,isTrusted:mode!=='untrusted',timeStamp:++stamp,movementX:8,movementY:3,getCoalescedEvents:()=>coalesced};docListeners.get(type)?.(e);canvasListeners.get(type)?.(e);};
   const win={focus(){},isFocused:()=>true,isDestroyed:()=>false,webContents:{executeJavaScript:async code=>{
    if(['delayed-right','late-down'].includes(mode)&&code.includes('window.__cqSmokeDown?.trusted')){const end=performance.now()+35;while(performance.now()<end){}}
    if(code.includes("c.removeEventListener('pointermove'")){cleaned=true;if(mode==='cleanup-error')throw Error('listener cleanup sentinel');}
    return vm.runInContext(code,renderer);},sendInputEvent:input=>{
     sent.push(input);const mask=input.modifiers?.includes('rightButtonDown')?2:input.modifiers?.includes('leftButtonDown')?1:0;
     if(input.type==='mouseDown'){assert.equal(mask,input.button==='right'?2:1);if(mode==='no-down')return;captured=mode!=='no-capture';emit('pointerdown',input,mask);if(captured)emit('gotpointercapture',input,mask);}
-    if(input.type==='mouseMove'){assert.equal(input.button,mode==='left'?'left':'right');if(mode==='lost-move'&&mask)return;emit('pointermove',input,mask);if(mode==='superseded'&&mask)emit('pointermove',{...input,x:input.x+1,y:input.y+1},mask);}
-    if(input.type==='mouseUp'){if(mode==='no-release')return;captured=false;emit('pointerup',input,0);emit('lostpointercapture',input,0);}
+    if(input.type==='mouseMove'){
+     assert.equal(input.button,mode==='left'?'left':'right');
+     if(mask&&['release-deferred','coalesced-final','move-after-up'].includes(mode)){pending={input,mask};return;}
+     if(mask&&(mode==='lost-move'||mode==='missing-final'&&frames===10))return;
+     emit('pointermove',input,mode==='wrong-move-mask'&&mask?1:mask);
+     if(mode==='superseded'&&mask)emit('pointermove',{...input,x:input.x+1,y:input.y+1},mask);
+     if(mode==='cancelled'&&mask)emit('pointercancel',input,mask);
+     if(mode==='journal-dropped'&&mask)for(let i=0;i<90;i++)emit('pointermove',input,mask);
+    }
+    if(input.type==='mouseUp'){
+     if(mode==='no-release')return;
+     if(pending&&mode!=='move-after-up'){
+      if(mode==='coalesced-final'){const p=pending.input,sample={clientX:p.x,clientY:p.y,button:-1,buttons:pending.mask,pointerId:1,isTrusted:true,timeStamp:++stamp};emit('pointermove',{...p,x:p.x+1},pending.mask,[sample]);}
+      else emit('pointermove',pending.input,pending.mask);
+     }
+     captured=false;emit('pointerup',input,0);if(pending&&mode==='move-after-up')emit('pointermove',pending.input,pending.mask);emit('lostpointercapture',input,0);
+    }
    }}};
   const main=vm.createContext({require,process,Buffer,setTimeout,clearTimeout,module:{exports:{}}});vm.runInContext(source+'\nglobalThis.drag=dragCamera;',main);
   if(healthy){
-   const result=await main.drag(win,mode==='left'?'left':'right');assert.equal(result.status,'checked');assert.equal(sent.filter(e=>e.type==='mouseDown').length,1);assert.equal(sent.filter(e=>e.type==='mouseMove'&&e.modifiers?.length).length,10);assert.equal(sent.at(-1).type,'mouseUp');assert.equal(result.observations.at(-1).phase,'pointerup acknowledged');
-   if(mode==='superseded')assert.notEqual(result.observations[2].pointer.x,sent[2].x,'Ledger must admit an observed requested move even after the last scalar changes');
-  }else{await assert.rejects(main.drag(win,'right'),error=>{assert.equal(error.pointer_trace.status,'failed');assert.ok(error.pointer_trace.observations.length||mode==='covered');if(mode==='late-down')assert.match(error.message,/deadline|timed out/);return true;});}
+   const result=await main.drag(win,mode==='left'?'left':'right');assert.equal(result.status,'checked');assert.equal(result.intermediate_ack_required,false);assert.equal(result.moves_sent,10);assert.equal(result.frames.length,10);assert.ok(result.elapsed_ms<=result.budget_ms);assert.equal(sent.filter(e=>e.type==='mouseDown').length,1);assert.equal(sent.filter(e=>e.type==='mouseMove'&&e.modifiers?.length).length,10);assert.equal(sent.at(-1).type,'mouseUp');assert.equal(result.observations.at(-1).phase,'whole gesture endpoint and release acknowledged');
+   if(mode==='superseded')assert.notEqual(result.observations.at(-1).pointer.x,sent.at(-1).x,'Last scalar need not equal the actual observed endpoint event');
+   if(mode==='release-deferred')assert.equal(result.observations.at(-1).events.filter(e=>e.type==='pointermove'&&e.buttons).length,1,'Intermediate moves may be coalesced, never claimed individually ACKed');
+   if(mode==='coalesced-final')assert.ok(result.observations.at(-1).events.some(e=>e.coalesced&&e.x===sent.at(-1).x));
+  }else{await assert.rejects(main.drag(win,'right'),error=>{assert.equal(error.pointer_trace.status,'failed');assert.ok(error.pointer_trace.observations.length||mode==='covered');if(['late-down','gesture-deadline'].includes(mode))assert.match(error.message,/deadline|timed out/);return true;});}
   assert.equal(cleaned,true);if(mode!=='cleanup-error'){assert.equal(canvasListeners.size,0);assert.equal(docListeners.size,0);}
  }
 });

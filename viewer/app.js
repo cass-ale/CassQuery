@@ -968,6 +968,7 @@ function resize() {
 }
 function tick(now) {
   requestAnimationFrame(tick);
+  const cameraAnimating = camAnim !== null;
   if (camAnim) {
     const k = Math.min(1, (now - camAnim.start) / camAnim.dur);
     const e = 1 - Math.pow(1 - k, 3);
@@ -980,7 +981,8 @@ function tick(now) {
   } else if (explodeAmt !== explodeTarget) {
     applyExplode(explodeTarget, true);
   }
-  controls.update();
+  // Input handlers update immediately; idle spherical roundtrips needlessly perturb the camera.
+  if (controls.enableDamping || controls.autoRotate || cameraAnimating) controls.update();
   renderer.render(scene, camera);
 }
 

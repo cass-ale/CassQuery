@@ -42,11 +42,9 @@ def run_preflight(root, output, timeout=90, stage_timeout=None):
         # shared budget as the application grows; this is not a syntax-timeout test.
         command = [sys.executable, '-c',
                    f'import sys;sys.path.insert(0,{str(root / "tools")!r});import preflight;'
-                   f'original=preflight.subprocess.run;'
-                   f'preflight.subprocess.run=lambda args,**kwargs: '
-                   f'original(args,**dict(kwargs,timeout={stage_timeout} if '
-                   f'any(str(arg).endswith("python_test_stage.py") for arg in args) '
-                   f'else kwargs.get("timeout")));preflight.main()']
+                   f'original=preflight.run_python_stage;'
+                   f'preflight.run_python_stage=lambda args,root,stream,timeout: '
+                   f'original(args,root,stream,{stage_timeout});preflight.main()']
     return subprocess.run([*command, '--root', str(root), '--output', str(output)], cwd=root, env=env,
                           capture_output=True, text=True, timeout=timeout, check=False)
 

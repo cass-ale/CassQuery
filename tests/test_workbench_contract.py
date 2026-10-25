@@ -761,7 +761,15 @@ async function model(mode){
    if(mode==='target-drift'||(mode==='target-settles'&&frames<=8))targetX+=Number.EPSILON*8;
    callback();}};
  const promise=vm.runInNewContext(scripts.settled,context);
- if(['preview','changing','building','camera-drift','target-drift'].includes(mode)){await assert.rejects(promise,/did not settle/);return;}
+ if(['preview','changing','building','camera-drift','target-drift'].includes(mode)){
+  await assert.rejects(promise,error=>{assert.match(error.message,/did not settle/);const marker='; last_readiness=';
+   assert.ok(error.message.includes(marker));const recent=JSON.parse(error.message.split(marker)[1]);assert.equal(recent.length,2);
+   assert.ok(recent[0].observed_at<recent[1].observed_at&&recent[1].observed_at<=10000);
+   assert.ok(recent.every(snapshot=>snapshot.stable<2&&snapshot.rendering.camera.length===3&&snapshot.rendering.target.length===3));
+   if(['camera-drift','target-drift'].includes(mode)){assert.ok(recent.every(snapshot=>snapshot.aligned&&snapshot.key_changed));
+    assert.notDeepEqual(recent[0].rendering[mode==='camera-drift'?'camera':'target'],recent[1].rendering[mode==='camera-drift'?'camera':'target']);}
+   return true;});return;
+ }
  const value=await promise;assert.equal(value.rendering.model_tier,'certified');assert.ok(frames>=6);
  if(mode==='transition')assert.ok(frames>=10,'Preview ticks cannot count toward certified readiness');
  if(['camera-settles','target-settles'].includes(mode))assert.ok(frames>=12,'Moving control coordinates cannot count toward fixed-point readiness');

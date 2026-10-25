@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -47,7 +48,74 @@ def python_counts(text, counts):
     files = counts.get('files')
     require(isinstance(files, list) and files and all(isinstance(name, str) and name.startswith('tests/') and name.endswith('.py')
             and '..' not in Path(name).parts for name in files) and files == sorted(set(files)), 'invalid Python source collection')
+    if 'expected_ids' in counts or 'test_ids' in counts:
+        expected, executed = counts.get('expected_ids'), counts.get('test_ids')
+        require(isinstance(expected, list) and expected and all(isinstance(item, str) and item for item in expected)
+                and expected == sorted(set(expected)) and executed == expected and len(expected) == counts['collected'],
+                'parallel Python IDs are missing, duplicated or differ from parent discovery')
+        require(counts.get('source_fingerprint') == counts.get('after_fingerprint')
+                and isinstance(counts.get('source_fingerprint'), str) and re.fullmatch(r'[a-f0-9]{64}', counts['source_fingerprint']),
+                'parallel Python source changed')
     return {key: counts[key] for key in ('tests', 'failures', 'skipped')}
+
+
+def run_python_stage(command, root, stream, timeout):
+    """Own one group for the parent and its two workers, with cleanup inside900s."""
+    deadline = time.monotonic() + timeout
+    cleanup = min(10.0, timeout * .2)
+    process, group = None, None
+    def cancelled(_signal, _frame):
+        raise KeyboardInterrupt('Python stage cancelled')
+    def group_exists(pid):
+        try:
+            os.killpg(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # Never assume a denied group check proves cleanup.
+    previous = signal.signal(signal.SIGTERM, cancelled)
+    try:
+        process = subprocess.Popen(command, cwd=root, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        require(os.getpgid(process.pid) == process.pid and os.getsid(process.pid) == process.pid,
+                'Python stage did not create its owned session/process group')
+        group = process.pid
+        try:
+            code = process.wait(timeout=max(.01, deadline - time.monotonic() - cleanup))
+        except subprocess.TimeoutExpired:
+            raise subprocess.TimeoutExpired(command, timeout)
+        return subprocess.CompletedProcess(command, code)
+    finally:
+        try:
+            if process is not None and group is None:
+                if process.poll() is None:
+                    process.terminate()
+                process.wait(timeout=max(.01, deadline - time.monotonic()))
+            if group is not None:
+                # This PGID/session was bound to the launched leader. Descendants
+                # keep it alive after leader exit; never signal the caller group.
+                if process.poll() is None:
+                    require(os.getpgid(process.pid) == group and os.getsid(process.pid) == group,
+                            'Python stage process group ownership changed')
+                try:
+                    os.killpg(group, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                grace = min(deadline, time.monotonic() + cleanup / 2)
+                while group_exists(group) and time.monotonic() < grace:
+                    process.poll()
+                    time.sleep(.02)
+                if group_exists(group):
+                    try:
+                        os.killpg(group, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                process.wait(timeout=max(.01, deadline - time.monotonic()))
+                while group_exists(group) and time.monotonic() < deadline:
+                    time.sleep(.02)
+                require(not group_exists(group), 'owned Python process group cleanup is incomplete or denied')
+        finally:
+            signal.signal(signal.SIGTERM, previous)
 
 
 def positive_time(value):
@@ -120,7 +188,8 @@ def main():
         report['stages'].append(stage)
         try:
             with log.open('w') as stream:
-                result = subprocess.run(command, cwd=root, stdout=stream, stderr=subprocess.STDOUT, timeout=STAGE_TIMEOUT)
+                result = (run_python_stage(command, root, stream, STAGE_TIMEOUT) if name == 'python' else
+                          subprocess.run(command, cwd=root, stdout=stream, stderr=subprocess.STDOUT, timeout=STAGE_TIMEOUT))
             stage['exit'] = result.returncode
         except BaseException as error:
             stage['error'] = f'{type(error).__name__}: {error}'

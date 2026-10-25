@@ -138,3 +138,74 @@ test('real public geometry/ray: returning long drags do not select; stationary c
     assert.ok(vm.runInContext('selected', h.context), 'stationary real-ray click was rejected');
   }
 });
+
+function installTick(context) {
+  vm.runInContext(app.slice(app.indexOf('function tick(now)'), app.indexOf('window.__cq =', app.indexOf('function tick(now)'))), context);
+}
+
+test('reduced-motion idle frames render without rewriting the exact camera pose', async () => {
+  const { THREE, OrbitControls } = await actual;
+  const poses = [[-7.149455742910504, -0.6068735383450985, 91.03718069382012],
+    [0.8086641319096088, 88.87776141054928, -96.97451088577509],
+    [-28.390839882194996, -15.541316056624055, -61.89555758610368]];
+  for (const pose of poses) {
+    const h = contextFor(THREE, OrbitControls, payload.bounds, true);
+    h.camera.position.fromArray(pose); h.controls.target.set(0, 0, 16); h.controls.update();
+    const before = [h.camera.position.toArray(), h.camera.quaternion.toArray(), h.controls.target.toArray()];
+    let updates = 0, renders = 0;
+    const update = h.controls.update.bind(h.controls);
+    h.controls.update = (...args) => { updates++; return update(...args); };
+    h.context.renderer.render = () => { renders++; };
+    installTick(h.context);
+    for (let frame = 0; frame < 600; frame++) vm.runInContext(`tick(${frame * 1000 / 60})`, h.context);
+    assert.equal(updates, 0, 'Idle reduced-motion frames do not need OrbitControls updates');
+    assert.equal(renders, 600, 'Skipping idle controls must not skip rendering');
+    assert.deepEqual([h.camera.position.toArray(), h.camera.quaternion.toArray(), h.controls.target.toArray()], before);
+  }
+});
+
+test('camera animation updates orientation through its final frame even without damping', async () => {
+  const { THREE, OrbitControls } = await actual;
+  const h = contextFor(THREE, OrbitControls, payload.bounds, true);
+  h.context.camAnim = { p0: h.camera.position.clone(), t0: h.controls.target.clone(),
+    p1: new THREE.Vector3(30, -40, 50), t1: new THREE.Vector3(5, 6, 7), start: 0, dur: 100 };
+  installTick(h.context); vm.runInContext('tick(50); tick(100)', h.context);
+  assert.equal(h.context.camAnim, null);
+  assert.ok(h.camera.position.distanceTo(new THREE.Vector3(30, -40, 50)) < 1e-9);
+  assert.ok(h.controls.target.distanceTo(new THREE.Vector3(5, 6, 7)) < 1e-9);
+  const direction = h.camera.getWorldDirection(new THREE.Vector3());
+  assert.ok(direction.dot(h.controls.target.clone().sub(h.camera.position).normalize()) > 0.999999999);
+  const before = [h.camera.position.toArray(), h.camera.quaternion.toArray()];
+  vm.runInContext('tick(101); tick(102)', h.context);
+  assert.deepEqual([h.camera.position.toArray(), h.camera.quaternion.toArray()], before);
+});
+
+test('actual reduced-motion orbit, pan, wheel and key handlers update without an idle tick', async () => {
+  const { THREE, OrbitControls } = await actual;
+  for (const action of ['orbit', 'pan', 'wheel', 'key']) {
+    const h = contextFor(THREE, OrbitControls, payload.bounds, true);
+    const position = h.camera.position.clone(), target = h.controls.target.clone();
+    if (action === 'orbit' || action === 'pan') {
+      h.controls._onMouseDown({ button: action === 'pan' ? 2 : 0, clientX: 400, clientY: 300 });
+      h.controls._onMouseMove({ clientX: 480, clientY: 320 });
+    } else if (action === 'wheel') h.controls._handleMouseWheel({ deltaY: -100, clientX: 400, clientY: 300 });
+    else h.controls._handleKeyDown({ code: 'ArrowUp', preventDefault() {} });
+    assert.ok(h.camera.position.distanceTo(position) > 1e-3 || h.controls.target.distanceTo(target) > 1e-3, action);
+    const before = [h.camera.position.toArray(), h.camera.quaternion.toArray(), h.controls.target.toArray()];
+    installTick(h.context); vm.runInContext('tick(1); tick(2)', h.context);
+    assert.deepEqual([h.camera.position.toArray(), h.camera.quaternion.toArray(), h.controls.target.toArray()], before, action);
+  }
+});
+
+test('damping and auto-rotation still advance through the actual viewer tick', async () => {
+  const { THREE, OrbitControls } = await actual;
+  for (const mode of ['damping', 'autoRotate']) {
+    const h = contextFor(THREE, OrbitControls, payload.bounds, mode === 'autoRotate');
+    if (mode === 'damping') {
+      h.controls._onMouseDown({ button: 0, clientX: 400, clientY: 300 });
+      h.controls._onMouseMove({ clientX: 480, clientY: 320 });
+    } else h.controls.autoRotate = true;
+    const before = h.camera.position.clone(); installTick(h.context); vm.runInContext('tick(1); tick(2)', h.context);
+    assert.ok(h.camera.position.distanceTo(before) > 1e-3, mode);
+  }
+});

@@ -30,7 +30,8 @@ class ReadinessTests(unittest.TestCase):
             raise AssertionError(result.stderr + result.stdout)
         cls.report = release_evidence.read_json(cls.output)
         cls.snapshot = release_evidence.source_snapshot(cls.root)
-        cls.logs = {file.name: file.read_bytes() for file in cls.output.parent.iterdir() if file.name != 'preflight.json'}
+        cls.logs = {file.name: file.read_bytes() for file in cls.output.parent.iterdir()
+                    if file.is_file() and file.name != 'preflight.json'}
 
     @classmethod
     def tearDownClass(cls):

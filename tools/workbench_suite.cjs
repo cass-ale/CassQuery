@@ -193,7 +193,7 @@ function captureScripts(drawEligibility = measureFrame) {
   })()`;
   const settled = `(async () => {
     await Promise.all(Array.from(document.images).filter(e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';}).map(e=>e.decode()));
-    let previous='',stable=0;
+    let previous='',stable=0;const recent=[];
     const end=performance.now()+10000;
     while(performance.now()<end){
       await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
@@ -204,10 +204,12 @@ function captureScripts(drawEligibility = measureFrame) {
         [r.camera,r.target].every(vector=>Array.isArray(vector)&&vector.length===3&&vector.every(Number.isFinite))&&
         r.vertices>0&&r.meshes>0&&r.clipped===0&&r.nonfinite===0&&!r.context_lost&&r.buffer[0]===r.drawing_buffer[0]&&r.buffer[1]===r.drawing_buffer[1]&&
         Math.abs(r.camera_aspect-r.canvas_rect.width/r.canvas_rect.height)<1e-6&&r.stage_size[0]===Math.round(r.canvas_rect.width)&&r.stage_size[1]===Math.round(r.canvas_rect.height);
+      const key_changed=key!==previous;
       stable=aligned&&key===previous?stable+1:0;previous=key;
+      recent.push({observed_at:performance.now(),aligned,stable,key_changed,...value});if(recent.length>2)recent.shift();
       if(stable>=2)return value;
     }
-    throw new Error('Actual workbench layout/geometry did not settle before capture');
+    throw new Error('Actual workbench layout/geometry did not settle before capture; last_readiness='+JSON.stringify(recent));
   })()`;
   return { sample, settled };
 }

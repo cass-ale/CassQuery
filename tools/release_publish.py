@@ -96,8 +96,9 @@ class GitHub:
         self.token = token
         self.opener = opener or urllib.request.build_opener(NoRedirect())
 
-    def _open(self, url, *, method="GET", data=None, binary=False, authenticated=True, size=None):
-        headers = {"Accept": "application/octet-stream" if binary else "application/vnd.github+json",
+    def _open(self, url, *, method="GET", data=None, binary=False, authenticated=True, size=None,
+              accept="application/vnd.github+json"):
+        headers = {"Accept": accept,
                    "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "CassQuery-release-verifier"}
         if authenticated:
             require(urllib.parse.urlsplit(url).hostname in ("api.github.com", "uploads.github.com"),
@@ -156,8 +157,13 @@ class GitHub:
         raise ReleaseError("API inventory exceeds pagination limit")
 
     def download(self, path, output, *, limit=MAX_ARCHIVE):
-        require(path.startswith(PREFIX + "/"), "invalid download path")
-        response = self._open("https://api.github.com" + path, binary=True)
+        artifact = re.fullmatch(re.escape(PREFIX) + r'/actions/artifacts/[1-9][0-9]*/zip', path)
+        asset = re.fullmatch(re.escape(PREFIX) + r'/releases/assets/[1-9][0-9]*', path)
+        require(artifact or asset, "invalid download path")
+        # Artifact archive endpoints use the REST media type and redirect;
+        # release asset endpoints require octet-stream to request their bytes.
+        accept = "application/octet-stream" if asset else "application/vnd.github+json"
+        response = self._open("https://api.github.com" + path, binary=True, accept=accept)
         try:
             if response.status == 302:
                 location = response.headers.get("Location", "")
@@ -169,7 +175,7 @@ class GitHub:
                         "untrusted GitHub download redirect")
                 response.close()
                 # Signed storage URLs never receive the GitHub bearer token.
-                response = self._open(location, binary=True, authenticated=False)
+                response = self._open(location, binary=True, authenticated=False, accept="application/octet-stream")
             require(response.status == 200, f"GitHub download failed (HTTP {response.status})")
             declared = response.headers.get("Content-Length")
             if declared is not None:

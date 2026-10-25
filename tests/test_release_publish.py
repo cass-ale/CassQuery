@@ -851,6 +851,29 @@ class Opener:
 
 
 class NetworkTests(unittest.TestCase):
+    def test_endpoint_specific_accept_types_and_upload_json_response(self):
+        for path, media in ((m.PREFIX + '/actions/artifacts/5/zip', 'application/vnd.github+json'),
+                            (m.PREFIX + '/releases/assets/5', 'application/octet-stream')):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as directory:
+                opener = Opener([Response(302, headers={'Location': 'https://release-assets.githubusercontent.com/file'}),
+                                 Response(200, b'bytes', {'Content-Length': '5'})])
+                m.GitHub('secret', opener).download(path, Path(directory) / 'file', limit=5)
+                self.assertEqual(opener.requests[0].get_header('Accept'), media)
+                self.assertEqual(opener.requests[1].get_header('Accept'), 'application/octet-stream')
+                self.assertIsNone(opener.requests[1].get_header('Authorization'))
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / 'asset'; file.write_bytes(b'bytes')
+            opener = Opener([Response(201, b'{"id":5}')])
+            m.GitHub('secret', opener).upload(5, 'asset.zip', file)
+            self.assertEqual(opener.requests[0].get_header('Accept'), 'application/vnd.github+json')
+            self.assertEqual(opener.requests[0].get_header('Content-type'), 'application/octet-stream')
+        for path in (m.PREFIX + '/actions/artifacts/5/zip?extra=1', m.PREFIX + '/releases/latest'):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as directory:
+                opener = Opener([])
+                with self.assertRaisesRegex(ValueError, 'invalid download path'):
+                    m.GitHub('secret', opener).download(path, Path(directory) / 'file')
+                self.assertFalse(opener.requests)
+
     def test_only_get_explicit_404_is_missing_never_other_errors(self):
         for status in (401, 403, 429, 500, 302):
             with self.subTest(status=status):

@@ -60,6 +60,21 @@ function validateRendering(record, pixels) {
   assert.deepEqual(record.canvas_pixels, pixels, 'Recorded canvas pixels contradict captured PNG');
 }
 
+function validateCaptureIdentity(before, after, expected = null) {
+  for (const rendering of [before.rendering, after.rendering]) {
+    assert.equal(rendering.model_tier, 'certified', 'Capture must show certified geometry, never a stable preview');
+    assert.ok(typeof rendering.model_project === 'string' && rendering.model_project.length > 0);
+    assert.match(rendering.model_hash, /^[a-f0-9]{16}$/);
+    assert.ok(Number.isInteger(rendering.model_gen) && rendering.model_gen >= 0 && Number.isFinite(rendering.model_built_at) && rendering.model_built_at > 0);
+  }
+  for (const key of ['model_tier','model_project','model_hash','model_gen','model_built_at'])
+    assert.equal(after.rendering[key], before.rendering[key], 'Certified model changed during capture: ' + key);
+  if (expected) {
+    assert.equal(before.rendering.model_project, expected.project);
+    assert.equal(before.rendering.model_hash, expected.hash);
+    assert.equal(before.rendering.model_built_at, expected.built_at);
+  }
+}
 function captureScripts(drawEligibility = measureFrame) {
   const sample = `(() => {
     const measured=(${drawEligibility.toString()})();
@@ -67,7 +82,8 @@ function captureScripts(drawEligibility = measureFrame) {
     const stage=document.getElementById('stage');
     return {viewport:[innerWidth,innerHeight],full_size:[innerWidth,Math.max(innerHeight,document.documentElement.scrollHeight)],dpr:devicePixelRatio,
       horizontal_overflow:document.documentElement.scrollWidth>innerWidth,
-      rendering:{model_tier:cq.model?.tier,model_hash:cq.model?.hash,vertices:measured.vertices,meshes:measured.meshes,clipped:measured.clipped,nonfinite:measured.nonfinite,
+      rendering:{model_tier:cq.model?.tier,model_hash:cq.model?.hash,model_project:cq.model?.index.project,model_gen:cq.model?.index.gen,model_built_at:cq.model?.index.built_at,
+        worker_state:cq.status?.state,rebuilding:!!cq.rebuilding,vertices:measured.vertices,meshes:measured.meshes,clipped:measured.clipped,nonfinite:measured.nonfinite,
         canvas_rect:{x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height},stage_size:[stage.clientWidth,stage.clientHeight],buffer:[c.width,c.height],
         drawing_buffer:gl?[gl.drawingBufferWidth,gl.drawingBufferHeight]:[0,0],context_lost:!gl||gl.isContextLost(),pixel_ratio:Math.min(devicePixelRatio,2),
         camera_aspect:cq.camera.aspect,camera:cq.camera.position.toArray(),target:cq.controls.target.toArray()}}
@@ -79,8 +95,10 @@ function captureScripts(drawEligibility = measureFrame) {
     while(performance.now()<end){
       await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
       const value=${sample}; const r=value.rendering;
-      const key=JSON.stringify([value.full_size,r.canvas_rect,r.buffer,r.camera_aspect,r.model_hash]);
-      const aligned=r.vertices>0&&r.meshes>0&&r.clipped===0&&r.nonfinite===0&&!r.context_lost&&r.buffer[0]===r.drawing_buffer[0]&&r.buffer[1]===r.drawing_buffer[1]&&
+      const key=JSON.stringify([value.full_size,r.canvas_rect,r.buffer,r.camera_aspect,r.model_tier,r.model_project,r.model_hash,r.model_gen,r.model_built_at]);
+      const aligned=r.model_tier==='certified'&&typeof r.model_project==='string'&&r.model_project.length>0&&/^[a-f0-9]{16}$/.test(r.model_hash)&&
+        Number.isInteger(r.model_gen)&&r.model_gen>=0&&Number.isFinite(r.model_built_at)&&r.model_built_at>0&&!r.rebuilding&&!r.worker_state?.startsWith('building')&&
+        r.vertices>0&&r.meshes>0&&r.clipped===0&&r.nonfinite===0&&!r.context_lost&&r.buffer[0]===r.drawing_buffer[0]&&r.buffer[1]===r.drawing_buffer[1]&&
         Math.abs(r.camera_aspect-r.canvas_rect.width/r.canvas_rect.height)<1e-6&&r.stage_size[0]===Math.round(r.canvas_rect.width)&&r.stage_size[1]===Math.round(r.canvas_rect.height);
       stable=aligned&&key===previous?stable+1:0;previous=key;
       if(stable>=2)return value;
@@ -383,10 +401,11 @@ async function run() {
     const start = wireTrace.length; await editor().press('Control+s');
     return until('actual save HTTP response', () => wireTrace.slice(start).find((r) => r.action === 'save' && r.status));
   }
-  async function capture(description, name = description) {
+  async function capture(description, name = description, expected = null) {
     const file = name + '.png';
     const { sample, settled } = captureScripts();
     const layout = await page.evaluate(settled);
+    validateCaptureIdentity(layout, layout, expected);
     assert.deepEqual(layout.viewport, report.viewport); assert.equal(layout.horizontal_overflow, false);
     const cdp = await page.context().newCDPSession(page);
     let bytes;
@@ -398,7 +417,7 @@ async function run() {
     const after = await page.evaluate(sample);
     assert.deepEqual(after.rendering.canvas_rect, layout.rendering.canvas_rect, 'Canvas moved during capture');
     assert.deepEqual(after.rendering.buffer, layout.rendering.buffer, 'Canvas resized during capture');
-    assert.equal(after.rendering.model_hash, layout.rendering.model_hash, 'Certified model changed during capture');
+    validateCaptureIdentity(layout, after, expected);
     const dimensions = pngDimensions(bytes); assert.equal(dimensions.width, layout.full_size[0]); assert.equal(dimensions.height, layout.full_size[1]);
     const record = { path: file, description, bytes: bytes.length, sha256: digest(bytes), ...dimensions, ...layout,
       canvas_pixels: canvasPixels(bytes, layout.rendering.canvas_rect) };
@@ -530,7 +549,12 @@ async function run() {
       retain(entry, 'external-source.py'); const failedSave = await save();
       await until('conflict visible', () => page.locator('#conflict-banner').isVisible());
       check('external-conflict', { status: failedSave.status, draft_before: digest(Buffer.from(draft)), draft_after: digest(Buffer.from(await editor().inputValue())),
-        external_source: digest(Buffer.from(external)), disk_after: digest(fs.readFileSync(entry)), conflict_visible: true }); await capture('external-conflict');
+        external_source: digest(Buffer.from(external)), disk_after: digest(fs.readFileSync(entry)), conflict_visible: true });
+      const conflictCertificate = await certified('WORKBENCHPLATE'); await shown('WORKBENCHPLATE', conflictCertificate.certified_hash);
+      assert.equal(await editor().inputValue(), draft, 'Waiting for external certification must not alter the conflict draft');
+      assert.equal(digest(fs.readFileSync(entry)), digest(Buffer.from(external)));
+      assert.equal(await page.locator('#conflict-banner').isVisible(), true);
+      await capture('external-conflict', 'external-conflict', { project:'WORKBENCHPLATE',hash:conflictCertificate.certified_hash,built_at:conflictCertificate.built_at });
       await page.locator('#conflict-reload').click();
       await page.locator('#draft-guard').waitFor({ state: 'visible' }); await page.locator('#draft-guard button[value="discard"]').click();
       await until('reload external bytes', async () => await editor().inputValue() === external);
@@ -673,7 +697,7 @@ async function run() {
   }
   console.log(JSON.stringify({ pass: report.pass, report: reportFile, error: report.error })); if (!report.pass) process.exitCode = 1; return report;
 }
-module.exports = { THEMES, REQUIRED_CHECKS, captureScripts, canvasPixels, validateRendering, validateEvidence, validateReport, verifyStepEvidence, request, recordWorkbenchTraffic, sourceSnapshot, measureStep, run };
+module.exports = { THEMES, REQUIRED_CHECKS, validateCaptureIdentity, captureScripts, canvasPixels, validateRendering, validateEvidence, validateReport, verifyStepEvidence, request, recordWorkbenchTraffic, sourceSnapshot, measureStep, run };
 if (require.main === module) {
   const args = process.argv.slice(2);
   if (args.length === 2 && args[0] === '--validate-report') {

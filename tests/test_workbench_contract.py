@@ -484,6 +484,37 @@ class WorkbenchContractTests(unittest.TestCase):
         result = subprocess.run([self.node, str(SUITE), '--skip-native'], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 2)
 
+    def test_capture_waits_for_certified_identity_not_stable_preview(self):
+        # Explicit scheduler/layout MODELS exercising the real serialized readiness code.
+        code = r"""
+const assert=require('node:assert/strict'),vm=require('node:vm'),s=require(process.argv[1]);
+const scripts=s.captureScripts(function measured(){return {vertices:30,meshes:1,clipped:0,nonfinite:0};});
+async function model(mode){
+ let clock=0,frames=0;const cq={model:{tier:'certified',hash:'a'.repeat(16),index:{project:'WORKBENCHPLATE',gen:2,built_at:5}},
+  status:{state:mode==='error'?'error':'certified'},rebuilding:false,camera:{aspect:1,position:{toArray:()=>[1,2,3]}},controls:{target:{toArray:()=>[0,0,0]}}};
+ const canvas={width:100,height:100,getBoundingClientRect:()=>({left:0,top:0,width:100,height:100}),getContext:()=>({drawingBufferWidth:100,drawingBufferHeight:100,isContextLost:()=>false})};
+ const context={window:{__cq:cq},document:{images:[],documentElement:{scrollHeight:100,scrollWidth:100},querySelector:()=>canvas,getElementById:()=>({clientWidth:100,clientHeight:100})},
+  innerWidth:100,innerHeight:100,devicePixelRatio:1,scrollX:0,scrollY:0,performance:{now:()=>clock},
+  requestAnimationFrame(callback){clock+=100;frames++;if(mode==='preview'||(mode==='transition'&&frames<=4))cq.model.tier='preview';else cq.model.tier='certified';
+   if(mode==='changing')cq.model.hash=(frames%4<2?'a':'b').repeat(16);if(mode==='building')cq.status.state='building-certified';callback();}};
+ const promise=vm.runInNewContext(scripts.settled,context);
+ if(['preview','changing','building'].includes(mode)){await assert.rejects(promise,/did not settle/);return;}
+ const value=await promise;assert.equal(value.rendering.model_tier,'certified');assert.ok(frames>=6);
+ if(mode==='transition')assert.ok(frames>=10,'Preview ticks cannot count toward certified readiness');
+ return JSON.parse(JSON.stringify(value));
+}
+(async()=>{
+ for(const mode of ['preview','transition','changing','error','building'])await model(mode);
+ const before=await model('healthy');s.validateCaptureIdentity(before,before,{project:'WORKBENCHPLATE',hash:'a'.repeat(16),built_at:5});
+ for(const [key,value]of[['model_tier','preview'],['model_project','FOREIGN'],['model_hash','b'.repeat(16)],['model_gen',3],['model_built_at',6]]){
+  const after=structuredClone(before);after.rendering[key]=value;assert.throws(()=>s.validateCaptureIdentity(before,after));
+ }
+ assert.throws(()=>s.validateCaptureIdentity(before,before,{project:'WORKBENCHPLATE',hash:'b'.repeat(16),built_at:5}));
+})().catch(error=>{console.error(error);process.exitCode=1;});
+"""
+        result = subprocess.run([self.node, '-e', code, str(SUITE)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_actual_native_text_helper_requires_input_acknowledgements(self):
         # MODELS ONLY: execute the actual helper body, not a copied implementation or native proof.
         code = r"""
@@ -498,13 +529,13 @@ async function model(mode){
  const document={activeElement:{id:'old-focus'},querySelector:()=>input,addEventListener(type,fn){events.set(type,fn);},removeEventListener(type){events.delete(type);}};
  const window={__workbench:{active:doc}},context=vm.createContext({window,document,JSON});
  const emit=(type,more={})=>events.get(type)?.({type,target:input,isTrusted:true,...more});
- const win={focus(){calls.push('focus');},webContents:{async insertText(value){calls.push('IME');if(mode==='noop')return;
+ const win={focus(){calls.push('focus');},webContents:{selectAll(){calls.push('select-all');if(mode!=='partial-selection'){input.selectionStart=numeric?null:0;input.selectionEnd=numeric?null:input.value.length;}emit('select');},async insertText(value){calls.push('IME');if(mode==='noop')return;
   if(mode!=='no-events')emit('beforeinput',{data:value,inputType:'insertText'});input.value=value;input.selectionStart=numeric?null:value.length;input.selectionEnd=numeric?null:value.length;
   if(mode!=='no-document'){doc.text=value;doc.revision++;doc.dirty=true;}if(mode!=='no-events')emit('input',{data:value,inputType:'insertText'});
  }}};
  const globals={assert,Buffer,fs,path,report,directory,win,hash:bytes=>crypto.createHash('sha256').update(bytes).digest('hex'),
   js:async code=>vm.runInContext(code,context),click:async()=>{calls.push('click');if(mode!=='wrong-focus')document.activeElement=input;},
-  shortcut:()=>{calls.push('select-all');if(mode!=='partial-selection'){input.selectionStart=numeric?null:0;input.selectionEnd=numeric?null:input.value.length;}emit('keyup',{key:'a'});},
+  shortcut:()=>{throw Error('Bulk IME setup must not claim a keyboard Select All shortcut');},
   waitFor:async(_win,code)=>{calls.push('ack');if(!vm.runInContext(code,context))throw Error('Model acknowledgement absent');},
   bounded:async work=>work(),image:async()=>{calls.push('failure-capture');},console:{error(){}}};
  vm.runInNewContext(body+'globalThis.actualText=text;',globals);
@@ -513,6 +544,8 @@ async function model(mode){
   if(['wrong-focus','readonly','partial-selection'].includes(mode))assert.ok(!calls.includes('IME'));
   if(['healthy','number'].includes(mode)){assert.equal(input.value,expected);assert.ok(calls.indexOf('IME')>calls.indexOf('select-all'));}
   const raw=JSON.parse(fs.readFileSync(path.join(directory,'text-input-1.json')));assert.equal(raw.pass,['healthy','number'].includes(mode));
+  assert.equal(raw.selection_method,'native webContents.selectAll edit command');
+  assert.equal(raw.method,'native focused IME text insertion with native Edit selection');
   assert.ok(raw.phases.length>0&&raw.phases.every(phase=>Buffer.byteLength(phase.value)<=16384));
   assert.ok(!window.__cqNativeInputAudit&&events.size===0);
  }finally{fs.rmSync(directory,{recursive:true,force:true});}

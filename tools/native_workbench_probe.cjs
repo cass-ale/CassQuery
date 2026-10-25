@@ -296,7 +296,8 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
     assert.ok(Buffer.byteLength(value) <= 16384, 'Probe text exceeds public-fixture input bound');
     report.text_diagnostics ||= [];
     const sequence = report.text_diagnostics.length + 1, name = `text-input-${sequence}.json`;
-    const audit = { schema:1, method:'native focused IME text insertion with keyboard selection', selector,
+    const audit = { schema:1, method:'native focused IME text insertion with native Edit selection',
+      selection_method:'native webContents.selectAll edit command', selector,
       expected_length:value.length, expected_sha256:hash(Buffer.from(value)), phases:[], sent_events:[], pass:false };
     const persist = () => {
       const bytes=Buffer.from(JSON.stringify(audit,null,2)+'\n'); fs.writeFileSync(path.join(directory,name),bytes);
@@ -330,12 +331,13 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
     try {
       const initial=await snapshot('before click');win.focus();await click(win,selector);
       await waitFor(win,`(() => {const e=document.querySelector(${JSON.stringify(selector)});return document.activeElement===e&&!e.readOnly&&!e.disabled;})()`,5000);
-      await snapshot('after focused writable click');shortcut('A');
+      await snapshot('after focused writable click');win.webContents.selectAll();
       await waitFor(win,`(() => {const e=document.querySelector(${JSON.stringify(selector)}),r=window.__cqNativeInputAudit;
         if(document.activeElement!==e||e.readOnly||e.disabled)return false;
         if(e.selectionStart!==null)return e.selectionStart===0&&e.selectionEnd===e.value.length;
-        // Number inputs do not expose DOM selection ranges. Observe the real select-all key acknowledgement and exact replacement below.
-        return e.type==='number'&&r.events.some(event=>event.type==='keyup'&&event.target===e.id&&event.key?.toLowerCase()==='a');})()`,5000);
+        // Number controls do not expose a DOM selection range. Native Edit selection is setup only;
+        // exact replacement and trusted IME events below must prove its effect, not a fabricated key acknowledgement.
+        return e.type==='number';})()`,5000);
       const selected=await snapshot('after observed select-all');audit.selection_range_supported=selected.selection_start!==null;
       await js("window.__cqNativeInputAudit.phase='native IME commit'");
       audit.sent_events.push({type:'native IME insertText',bytes:Buffer.byteLength(value)});

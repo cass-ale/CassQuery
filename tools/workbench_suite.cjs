@@ -12,7 +12,7 @@ const { GATES, pngDimensions, validateReport: validateBaseline } = require('./in
 const { measureFrame } = require('../shell/smoke.cjs');
 const { inflateSync } = require('node:zlib');
 
-function canvasPixels(bytes, rect) {
+function analyzeCanvasRaster(bytes, rect) {
   // Decode only the already CRC/size-validated 8-bit RGB/RGBA PNG, including row filters.
   const size = pngDimensions(bytes), channels = bytes[25] === 2 ? 3 : 4, chunks = [];
   for (let offset = 8; offset < bytes.length;) {
@@ -22,7 +22,7 @@ function canvasPixels(bytes, rect) {
   }
   const stride = size.width * channels, raw = inflateSync(Buffer.concat(chunks), { maxOutputLength: (stride + 1) * size.height });
   let previous = Buffer.alloc(stride), current = Buffer.alloc(stride);
-  const histogram = new Map(); let samples = 0;
+  const histogram = new Map(), raster = createHash('sha256'); let samples = 0;
   const left = Math.max(0, Math.ceil(rect.x + rect.width * .1)), right = Math.min(size.width, Math.floor(rect.x + rect.width * .9));
   const top = Math.max(0, Math.ceil(rect.y + rect.height * .1)), bottom = Math.min(size.height, Math.floor(rect.y + rect.height * .9));
   assert.ok(right > left && bottom > top, 'Canvas pixel region is empty/outside screenshot');
@@ -34,6 +34,14 @@ function canvasPixels(bytes, rect) {
       const prediction = filter === 0 ? 0 : filter === 1 ? a : filter === 2 ? b : filter === 3 ? Math.floor((a + b) / 2) : paeth(a, b, c);
       current[x] = (raw[y * (stride + 1) + x + 1] + prediction) & 255;
     }
+    if (y >= top && y < bottom) {
+      const rgb = Buffer.alloc((right - left) * 3);
+      for (let x = left; x < right; x++) {
+        const index = x * channels, destination = (x - left) * 3;
+        rgb[destination] = current[index]; rgb[destination + 1] = current[index + 1]; rgb[destination + 2] = current[index + 2];
+      }
+      raster.update(rgb);
+    }
     if (y >= top && y < bottom) for (let x = left; x < right; x += 2) {
       const offset = x * channels, color = (current[offset] << 16) | (current[offset + 1] << 8) | current[offset + 2];
       histogram.set(color, (histogram.get(color) || 0) + 1); samples++;
@@ -41,9 +49,15 @@ function canvasPixels(bytes, rect) {
     [previous, current] = [current, previous];
   }
   let dominant = 0; for (const count of histogram.values()) dominant = Math.max(dominant, count);
-  return { samples, distinct_colors: histogram.size, non_background_samples: samples - dominant };
+  return { samples, distinct_colors: histogram.size, non_background_samples: samples - dominant, raster_sha256: raster.digest('hex') };
 }
-function validateRendering(record, pixels) {
+function canvasPixels(bytes, rect) {
+  const { raster_sha256, ...pixels } = analyzeCanvasRaster(bytes, rect); return pixels;
+}
+function renderedPixels(pixels) {
+  return pixels.samples > 0 && pixels.distinct_colors >= 8 && pixels.non_background_samples > pixels.samples * .001;
+}
+function validateRenderGeometry(record) {
   const observation = record.rendering;
   assert.ok(observation && observation.model_tier === 'certified');
   assert.match(observation.model_hash, /^[a-f0-9]{16}$/);
@@ -56,6 +70,9 @@ function validateRendering(record, pixels) {
   assert.ok(Math.abs(observation.camera_aspect - observation.canvas_rect.width / observation.canvas_rect.height) < 1e-6);
   assert.deepEqual(observation.buffer, observation.drawing_buffer, 'Canvas and actual WebGL buffer disagree');
   assert.ok(observation.buffer[0] === Math.floor(observation.canvas_rect.width * observation.pixel_ratio) && observation.buffer[1] === Math.floor(observation.canvas_rect.height * observation.pixel_ratio));
+}
+function validateRendering(record, pixels) {
+  validateRenderGeometry(record);
   assert.ok(pixels.samples > 0 && pixels.distinct_colors >= 8 && pixels.non_background_samples > pixels.samples * .001, 'Captured canvas is blank or has no meaningful rendered geometry');
   assert.deepEqual(record.canvas_pixels, pixels, 'Recorded canvas pixels contradict captured PNG');
 }
@@ -75,6 +92,90 @@ function validateCaptureIdentity(before, after, expected = null) {
     assert.equal(before.rendering.model_built_at, expected.built_at);
   }
 }
+function rasterIdentity(layout) {
+  const r = layout.rendering;
+  return JSON.stringify([layout.viewport,layout.full_size,layout.dpr,layout.horizontal_overflow,
+    r.model_tier,r.model_project,r.model_hash,r.model_gen,r.model_built_at,r.canvas_rect,r.stage_size,r.buffer,r.drawing_buffer,
+    r.pixel_ratio,r.camera_aspect,r.theme,r.theme_choice,r.panel,r.source_fingerprint]);
+}
+function validateRasterIdentity(before, after, message) {
+  assert.equal(rasterIdentity(before),rasterIdentity(after),message);
+  for(const key of ['camera','target']){
+    const a=before.rendering[key],b=after.rendering[key];vector(a);vector(b);
+    for(let index=0;index<3;index++)assert.ok(Math.abs(a[index]-b[index])<=128*Number.EPSILON*Math.max(1,Math.abs(a[index]),Math.abs(b[index])),
+      message+': '+key+' coordinate '+index+' changed beyond machine roundoff');
+  }
+}
+async function captureStableRaster({ observe, take, retain, now = Date.now, readiness_started_at = now(), deadline_at = readiness_started_at + 15000 }, attempts = []) {
+  const deadline = deadline_at;
+  assert.ok(Number.isFinite(readiness_started_at) && Number.isFinite(deadline) && deadline > readiness_started_at && deadline <= readiness_started_at + 15000,
+    'Invalid aggregate physical capture deadline');
+  let baseline, previous = null;
+  const checkTime = () => assert.ok(now() < deadline, 'Physical raster readiness exceeded its 15-second deadline');
+  async function within(work) {
+    checkTime(); let timer;
+    try { return await Promise.race([Promise.resolve().then(work),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Physical raster readiness exceeded its 15-second deadline')),Math.max(1,deadline-now()));})]); }
+    finally { clearTimeout(timer); }
+  }
+  for (let index = 0; index < 8; index++) {
+    checkTime(); const before = await within(()=>observe(deadline - now())); checkTime();
+    validateCaptureIdentity(before,before);
+    validateRenderGeometry({...before,width:before.full_size[0],height:before.full_size[1]});
+    if (!baseline) baseline = before;
+    validateRasterIdentity(before,baseline,'Source/camera/theme/layout identity changed during raster readiness');
+    const attempt = { index, readiness_started_at, deadline_at:deadline, started_at:now(), before, status:'pending' };
+    attempts.push(attempt);
+    try {
+      const bytes = await within(()=>take(before,deadline - now())); attempt.captured_at = now();
+      assert.ok(Buffer.isBuffer(bytes) && bytes.length <= 32 * 1024 ** 2, 'Physical raster exceeds capture byte bound');
+      attempt.observed_bytes = bytes.length; attempt.observed_sha256 = digest(bytes);
+      attempt.image = await within(()=>retain(bytes,index,before,deadline - now())); checkTime();
+      const after = await within(()=>observe(deadline - now())); attempt.after = after; checkTime();
+      validateCaptureIdentity(before,after);
+      validateRenderGeometry({...after,width:after.full_size[0],height:after.full_size[1]});
+      validateRasterIdentity(after,before,'Source/camera/theme/layout identity changed during physical capture');
+      const dimensions = pngDimensions(bytes);
+      assert.deepEqual([dimensions.width,dimensions.height],before.full_size,'Physical raster does not cover the observed full document');
+      const analysis = analyzeCanvasRaster(bytes,before.rendering.canvas_rect);
+      const { raster_sha256, ...pixels } = analysis;
+      attempt.pixels = pixels; attempt.raster_sha256 = raster_sha256;
+      attempt.status = renderedPixels(pixels) ? 'rendered' : 'blank'; attempt.completed_at = now(); checkTime();
+      if (attempt.status === 'rendered') {
+        validateRendering({ ...attempt.image,...before,canvas_pixels:pixels },pixels);
+        if (previous?.status === 'rendered' && previous.raster_sha256 === raster_sha256) return attempt;
+      }
+      previous = attempt;
+    } catch(error) { attempt.status='failed';attempt.error=error.message;attempt.completed_at=now();throw error; }
+  }
+  assert.fail('Physical raster never produced two consecutive stable rendered samples within eight attempts');
+}
+function validateRasterAttempts(attempts, directory) {
+  assert.ok(Array.isArray(attempts) && attempts.length >= 2 && attempts.length <= 8, 'Incomplete/excessive physical raster samples');
+  const baseline=attempts[0].before, start=attempts[0].readiness_started_at;
+  let previous=null; const paths=new Set();
+  for (const [index,attempt] of attempts.entries()) {
+    assert.equal(attempt.index,index);assert.equal(attempt.readiness_started_at,start);
+    assert.ok(attempt.deadline_at>start && attempt.deadline_at<=start+15000 && attempt.deadline_at===attempts[0].deadline_at);
+    assert.ok([start,attempt.started_at,attempt.captured_at,attempt.completed_at].every(Number.isFinite) && start>0 &&
+      attempt.started_at>=start && attempt.captured_at>=attempt.started_at && attempt.completed_at>=attempt.captured_at && attempt.completed_at<attempt.deadline_at);
+    validateCaptureIdentity(attempt.before,attempt.after);
+    validateRasterIdentity(attempt.before,baseline,'Raster readiness source identity changed');
+    validateRasterIdentity(attempt.after,baseline,'Raster readiness post-capture identity changed');
+    for (const layout of [attempt.before,attempt.after]) validateRenderGeometry({...layout,width:layout.full_size[0],height:layout.full_size[1]});
+    const image=attempt.image;requireHash(image.sha256);assert.ok(!paths.has(image.path),'Duplicate raster sample path');paths.add(image.path);
+    const bytes=fs.readFileSync(relativeEvidence(directory,image.path));assert.equal(bytes.length,image.bytes);assert.equal(digest(bytes),image.sha256);
+    assert.equal(attempt.observed_bytes,image.bytes);assert.equal(attempt.observed_sha256,image.sha256);
+    const size=pngDimensions(bytes);assert.deepEqual([size.width,size.height],attempt.before.full_size);
+    const {raster_sha256,...pixels}=analyzeCanvasRaster(bytes,attempt.before.rendering.canvas_rect);
+    assert.equal(attempt.raster_sha256,raster_sha256);assert.deepEqual(attempt.pixels,pixels);
+    assert.equal(attempt.status,renderedPixels(pixels)?'rendered':'blank','Raster sample classification contradicts physical pixels');
+    if(previous)assert.ok(attempt.started_at>=previous.completed_at,'Raster samples must be serial');
+    previous=attempt;
+  }
+  const first=attempts.at(-2),last=attempts.at(-1);
+  assert.equal(first.status,'rendered');assert.equal(last.status,'rendered');assert.equal(first.raster_sha256,last.raster_sha256,'Final physical rasters are not consecutive/stable');
+  return last;
+}
 function captureScripts(drawEligibility = measureFrame) {
   const sample = `(() => {
     const measured=(${drawEligibility.toString()})();
@@ -83,7 +184,9 @@ function captureScripts(drawEligibility = measureFrame) {
     return {viewport:[innerWidth,innerHeight],full_size:[innerWidth,Math.max(innerHeight,document.documentElement.scrollHeight)],dpr:devicePixelRatio,
       horizontal_overflow:document.documentElement.scrollWidth>innerWidth,
       rendering:{model_tier:cq.model?.tier,model_hash:cq.model?.hash,model_project:cq.model?.index.project,model_gen:cq.model?.index.gen,model_built_at:cq.model?.index.built_at,
-        worker_state:cq.status?.state,rebuilding:!!cq.rebuilding,vertices:measured.vertices,meshes:measured.meshes,clipped:measured.clipped,nonfinite:measured.nonfinite,
+        worker_state:cq.status?.state,rebuilding:!!cq.rebuilding,theme:document.documentElement.dataset.theme,theme_choice:document.documentElement.dataset.themeChoice,
+        panel:getComputedStyle(document.documentElement).getPropertyValue('--panel'),source_fingerprint:window.__workbench?.inspection?.source_fingerprint,
+        vertices:measured.vertices,meshes:measured.meshes,clipped:measured.clipped,nonfinite:measured.nonfinite,
         canvas_rect:{x:r.left+scrollX,y:r.top+scrollY,width:r.width,height:r.height},stage_size:[stage.clientWidth,stage.clientHeight],buffer:[c.width,c.height],
         drawing_buffer:gl?[gl.drawingBufferWidth,gl.drawingBufferHeight]:[0,0],context_lost:!gl||gl.isContextLost(),pixel_ratio:Math.min(devicePixelRatio,2),
         camera_aspect:cq.camera.aspect,camera:cq.camera.position.toArray(),target:cq.controls.target.toArray()}}
@@ -95,9 +198,10 @@ function captureScripts(drawEligibility = measureFrame) {
     while(performance.now()<end){
       await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
       const value=${sample}; const r=value.rendering;
-      const key=JSON.stringify([value.full_size,r.canvas_rect,r.buffer,r.camera_aspect,r.model_tier,r.model_project,r.model_hash,r.model_gen,r.model_built_at]);
+      const key=JSON.stringify([value.full_size,r.canvas_rect,r.buffer,r.camera_aspect,r.camera,r.target,r.model_tier,r.model_project,r.model_hash,r.model_gen,r.model_built_at]);
       const aligned=r.model_tier==='certified'&&typeof r.model_project==='string'&&r.model_project.length>0&&/^[a-f0-9]{16}$/.test(r.model_hash)&&
         Number.isInteger(r.model_gen)&&r.model_gen>=0&&Number.isFinite(r.model_built_at)&&r.model_built_at>0&&!r.rebuilding&&!r.worker_state?.startsWith('building')&&
+        [r.camera,r.target].every(vector=>Array.isArray(vector)&&vector.length===3&&vector.every(Number.isFinite))&&
         r.vertices>0&&r.meshes>0&&r.clipped===0&&r.nonfinite===0&&!r.context_lost&&r.buffer[0]===r.drawing_buffer[0]&&r.buffer[1]===r.drawing_buffer[1]&&
         Math.abs(r.camera_aspect-r.canvas_rect.width/r.canvas_rect.height)<1e-6&&r.stage_size[0]===Math.round(r.canvas_rect.width)&&r.stage_size[1]===Math.round(r.canvas_rect.height);
       stable=aligned&&key===previous?stable+1:0;previous=key;
@@ -238,6 +342,25 @@ function validateReport(report, directory) {
       assert.ok(Array.isArray(record.full_size) && record.full_size[0] === 1600 && record.full_size[1] >= 1000);
       assert.equal(size.width, 1600); assert.equal(size.height, record.full_size[1]);
       const pixels = canvasPixels(bytes, record.rendering?.canvas_rect || {}); validateRendering(record, pixels);
+      const selected=validateRasterAttempts(record.raster_attempts,directory);
+      assert.equal(record.sha256,selected.image.sha256,'Final screenshot differs from its selected physical sample');
+      assert.equal(record.raster_sha256,selected.raster_sha256);
+      validateRasterIdentity(record,selected.before,'Final screenshot metadata differs from its physical raster sample');
+    }
+  }
+  assert.ok(Array.isArray(report.capture_attempts)&&report.capture_attempts.length===report.screenshots.length,'Missing/excessive raster readiness journal');
+  const journal=JSON.parse(fs.readFileSync(relativeEvidence(directory,'capture-attempts.json')));
+  assert.deepEqual(journal,report.capture_attempts,'Retained capture journal differs from report');
+  for (const shot of report.screenshots) {
+    const entries=report.capture_attempts.filter(entry=>entry.description===shot.description);
+    assert.equal(entries.length,1);assert.equal(entries[0].status,'stable');assert.equal(entries[0].method,'bounded serial physical raster readiness');
+    assert.ok(Number.isFinite(entries[0].started_at)&&entries[0].started_at>0&&entries[0].deadline_at===entries[0].started_at+15000&&
+      Number.isFinite(entries[0].completed_at)&&entries[0].completed_at>=entries[0].started_at&&entries[0].completed_at<entries[0].deadline_at,'Capture action exceeded its aggregate deadline');
+    assert.deepEqual(entries[0].attempts,shot.raster_attempts);
+    assert.ok(entries[0].completed_at>=shot.raster_attempts.at(-1).completed_at,'Capture action completed before its final physical sample');
+    for(const attempt of shot.raster_attempts){
+      assert.equal(attempt.readiness_started_at,entries[0].started_at,'Capture sample origin differs from the action origin');
+      assert.equal(attempt.deadline_at,entries[0].deadline_at-1000,'Capture sample budget differs from the reserved action budget');
     }
   }
   for (const name of ['before-edit.py', 'after-edit.py', 'transformed-manifest.json', 'recovery.json', 'settings.json', 'transformed.step', 'roundtrip.step'])
@@ -402,26 +525,49 @@ async function run() {
     return until('actual save HTTP response', () => wireTrace.slice(start).find((r) => r.action === 'save' && r.status));
   }
   async function capture(description, name = description, expected = null) {
-    const file = name + '.png';
-    const { sample, settled } = captureScripts();
-    const layout = await page.evaluate(settled);
-    validateCaptureIdentity(layout, layout, expected);
-    assert.deepEqual(layout.viewport, report.viewport); assert.equal(layout.horizontal_overflow, false);
-    const cdp = await page.context().newCDPSession(page);
-    let bytes;
+    const started_at=Date.now(),deadline_at=started_at+15000;
+    const attempts=[];report.capture_attempts ||= [];
+    const journal={method:'bounded serial physical raster readiness',description,started_at,deadline_at,attempts,status:'pending'};report.capture_attempts.push(journal);
+    let cdp,record,error;
+    async function withinCapture(work, deadline=deadline_at) {
+      assert.ok(Date.now()<deadline,'Physical capture action exceeded its 15-second deadline');let timer;
+      try { const result=await Promise.race([Promise.resolve().then(work),new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Physical capture action exceeded its 15-second deadline')),Math.max(1,deadline-Date.now()));})]);
+        assert.ok(Date.now()<deadline,'Physical capture action exceeded its 15-second deadline');return result;
+      } finally {clearTimeout(timer);}
+    }
     try {
-      const shot = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: true, fromSurface: true,
-        clip: { x: 0, y: 0, width: layout.full_size[0], height: layout.full_size[1], scale: 1 } });
-      bytes = Buffer.from(shot.data, 'base64'); fs.writeFileSync(path.join(output, file), bytes);
-    } finally { await cdp.detach(); }
-    const after = await page.evaluate(sample);
-    assert.deepEqual(after.rendering.canvas_rect, layout.rendering.canvas_rect, 'Canvas moved during capture');
-    assert.deepEqual(after.rendering.buffer, layout.rendering.buffer, 'Canvas resized during capture');
-    validateCaptureIdentity(layout, after, expected);
-    const dimensions = pngDimensions(bytes); assert.equal(dimensions.width, layout.full_size[0]); assert.equal(dimensions.height, layout.full_size[1]);
-    const record = { path: file, description, bytes: bytes.length, sha256: digest(bytes), ...dimensions, ...layout,
-      canvas_pixels: canvasPixels(bytes, layout.rendering.canvas_rect) };
-    report.screenshots.push(record); validateRendering(record, record.canvas_pixels);
+      const { settled } = captureScripts();
+      cdp=await withinCapture(()=>page.context().newCDPSession(page));
+      const selected=await captureStableRaster({readiness_started_at:started_at,deadline_at:deadline_at-1000,
+        observe:async()=>{const layout=await page.evaluate(settled);validateCaptureIdentity(layout,layout,expected);
+          assert.deepEqual(layout.viewport,report.viewport);assert.equal(layout.horizontal_overflow,false);return layout;},
+        take:async(layout)=>{const shot=await cdp.send('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,fromSurface:true,
+          clip:{x:0,y:0,width:layout.full_size[0],height:layout.full_size[1],scale:1}});return Buffer.from(shot.data,'base64');},
+        retain:async(bytes,index)=>{
+          const file=`${name}-raster-${index}.png`;fs.writeFileSync(path.join(output,file),bytes);
+          assert.ok(fs.readFileSync(path.join(output,file)).equals(bytes),'Retained physical raster differs from captured bytes');
+          return {path:file,bytes:bytes.length,sha256:digest(bytes),width:bytes.length>=24?bytes.readUInt32BE(16):null,height:bytes.length>=24?bytes.readUInt32BE(20):null};
+        },
+      },attempts);
+      await withinCapture(()=>validateRasterAttempts(attempts,output),deadline_at-500);
+      record={...selected.image,path:name+'.png',description,...selected.before,canvas_pixels:selected.pixels,
+        raster_sha256:selected.raster_sha256,raster_attempts:attempts};
+      await withinCapture(()=>validateRendering(record,record.canvas_pixels),deadline_at-500);
+    }catch(failure){error=failure;journal.status='failed';journal.error=failure.message;}
+    if(cdp){try{await withinCapture(()=>cdp.detach());}catch(cleanup){error ||= cleanup;journal.status='failed';journal.cleanup_error=cleanup.message;}}
+    if(!error)journal.status='stable';journal.completed_at=Date.now();
+    try {await withinCapture(()=>{const bytes=Buffer.from(JSON.stringify(report.capture_attempts,null,2)+'\n');
+      fs.writeFileSync(path.join(output,'capture-attempts.json'),bytes);assert.ok(fs.readFileSync(path.join(output,'capture-attempts.json')).equals(bytes));});}
+    catch(failure){error ||= failure;journal.status='failed';journal.journal_error=failure.message;}
+    if(error)throw error;
+    try {
+      await withinCapture(()=>{const bytes=fs.readFileSync(path.join(output,attempts.at(-1).image.path));
+        fs.writeFileSync(path.join(output,record.path),bytes);assert.ok(fs.readFileSync(path.join(output,record.path)).equals(bytes));});
+      journal.completed_at=Date.now();
+      await withinCapture(()=>{const bytes=Buffer.from(JSON.stringify(report.capture_attempts,null,2)+'\n');
+        fs.writeFileSync(path.join(output,'capture-attempts.json'),bytes);assert.ok(fs.readFileSync(path.join(output,'capture-attempts.json')).equals(bytes));});
+    }catch(failure){journal.status='failed';journal.error=failure.message;throw failure;}
+    report.screenshots.push(record);
   }
   function retain(file, name) { const bytes = fs.readFileSync(file); fs.writeFileSync(path.join(output, name), bytes); report.files.push({ path: name, bytes: bytes.length, sha256: digest(bytes) }); return digest(bytes); }
   async function scenario(id, work) { currentScenario = { id, pass: false, checks: [] }; report.scenarios.push(currentScenario); await work(); assert.deepEqual(currentScenario.checks.map((c) => c.id), REQUIRED_CHECKS[id]); currentScenario.pass = true; }
@@ -697,7 +843,7 @@ async function run() {
   }
   console.log(JSON.stringify({ pass: report.pass, report: reportFile, error: report.error })); if (!report.pass) process.exitCode = 1; return report;
 }
-module.exports = { THEMES, REQUIRED_CHECKS, validateCaptureIdentity, captureScripts, canvasPixels, validateRendering, validateEvidence, validateReport, verifyStepEvidence, request, recordWorkbenchTraffic, sourceSnapshot, measureStep, run };
+module.exports = { THEMES, REQUIRED_CHECKS, validateRasterIdentity, validateRasterAttempts, validateRenderGeometry, captureStableRaster, rasterIdentity, analyzeCanvasRaster, validateCaptureIdentity, captureScripts, canvasPixels, validateRendering, validateEvidence, validateReport, verifyStepEvidence, request, recordWorkbenchTraffic, sourceSnapshot, measureStep, run };
 if (require.main === module) {
   const args = process.argv.slice(2);
   if (args.length === 2 && args[0] === '--validate-report') {

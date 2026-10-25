@@ -247,7 +247,10 @@ class WorkbenchContractTests(unittest.TestCase):
         step_hash = next(r['sha256'] for r in self.report['files'] if r['path'] == 'transformed.step')
         self.data['step-export-import'].update(export_sha256=step_hash, original_export_after_import=step_hash)
         themes = ['Counterform Dark', 'Counterform Light', 'Graphite', 'Midnight', 'Forest', 'Sand', 'Paper', 'High Contrast']
-        png = parser_png()
+        png = parser_png(); (self.output / 'pixel-input.png').write_bytes(png)
+        sample_code = "const fs=require('node:fs'),s=require(process.argv[1]);console.log(JSON.stringify(s.analyzeCanvasRaster(fs.readFileSync(process.argv[2]),{x:0,y:0,width:800,height:600})));"
+        sample = subprocess.run([self.node, '-e', sample_code, str(SUITE), str(self.output / 'pixel-input.png')], capture_output=True, text=True, timeout=10, check=True)
+        analysis = json.loads(sample.stdout); raster_hash = analysis.pop('raster_sha256')
         for index, label in enumerate(themes + ['edit-certified', 'external-conflict', 'syntax-retained', 'step-roundtrip']):
             name = f'parser-image-{index}.png'; (self.output / name).write_bytes(png)
             record = {'path': name, 'bytes': len(png), 'sha256': sha(png), 'width': 1600, 'height': 1000,
@@ -255,18 +258,33 @@ class WorkbenchContractTests(unittest.TestCase):
                 'rendering': {'model_tier': 'certified', 'model_hash': 'a' * 16, 'vertices': 30, 'meshes': 3, 'clipped': 0, 'nonfinite': 0,
                     'context_lost': False, 'canvas_rect': {'x': 0, 'y': 0, 'width': 800, 'height': 600}, 'camera_aspect': 800 / 600,
                     'pixel_ratio': 1, 'buffer': [800, 600], 'drawing_buffer': [800, 600]}}
+            layout = {key: copy.deepcopy(record[key]) for key in ('viewport', 'full_size', 'dpr', 'horizontal_overflow', 'rendering')}
+            layout['rendering'].update(model_project='WORKBENCHPLATE', model_gen=1, model_built_at=1, camera=[1,2,3], target=[0,0,0],
+                                       theme='sand', theme_choice='sand', panel='#aaa', source_fingerprint='a'*64)
+            record['raster_sha256'] = raster_hash
+            record['rendering'] = copy.deepcopy(layout['rendering'])
+            record['raster_attempts'] = []
+            for attempt_index in range(2):
+                sample_name = f'{name}-sample-{attempt_index}.png'; (self.output / sample_name).write_bytes(png)
+                sample_image = {'path': sample_name, 'bytes': len(png), 'sha256': sha(png), 'width': 1600, 'height': 1000}
+                record['raster_attempts'].append({'index': attempt_index, 'readiness_started_at': 1, 'deadline_at': 14001,
+                    'started_at': 2+attempt_index*3, 'captured_at': 3+attempt_index*3, 'completed_at': 4+attempt_index*3,
+                    'before': copy.deepcopy(layout), 'after': copy.deepcopy(layout), 'image': sample_image, 'observed_bytes': len(png),
+                    'observed_sha256': sha(png), 'raster_sha256': record['raster_sha256'], 'pixels': copy.deepcopy(analysis), 'status': 'rendered'})
             self.report['screenshots'].append(record)
+            self.report.setdefault('capture_attempts', []).append({'method': 'bounded serial physical raster readiness', 'description': label,
+                'started_at':1,'deadline_at':15001,'completed_at':10,'attempts': copy.deepcopy(record['raster_attempts']), 'status': 'stable'})
             if index < len(themes):
                 self.data['eight-themes']['states'].append({'name': label, 'styling': f'parser-style-{index}', 'persisted': True, 'visible': True, 'image_sha256': sha(png)})
-        pixel_code = "const fs=require('node:fs'),s=require(process.argv[1]);console.log(JSON.stringify(s.canvasPixels(fs.readFileSync(process.argv[2]),{x:0,y:0,width:800,height:600})));"
-        result = subprocess.run([self.node, '-e', pixel_code, str(SUITE), str(self.output / 'parser-image-0.png')], capture_output=True, text=True, timeout=10, check=True)
-        for record in self.report['screenshots']: record['canvas_pixels'] = json.loads(result.stdout)
+        for record in self.report['screenshots']: record['canvas_pixels'] = copy.deepcopy(analysis)
+        (self.output / 'capture-attempts.json').write_text(json.dumps(self.report['capture_attempts']))
         groups = {'source-edit': ['capability-boundary', 'open-folder-file', 'edit-save-volume', 'external-conflict', 'syntax-retains-certified', 'draft-recovery'],
                   'cad-roundtrip': ['source-transform', 'step-export-import'], 'workbench-ui': ['eight-themes', 'font-tabs', 'shortcut-focus']}
         self.report['scenarios'] = [{'id': group, 'pass': True, 'checks': [{'id': name, 'pass': True, 'evidence': self.data[name]} for name in names]} for group, names in groups.items()]
 
     def validate(self, report=None):
-        file = self.output / 'workbench-results.json'; file.write_text(json.dumps(self.report if report is None else report))
+        file = self.output / 'workbench-results.json'; value = self.report if report is None else report; file.write_text(json.dumps(value))
+        (self.output / 'capture-attempts.json').write_text(json.dumps(value.get('capture_attempts', [])))
         code = "const fs=require('node:fs'),s=require(process.argv[1]);try{s.validateReport(JSON.parse(fs.readFileSync(process.argv[2])),process.argv[3]);}catch(e){console.error(e.message);process.exitCode=1;}"
         return subprocess.run([self.node, '-e', code, str(SUITE), str(file), str(self.output)], capture_output=True, text=True, timeout=10, check=False)
 
@@ -484,13 +502,148 @@ class WorkbenchContractTests(unittest.TestCase):
         result = subprocess.run([self.node, str(SUITE), '--skip-native'], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 2)
 
+    def test_physical_raster_readiness_is_serial_bounded_and_spatial(self):
+        # Capture MODEL: actual PNG bytes, transparent transport functions, no renderer/source state mutation.
+        png = parser_png(); blank = parser_png(blank=True)
+        # Recompress the same ordered pixels; compressed byte equality is not raster equality.
+        raw = zlib.decompress(png[41:-16]); alternate_data = zlib.compress(raw, 1)
+        kind = b'IDAT'; chunk = struct.pack('>I', len(alternate_data)) + kind + alternate_data + struct.pack('>I', zlib.crc32(kind + alternate_data) & 0xffffffff)
+        alternate = png[:33] + chunk + png[-12:]
+        # Move the same colors to different columns, preserving color histograms but changing spatial raster.
+        rows = bytearray(raw); stride = 1600 * 3 + 1
+        for row in range(1000):
+            start = row * stride + 1
+            pixels = [rows[start+i:start+i+3] for i in range(0, 4800, 3)]
+            rows[start:start+4800] = b''.join(pixels[2:] + pixels[:2])
+        swapped_data = zlib.compress(bytes(rows)); swapped_chunk = struct.pack('>I', len(swapped_data)) + kind + swapped_data + struct.pack('>I', zlib.crc32(kind + swapped_data) & 0xffffffff)
+        swapped = png[:33] + swapped_chunk + png[-12:]
+        for name, data in (('a.png', png), ('a2.png', alternate), ('b.png', swapped), ('blank.png', blank)): (self.output / name).write_bytes(data)
+        (self.output / 'layout.json').write_text(json.dumps(self.report['screenshots'][0]['raster_attempts'][0]['before']))
+        code = r"""
+const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),s=require(process.argv[1]);
+const root=process.argv[2],layout=JSON.parse(fs.readFileSync(path.join(root,'layout.json'))),clone=x=>structuredClone(x);
+const pngs=Object.fromEntries(['a','a2','b','blank'].map(name=>[name,fs.readFileSync(path.join(root,name+'.png'))]));
+assert.notDeepEqual(pngs.a,pngs.a2);assert.deepEqual(s.analyzeCanvasRaster(pngs.a,layout.rendering.canvas_rect),s.analyzeCanvasRaster(pngs.a2,layout.rendering.canvas_rect));
+assert.deepEqual(s.canvasPixels(pngs.a,layout.rendering.canvas_rect),s.canvasPixels(pngs.b,layout.rendering.canvas_rect));
+assert.notEqual(s.analyzeCanvasRaster(pngs.a,layout.rendering.canvas_rect).raster_sha256,s.analyzeCanvasRaster(pngs.b,layout.rendering.canvas_rect).raster_sha256);
+async function scenario(name,sequence,mutation){let clock=1,takes=0,observations=0;const attempts=[];
+ const ops={now:()=>clock,observe:async()=>{clock++;observations++;const value=clone(layout);if(mutation&&observations>1)value.rendering[mutation]=mutation==='camera'?[9,2,3]:'foreign';return value;},
+ take:async()=>{clock++;return pngs[sequence[Math.min(takes++,sequence.length-1)]];},
+ retain:async(bytes,index,before)=>{clock++;const name='sample-'+index+'.png';fs.writeFileSync(path.join(root,name),bytes);return{path:name,bytes:bytes.length,sha256:require('node:crypto').createHash('sha256').update(bytes).digest('hex'),width:1600,height:1000};}};
+ if(name==='varying'){ops.take=async()=>{clock++;return pngs[takes++%2?'b':'a'];};}
+ if(name==='timeout'){ops.retain=async()=>{clock+=15001;return{};};}
+ if(name==='hung-retention'){ops.take=async()=>{clock=14999;return pngs.a;};ops.retain=async()=>new Promise(()=>{});}
+ if(['blank','varying','timeout','hung-retention','identity'].includes(name)){await assert.rejects(s.captureStableRaster(ops,attempts));assert.ok(attempts.length<=8);}
+ else{await s.captureStableRaster(ops,attempts);s.validateRasterAttempts(attempts,root);}
+ if(name==='transient')assert.deepEqual(attempts.map(a=>a.status),['blank','rendered','rendered']);
+ if(name==='converge')assert.equal(attempts.length,3);
+ if(name==='blank'||name==='varying')assert.equal(attempts.length,8);
+ if(name==='identity')assert.equal(takes,1,'Metadata change must fail immediately, not reset readiness');
+}
+(async()=>{await scenario('same',['a','a2']);await scenario('transient',['blank','a','a2']);await scenario('converge',['a','b','b']);
+ await scenario('blank',['blank']);await scenario('varying',['a','b']);await scenario('timeout',['a']);await scenario('hung-retention',['a']);
+ for(const field of ['model_hash','camera','theme','source_fingerprint'])await scenario('identity',['a'],field);
+})().catch(error=>{console.error(error);process.exitCode=1;});
+"""
+        result = subprocess.run([self.node, '-e', code, str(SUITE), str(self.output)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_entire_capture_lifecycle_shares_one_deadline(self):
+        # MODELS ONLY: execute the actual outer capture body, including session creation, cleanup and final writes.
+        png = parser_png(100, 100); (self.output / 'small.png').write_bytes(png)
+        code = r"""
+const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm'),s=require(process.argv[1]);
+const source=fs.readFileSync(process.argv[1],'utf8'),start=source.indexOf('  async function capture(description'),end=source.indexOf('  function retain(',start);assert.ok(start>0&&end>start);
+const bytes=fs.readFileSync(process.argv[2]),root=process.argv[3],clone=x=>structuredClone(x);
+async function scenario(mode){
+ const output=path.join(root,mode);fs.mkdirSync(output);let clock=1000,detached=false;const report={viewport:[100,100],screenshots:[]};
+ const layout={viewport:[100,100],full_size:[100,100],dpr:1,horizontal_overflow:false,rendering:{model_tier:'certified',model_project:'PUBLIC',model_hash:'a'.repeat(16),model_gen:1,model_built_at:1,
+  vertices:30,meshes:1,clipped:0,nonfinite:0,context_lost:false,canvas_rect:{x:0,y:0,width:100,height:100},stage_size:[100,100],buffer:[100,100],drawing_buffer:[100,100],pixel_ratio:1,camera_aspect:1,camera:[1,2,3],target:[0,0,0]}};
+ const session={send:async()=>{clock+=100;return{data:bytes.toString('base64')};},detach:async()=>{detached=true;clock+=mode==='detach-timeout'?15001:100;}};
+ const page={context:()=>({newCDPSession:async()=>{clock+=mode==='create-timeout'?15001:100;return session;}}),evaluate:async()=>{clock+=100;return clone(layout);}};
+ const nativeFS=Object.create(fs);nativeFS.writeFileSync=(file,data)=>{fs.writeFileSync(file,data);if(mode==='journal-timeout'&&path.basename(file)==='capture-attempts.json')clock+=15001;
+  if(mode==='alias-timeout'&&path.basename(file)==='shot.png')clock+=15001;};
+ const context={assert,fs:nativeFS,path,page,report,output,Date:{now:()=>clock},setTimeout,clearTimeout,Buffer,
+  captureScripts:s.captureScripts,validateCaptureIdentity:s.validateCaptureIdentity,digest:data=>require('node:crypto').createHash('sha256').update(data).digest('hex'),
+  validateRasterAttempts:s.validateRasterAttempts,validateRendering:s.validateRendering,
+  captureStableRaster:(ops,attempts)=>s.captureStableRaster({...ops,now:()=>clock},attempts)};
+ vm.runInNewContext(source.slice(start,end)+'globalThis.actualCapture=capture;',context);
+ if(mode==='healthy'){await context.actualCapture('shot');assert.equal(report.screenshots.length,1);assert.ok(detached);assert.equal(report.capture_attempts[0].status,'stable');}
+ else{await assert.rejects(context.actualCapture('shot'),/deadline/);assert.equal(report.screenshots.length,0);assert.equal(report.capture_attempts[0].status,'failed');}
+ assert.equal(report.capture_attempts[0].started_at,1000);assert.equal(report.capture_attempts[0].deadline_at,16000);
+}
+(async()=>{for(const mode of ['healthy','create-timeout','detach-timeout','journal-timeout','alias-timeout'])await scenario(mode);})().catch(error=>{console.error(error);process.exitCode=1;});
+"""
+        result = subprocess.run([self.node, '-e', code, str(SUITE), str(self.output / 'small.png'), str(self.output)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_raster_camera_identity_allows_only_machine_roundoff(self):
+        code = r"""
+const assert=require('node:assert/strict'),s=require(process.argv[1]);
+const original={viewport:[1600,1000],full_size:[1600,1000],dpr:1,horizontal_overflow:false,rendering:{
+ model_tier:'certified',model_project:'WORKBENCHPLATE',model_hash:'115cbd1b88c84efe',model_gen:1,model_built_at:1792940835.9744327,
+ canvas_rect:{x:712,y:202,width:592,height:770},stage_size:[592,770],buffer:[592,770],drawing_buffer:[592,770],pixel_ratio:1,
+ camera_aspect:592/770,camera:[61.9191595537647,-87.99038462903351,56.41039886666711],target:[0,0,16],theme:'counterform-light',theme_choice:'system',panel:'#eee8db',source_fingerprint:'a'.repeat(64)}};
+const changed=structuredClone(original);changed.rendering.camera=[61.91915955376471,-87.99038462903243,56.410398866666625];
+s.validateRasterIdentity(original,changed,'actual Workbench18 roundoff');
+for(const key of ['camera','target'])for(let index=0;index<3;index++){
+ const noise=structuredClone(original);const magnitude=128*Number.EPSILON*Math.max(1,Math.abs(noise.rendering[key][index]));
+ noise.rendering[key][index]+=magnitude/2;s.validateRasterIdentity(original,noise,'bounded coordinate roundoff');
+ for(const delta of [1e-8,1e-3,magnitude*2]){const moved=structuredClone(original);moved.rendering[key][index]+=delta;
+  assert.throws(()=>s.validateRasterIdentity(original,moved,'real camera change'));}
+ const nonfinite=structuredClone(original);nonfinite.rendering[key][index]=NaN;assert.throws(()=>s.validateRasterIdentity(original,nonfinite,'nonfinite camera'));
+}
+for(const field of ['model_hash','model_gen','model_built_at','theme','panel','source_fingerprint','camera_aspect']){
+ const other=structuredClone(original);other.rendering[field]=typeof other.rendering[field]==='number'?other.rendering[field]+Math.max(1e-12,Math.abs(other.rendering[field])*Number.EPSILON*4):'foreign';
+ assert.throws(()=>s.validateRasterIdentity(original,other,'noncamera identity must remain exact'));
+}
+"""
+        result = subprocess.run([self.node, '-e', code, str(SUITE)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Physically coherent consumer evidence must use the same comparison as the producer.
+        value = copy.deepcopy(self.report)
+        for shot in value['screenshots']:
+            for attempt in shot['raster_attempts']:
+                attempt['after']['rendering']['camera'][1] += 32 * 2.220446049250313e-16
+        for shot, journal in zip(value['screenshots'], value['capture_attempts']): journal['attempts'] = copy.deepcopy(shot['raster_attempts'])
+        self.assertEqual(self.validate(value).returncode, 0)
+        for field in ('camera', 'target'):
+            moved = copy.deepcopy(value); moved['screenshots'][0]['raster_attempts'][0]['after']['rendering'][field][0] += 1e-8
+            moved['capture_attempts'][0]['attempts'] = copy.deepcopy(moved['screenshots'][0]['raster_attempts'])
+            self.assertNotEqual(self.validate(moved).returncode, 0)
+
+    def test_capture_journal_timeline_must_contain_each_sample(self):
+        for kind in ('early-inner-deadline', 'foreign-action-origin', 'action-before-samples'):
+            value = copy.deepcopy(self.report); shot = value['screenshots'][0]; journal = value['capture_attempts'][0]
+            if kind == 'early-inner-deadline':
+                for attempt in shot['raster_attempts']: attempt['deadline_at'] = 2
+            elif kind == 'foreign-action-origin': journal.update(started_at=100000, deadline_at=115000, completed_at=100001)
+            else: journal['completed_at'] = 2
+            journal['attempts'] = copy.deepcopy(shot['raster_attempts'])
+            with self.subTest(coherent=kind): self.assertNotEqual(self.validate(value).returncode, 0)
+
+    def test_raster_attempt_evidence_cannot_be_dropped_reordered_or_reclassified(self):
+        for kind in ('missing', 'reordered', 'blank-label', 'spatial-hash', 'metadata', 'deadline', 'missing-image'):
+            value = copy.deepcopy(self.report); shot = value['screenshots'][0]
+            if kind == 'missing': shot['raster_attempts'].pop()
+            elif kind == 'reordered': shot['raster_attempts'].reverse()
+            elif kind == 'blank-label': shot['raster_attempts'][0]['status'] = 'blank'
+            elif kind == 'spatial-hash': shot['raster_attempts'][0]['raster_sha256'] = '0' * 64
+            elif kind == 'metadata': shot['raster_attempts'][0]['after']['rendering']['model_hash'] = 'b' * 16
+            elif kind == 'deadline': shot['raster_attempts'][0]['completed_at'] = 15001
+            else: (self.output / shot['raster_attempts'][0]['image']['path']).unlink()
+            value['capture_attempts'][0]['attempts'] = copy.deepcopy(shot['raster_attempts'])
+            with self.subTest(kind=kind): self.assertNotEqual(self.validate(value).returncode, 0)
+            if kind == 'missing-image': (self.output / shot['raster_attempts'][0]['image']['path']).write_bytes(parser_png())
+
     def test_native_closed_select_typeahead_requires_real_effects(self):
         # MODELS ONLY: execute the actual helper; no model success claims native platform qualification.
         code = r"""
 const fs=require('node:fs'),path=require('node:path'),os=require('node:os'),vm=require('node:vm'),assert=require('node:assert/strict');
 const source=fs.readFileSync(process.argv[2],'utf8'),start=source.indexOf('  async function selectOption(selector, value) {'),end=source.indexOf('  async function text(selector, value)',start);assert.ok(start>0&&end>start);
 async function model(mode){
- const directory=fs.mkdtempSync(path.join(os.tmpdir(),'cq-select-MODEL-')),report={},events=new Map(),tabs=mode==='tabs';
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'cq-select-MODEL-')),report={},events=new Map(),tabs=['tabs','lazy-tabs'].includes(mode);
+ const positive=['healthy','tabs','lazy','lazy-tabs'].includes(mode);
  const selector=tabs?'#tab-size':'#theme-select',value=tabs?'2':'counterform-dark',label=tabs?'2 spaces':'Counterform Dark';
  const input={id:selector.slice(1),disabled:mode==='disabled',value:tabs?'4':'system',selectedIndex:0,matches:()=>mode==='popup',
   options:[{value:tabs?'4':'system',text:tabs?'4 spaces':'System'},{value,text:label}]};
@@ -498,29 +651,36 @@ async function model(mode){
  const document={activeElement:close,documentElement:{dataset:{theme:'counterform-light'}},querySelector:()=>input,getElementById:()=>({open:true}),
   addEventListener(type,listener){events.set(type,listener);},removeEventListener(type){events.delete(type);}};
  const window={},context=vm.createContext({window,document,JSON,requestAnimationFrame:callback=>callback()});let typed='';
- const settingsFile=path.join(directory,'workbench-settings.json');fs.writeFileSync(settingsFile,JSON.stringify({theme:'system',tabSize:4}));
+ const settingsFile=path.join(directory,'workbench-settings.json');
+ if(!['lazy','lazy-tabs','missing-after-input'].includes(mode))fs.writeFileSync(settingsFile,JSON.stringify({theme:'system',tabSize:4}));
  const win={webContents:{sendInputEvent(event){assert.equal(event.type,'char');assert.ok(!event.modifiers);typed+=event.keyCode;
   if(typed===label&&mode!=='noop'){
    input.value=mode==='wrong-value'?'foreign':value;input.selectedIndex=mode==='wrong-value'?0:1;
    if(mode!=='no-event')for(const type of ['input','change'])events.get(type)?.({type,target:input,isTrusted:mode!=='untrusted'});
    document.documentElement.dataset.theme=value;
-   if(mode!=='unchanged-persist')fs.writeFileSync(settingsFile,JSON.stringify({theme:value,tabSize:Number(value)}));
+   if(!['unchanged-persist','missing-after-input'].includes(mode))fs.writeFileSync(settingsFile,mode==='malformed-after-input'?'not JSON':JSON.stringify({theme:value,tabSize:Number(value)}));
   }
  }}};
- const globals={assert,report,fs,path,directory,win,process:{env:{CASSQUERY_USER_DATA:directory}},
+ const observedFS=Object.create(fs);
+ observedFS.readFileSync=(file,...args)=>{if(mode==='read-denied'&&file===settingsFile)throw Object.assign(new Error('Actual read denied'),{code:'EACCES'});return fs.readFileSync(file,...args);};
+ const globals={assert,report,fs:observedFS,path,directory,win,process:{env:{CASSQUERY_USER_DATA:directory}},
   js:async code=>vm.runInContext(code,context),waitFor:async(_win,code)=>{if(!vm.runInContext(code,context))throw Error('Observed condition missing');},
   key:code=>{assert.equal(code,'Tab');if(mode!=='wrong-focus')document.activeElement=document.activeElement===input?after:input;},
   until:async(_label,predicate)=>{const value=await predicate();if(!value)throw Error('Persisted effect missing');return value;},image:async()=>{}};
  vm.runInNewContext(source.slice(start,end)+'globalThis.actualSelect=selectOption;',globals);
  try{
-  if(['healthy','tabs'].includes(mode)){await globals.actualSelect(selector,value);assert.equal(input.value,value);assert.equal(document.activeElement,after);}
+  if(positive){await globals.actualSelect(selector,value);assert.equal(input.value,value);assert.equal(document.activeElement,after);}
   else await assert.rejects(globals.actualSelect(selector,value));
-  const audit=JSON.parse(fs.readFileSync(path.join(directory,'select-diagnostics.json')))[0];assert.equal(audit.pass,['healthy','tabs'].includes(mode));
-  assert.equal(audit.method,'native keyboard closed-select typeahead');assert.ok(audit.phases.length>0);
+  const audit=JSON.parse(fs.readFileSync(path.join(directory,'select-diagnostics.json')))[0];assert.equal(audit.pass,positive);
+  assert.equal(audit.method,'native keyboard closed-select typeahead');
+  if(mode==='read-denied'){assert.equal(audit.phases.length,0);assert.equal(typed,'');}
+  else assert.ok(audit.phases.length>0);
+  if(['lazy','lazy-tabs'].includes(mode)){assert.equal(audit.phases[0].persisted,null);assert.equal(audit.phases[1].persisted[tabs?'tabSize':'theme'],tabs?2:value);}
+  if(mode==='missing-after-input'){assert.equal(audit.phases[0].persisted,null);assert.equal(fs.existsSync(settingsFile),false);}
   assert.ok(!window.__cqNativeSelectAudit&&events.size===0);
  }finally{fs.rmSync(directory,{recursive:true,force:true});}
 }
-(async()=>{for(const mode of['healthy','tabs','wrong-focus','popup','disabled','noop','no-event','untrusted','wrong-value','unchanged-persist'])await model(mode);})().catch(error=>{console.error(error);process.exitCode=1;});
+(async()=>{for(const mode of['healthy','tabs','lazy','lazy-tabs','missing-after-input','malformed-after-input','read-denied','wrong-focus','popup','disabled','noop','no-event','untrusted','wrong-value','unchanged-persist'])await model(mode);})().catch(error=>{console.error(error);process.exitCode=1;});
 """
         file = self.output / 'native-select-models.cjs'; file.write_text(code)
         result = subprocess.run([self.node, str(file), str(ROOT / 'tools/native_workbench_probe.cjs')], capture_output=True, text=True, timeout=20)
@@ -532,21 +692,26 @@ async function model(mode){
 const assert=require('node:assert/strict'),vm=require('node:vm'),s=require(process.argv[1]);
 const scripts=s.captureScripts(function measured(){return {vertices:30,meshes:1,clipped:0,nonfinite:0};});
 async function model(mode){
- let clock=0,frames=0;const cq={model:{tier:'certified',hash:'a'.repeat(16),index:{project:'WORKBENCHPLATE',gen:2,built_at:5}},
-  status:{state:mode==='error'?'error':'certified'},rebuilding:false,camera:{aspect:1,position:{toArray:()=>[1,2,3]}},controls:{target:{toArray:()=>[0,0,0]}}};
+ let clock=0,frames=0,cameraY=2,targetX=0;const cq={model:{tier:'certified',hash:'a'.repeat(16),index:{project:'WORKBENCHPLATE',gen:2,built_at:5}},
+  status:{state:mode==='error'?'error':'certified'},rebuilding:false,camera:{aspect:1,position:{toArray:()=>[1,cameraY,3]}},controls:{target:{toArray:()=>[targetX,0,0]}}};
  const canvas={width:100,height:100,getBoundingClientRect:()=>({left:0,top:0,width:100,height:100}),getContext:()=>({drawingBufferWidth:100,drawingBufferHeight:100,isContextLost:()=>false})};
- const context={window:{__cq:cq},document:{images:[],documentElement:{scrollHeight:100,scrollWidth:100},querySelector:()=>canvas,getElementById:()=>({clientWidth:100,clientHeight:100})},
+ const context={window:{__cq:cq},document:{images:[],documentElement:{scrollHeight:100,scrollWidth:100,dataset:{theme:'sand',themeChoice:'sand'}},querySelector:()=>canvas,getElementById:()=>({clientWidth:100,clientHeight:100})},
+  getComputedStyle:()=>({getPropertyValue:()=> '#aaa'}),
   innerWidth:100,innerHeight:100,devicePixelRatio:1,scrollX:0,scrollY:0,performance:{now:()=>clock},
   requestAnimationFrame(callback){clock+=100;frames++;if(mode==='preview'||(mode==='transition'&&frames<=4))cq.model.tier='preview';else cq.model.tier='certified';
-   if(mode==='changing')cq.model.hash=(frames%4<2?'a':'b').repeat(16);if(mode==='building')cq.status.state='building-certified';callback();}};
+   if(mode==='changing')cq.model.hash=(frames%4<2?'a':'b').repeat(16);if(mode==='building')cq.status.state='building-certified';
+   if(mode==='camera-drift'||(mode==='camera-settles'&&frames<=8))cameraY+=Number.EPSILON*8;
+   if(mode==='target-drift'||(mode==='target-settles'&&frames<=8))targetX+=Number.EPSILON*8;
+   callback();}};
  const promise=vm.runInNewContext(scripts.settled,context);
- if(['preview','changing','building'].includes(mode)){await assert.rejects(promise,/did not settle/);return;}
+ if(['preview','changing','building','camera-drift','target-drift'].includes(mode)){await assert.rejects(promise,/did not settle/);return;}
  const value=await promise;assert.equal(value.rendering.model_tier,'certified');assert.ok(frames>=6);
  if(mode==='transition')assert.ok(frames>=10,'Preview ticks cannot count toward certified readiness');
+ if(['camera-settles','target-settles'].includes(mode))assert.ok(frames>=12,'Moving control coordinates cannot count toward fixed-point readiness');
  return JSON.parse(JSON.stringify(value));
 }
 (async()=>{
- for(const mode of ['preview','transition','changing','error','building'])await model(mode);
+ for(const mode of ['preview','transition','changing','error','building','camera-drift','target-drift','camera-settles','target-settles'])await model(mode);
  const before=await model('healthy');s.validateCaptureIdentity(before,before,{project:'WORKBENCHPLATE',hash:'a'.repeat(16),built_at:5});
  for(const [key,value]of[['model_tier','preview'],['model_project','FOREIGN'],['model_hash','b'.repeat(16)],['model_gen',3],['model_built_at',6]]){
   const after=structuredClone(before);after.rendering[key]=value;assert.throws(()=>s.validateCaptureIdentity(before,after));

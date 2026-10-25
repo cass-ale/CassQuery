@@ -8,8 +8,12 @@ const graphics=require('../shell/renderer_config.cjs');
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
 test('native camera gesture carries coherent button state, observed capture and an event ledger through release',async()=>{
- const source=fs.readFileSync(path.join(__dirname,'../shell/smoke.cjs'),'utf8').replaceAll(',2000)',',20)');
- for(const mode of ['left','right','superseded','no-down','no-capture','lost-move','untrusted','no-release','covered','cleanup-error']){
+ const originalSource=fs.readFileSync(path.join(__dirname,'../shell/smoke.cjs'),'utf8');
+ for(const mode of ['left','right','superseded','no-down','no-capture','lost-move','untrusted','no-release','covered','cleanup-error','delayed-right','late-down']){
+  const healthy=['left','right','superseded','delayed-right'].includes(mode);
+  // Scheduling headroom is only for healthy VM callbacks; negative deadlines stay deliberately short.
+  const source=originalSource.replaceAll(',2000)',healthy?',1000)':',20)');
+  assert.notEqual(source,originalSource,'Native pointer timeout test seam must replace the production budget');
   const canvasListeners=new Map(),docListeners=new Map(),sent=[];let captured=false,cleaned=false;
   const canvas={getBoundingClientRect:()=>({left:0,top:0,right:400,bottom:300,width:400,height:300}),hasPointerCapture:()=>captured,
    addEventListener:(t,f)=>canvasListeners.set(t,f),removeEventListener:t=>canvasListeners.delete(t)};
@@ -18,6 +22,7 @@ test('native camera gesture carries coherent button state, observed capture and 
   const renderer=vm.createContext({document,window:{},innerWidth:400,innerHeight:300,scrollX:0,scrollY:0});
   const emit=(type,input,buttons)=>{const e={type,target:canvas,clientX:input.x,clientY:input.y,buttons,button:type==='pointermove'?-1:input.button==='right'?2:0,pointerId:1,isTrusted:mode!=='untrusted',movementX:8,movementY:3};docListeners.get(type)?.(e);canvasListeners.get(type)?.(e);};
   const win={focus(){},isFocused:()=>true,isDestroyed:()=>false,webContents:{executeJavaScript:async code=>{
+   if(['delayed-right','late-down'].includes(mode)&&code.includes('window.__cqSmokeDown?.trusted')){const end=performance.now()+35;while(performance.now()<end){}}
    if(code.includes("c.removeEventListener('pointermove'")){cleaned=true;if(mode==='cleanup-error')throw Error('listener cleanup sentinel');}
    return vm.runInContext(code,renderer);},sendInputEvent:input=>{
     sent.push(input);const mask=input.modifiers?.includes('rightButtonDown')?2:input.modifiers?.includes('leftButtonDown')?1:0;
@@ -26,10 +31,10 @@ test('native camera gesture carries coherent button state, observed capture and 
     if(input.type==='mouseUp'){if(mode==='no-release')return;captured=false;emit('pointerup',input,0);emit('lostpointercapture',input,0);}
    }}};
   const main=vm.createContext({require,process,Buffer,setTimeout,clearTimeout,module:{exports:{}}});vm.runInContext(source+'\nglobalThis.drag=dragCamera;',main);
-  if(['left','right','superseded'].includes(mode)){
+  if(healthy){
    const result=await main.drag(win,mode==='left'?'left':'right');assert.equal(result.status,'checked');assert.equal(sent.filter(e=>e.type==='mouseDown').length,1);assert.equal(sent.filter(e=>e.type==='mouseMove'&&e.modifiers?.length).length,10);assert.equal(sent.at(-1).type,'mouseUp');assert.equal(result.observations.at(-1).phase,'pointerup acknowledged');
    if(mode==='superseded')assert.notEqual(result.observations[2].pointer.x,sent[2].x,'Ledger must admit an observed requested move even after the last scalar changes');
-  }else{await assert.rejects(main.drag(win,'right'),error=>{assert.equal(error.pointer_trace.status,'failed');assert.ok(error.pointer_trace.observations.length||mode==='covered');return true;});}
+  }else{await assert.rejects(main.drag(win,'right'),error=>{assert.equal(error.pointer_trace.status,'failed');assert.ok(error.pointer_trace.observations.length||mode==='covered');if(mode==='late-down')assert.match(error.message,/deadline|timed out/);return true;});}
   assert.equal(cleaned,true);if(mode!=='cleanup-error'){assert.equal(canvasListeners.size,0);assert.equal(docListeners.size,0);}
  }
 });
@@ -141,7 +146,7 @@ test('native input waits reachable geometry and rejects a persistent overlay/dis
   let reads=0;const events=[];
   const win={isDestroyed:()=>false,webContents:{executeJavaScript:async()=>({ready:mode==='transient'&&++reads>1,x:10,y:20,reason:mode}),sendInputEvent:e=>events.push(e)}};
   if(mode==='transient'){await api.click(win,'#target',1000);assert.equal(reads,2);assert.equal(events.length,3);}
-  else{await assert.rejects(api.click(win,'#target',20),/Unreachable control/);assert.equal(events.length,0);}
+  else{await assert.rejects(api.click(win,'#target',20),/^(?:Error: )?(?:Unreachable control: #target: |Renderer execution (?:exceeded its deadline|timed out)$)/);assert.equal(events.length,0);}
  }
 });
 test('renderer readiness waits actual stage/canvas dimensions and camera aspect, not viewport alone',async()=>{

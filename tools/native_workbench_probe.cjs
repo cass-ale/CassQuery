@@ -305,7 +305,8 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
         if(r)r.phase=${JSON.stringify(phase)};
         return {phase:${JSON.stringify(phase)},active:document.activeElement?.id,disabled:e.disabled,open:e.matches(':open'),value:e.value,index:e.selectedIndex,
           theme:document.documentElement.dataset.theme,events:r?.events||[],dropped:r?.dropped||0};})()`);
-      result.persisted=JSON.parse(fs.readFileSync(path.join(process.env.CASSQUERY_USER_DATA,'workbench-settings.json')));
+      try { result.persisted=JSON.parse(fs.readFileSync(path.join(process.env.CASSQUERY_USER_DATA,'workbench-settings.json'))); }
+      catch(error) { if(error.code!=='ENOENT')throw error;result.persisted=null; }
       audit.phases.push(result);persist();return result;
     }
     await js(`(() => {if(window.__cqNativeSelectAudit)throw new Error('Native select observer already owned');

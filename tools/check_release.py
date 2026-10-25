@@ -51,11 +51,11 @@ python tools/zip_smoke.py --zip "$(printf '%s\\n' dist/mac-app/*.zip)" --arch "$
 if [ "$ARCH" = x64 ]; then ARCH=x86_64; fi
 APP=$(printf '%s\\n' dist/mac-app/mac*/CassQuery.app)
 python tools/dmg_smoke.py --dmg "$(printf '%s\\n' dist/mac-app/*.dmg)" --arch "$ARCH" --output evidence/dmg-${{ matrix.arch }} --checked-app "$APP" --checked-inventory evidence/mac-${{ matrix.arch }}/bundle-before.json''',
-    'Verify GitHub update channel transport': 'node tools/update_check_smoke.cjs --arch ${{ matrix.arch }} --output evidence/updatecheck-${{ matrix.arch }}.json',
     'Native workbench editor and file dialogs': '''APP=$(printf '%s\\n' dist/mac-app/mac*/CassQuery.app)
 python tools/workbench_native_smoke.py --app "$APP" --arch ${{ matrix.arch }} --output evidence/workbench-${{ matrix.arch }}''',
     'Native update installation and rollback': '''APP=$(printf '%s\\n' dist/mac-app/mac*/CassQuery.app)
 python tools/update_smoke.py --app "$APP" --arch ${{ matrix.arch }} --output evidence/update-${{ matrix.arch }}''',
+    'Verify GitHub update channel transport': 'node tools/update_check_smoke.cjs --arch ${{ matrix.arch }} --output evidence/updatecheck-${{ matrix.arch }}.json',
     'Candidate identity and hashes': '''python tools/sbom.py --output evidence/sbom.json
 python tools/release_evidence.py stage --arch ${{ matrix.arch }} --output dist/candidate-${{ matrix.arch }}''',
 }

@@ -58,6 +58,83 @@ function allowedURL(url, initial) {
   else if (value.hostname === 'github.com') need(value.href === initial && initial.startsWith(RELEASES + '/download/'), 'Unexpected repository redirect');
   else need(['release-assets.githubusercontent.com', 'objects.githubusercontent.com'].includes(value.hostname) && initial.startsWith(RELEASES + '/download/') && value.pathname.startsWith(`/github-production-release-asset/${REPOSITORY_ID}/`), 'Unexpected release download host/path');
 }
+function diagnosticText(value, limit = 512) {
+  return String(value).replace(/https?:\/\/[^\s"<>]+/gi, '[HTTPS endpoint]')
+    .replace(/\b(?:Bearer\s+[^\s,;]+|(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+)\b/gi, '[redacted token]')
+    .replace(/\b(?:authorization|cookie|password|secret|token|sig|jwt)\s*[:=]\s*[^\s,;]+/gi, '[redacted credential]')
+    .replace(/\b[a-f0-9]{32,}\b/gi, '[redacted token]')
+    .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g, '[redacted address]')
+    .replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, limit);
+}
+function httpHeaders(response) {
+  return Object.fromEntries(['x-ratelimit-limit', 'x-ratelimit-remaining', 'x-ratelimit-reset', 'retry-after', 'date', 'x-github-request-id', 'content-type']
+    .map(name => [name, response.headers.get(name)]).filter(([, value]) => value !== null)
+    .map(([name, value]) => [name, diagnosticText(value, 128)]));
+}
+function retryTiming(status, headers, now = Date.now()) {
+  // Preserve server guidance; never retry/sleep or diagnose generic 403 as quota.
+  if (![403, 429, 503].includes(status)) return null;
+  const server = Date.parse(headers.date || ''), origin = Number.isFinite(server) ? server : now;
+  const delays = [], retry = headers['retry-after'];
+  if (/^\d{1,9}$/.test(retry || '')) delays.push(Number(retry) * 1000);
+  else if (retry && Number.isFinite(Date.parse(retry))) delays.push(Date.parse(retry) - origin);
+  if ([403, 429].includes(status) && headers['x-ratelimit-remaining'] === '0' && /^\d{1,12}$/.test(headers['x-ratelimit-reset'] || ''))
+    delays.push(Number(headers['x-ratelimit-reset']) * 1000 - origin);
+  if (!delays.length) return null;
+  const delay = Math.max(0, ...delays);
+  return Number.isSafeInteger(delay) && Number.isSafeInteger(now + delay) ? now + delay : null;
+}
+async function httpFailure(response, url, signal) {
+  const address = new URL(url), headers = httpHeaders(response);
+  const details = { status: response.status, endpoint: address.origin + address.pathname, headers,
+    retryAt: retryTiming(response.status, headers), body: { format: 'none', bytes: 0, truncated: false } };
+  const chunks = []; let bytes = 0;
+  try {
+    if (response.body) {
+      // An error body gets at most 8 KiB and two seconds, still inside the
+      // caller's existing aggregate budget. Do not read a large/idle error page.
+      const bodySignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(2000)]) : AbortSignal.timeout(2000);
+      const reader = typeof response.body.getReader === 'function' ? response.body.getReader() : null;
+      const iterator = reader ? { next: () => reader.read(), return: () => reader.cancel() } : bodyStream(response)[Symbol.asyncIterator]();
+      let abort;
+      const aborted = new Promise((_, reject) => { abort = () => reject(bodySignal.reason); });
+      bodySignal.addEventListener('abort', abort, { once: true });
+      try {
+        bodySignal.throwIfAborted();
+        while (true) {
+          const { value, done } = await Promise.race([iterator.next(), aborted]);
+          if (done) break;
+          const data = Buffer.from(value), remaining = 8192 - bytes;
+          chunks.push(data.subarray(0, remaining)); bytes += Math.min(data.length, remaining);
+          if (data.length > remaining || bytes === 8192) { details.body.truncated = true; break; }
+        }
+      } finally {
+        bodySignal.removeEventListener('abort', abort);
+        details.body.cancel_requested = true;
+        // Request cleanup, but an untrusted cancel promise must not extend the
+        // caller's budget. This is not a claim that arbitrary I/O was reaped.
+        try { Promise.resolve(iterator.return?.()).catch(() => { details.body.cancel_failed = true; }); } catch { details.body.cancel_failed = true; }
+      }
+      details.body.bytes = bytes;
+      const captured = Buffer.concat(chunks), text = captured.toString('utf8');
+      details.body.sha256 = crypto.createHash('sha256').update(captured).digest('hex');
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          details.body.format = 'json';
+          // Only documented public error fields, never arbitrary echoed data.
+          for (const key of ['message', 'status']) if (typeof parsed[key] === 'string') details.body[key] = diagnosticText(parsed[key]);
+          if (typeof parsed.documentation_url === 'string') {
+            try { const doc = new URL(parsed.documentation_url); if (doc.origin === 'https://docs.github.com' && !doc.username && !doc.password && /^\/(?:en\/)?rest\/(?:rate-limits|using-the-rest-api\/rate-limits-for-the-rest-api|overview\/resources-in-the-rest-api)\/?$/.test(doc.pathname)) details.body.documentation_url = doc.origin + doc.pathname; } catch { details.body.documentation_url = '[invalid documentation URL]'; }
+          }
+        } else details.body.format = 'unrecognized-json';
+      } catch { details.body.format = 'text'; details.body.message = 'Non-JSON error response; unstructured body omitted'; }
+    }
+  } catch (error) {
+    details.body.bytes = bytes; details.body.read_error = { name: error.name, code: error.code || null, message: diagnosticText(error.message, 128) };
+  }
+  return Object.assign(new Error(`Update server returned HTTP ${response.status}`), { code: 'UPDATE_HTTP', http: details });
+}
 async function responseFor(url, fetcher, signal) {
   const initial = url;
   for (let redirects = 0; redirects <= 3; redirects++) {
@@ -68,7 +145,7 @@ async function responseFor(url, fetcher, signal) {
       need(redirects < 3 && response.headers.get('location'), 'Update redirect limit exceeded');
       const next = new URL(response.headers.get('location'), url).href; await response.body?.cancel?.(); url = next; continue;
     }
-    need(response.status === 200, `Update server returned HTTP ${response.status}`, 'UPDATE_HTTP');
+    if (response.status !== 200) throw await httpFailure(response, url, signal);
     need(!response.headers.get('content-encoding') || response.headers.get('content-encoding') === 'identity', 'Unexpected update content encoding');
     return response;
   }
@@ -107,7 +184,7 @@ async function createUpdater(options) {
   const stateFile = path.join(root, 'state.json'), fetcher = options.fetch || globalThis.fetch;
   let preferences = { autoCheck: options.autoCheck ?? true, autoDownload: options.autoDownload ?? false }, lastCheck = 0, ready = null, selected = null;
   need(typeof preferences.autoCheck === 'boolean' && typeof preferences.autoDownload === 'boolean', 'Updater preferences must be booleans');
-  let state = { schema: 1, phase: 'idle', currentVersion: version, version: null, progress: 0, error: null, installMode: 'custom-user-owned-explicit-restart' };
+  let state = { schema: 1, phase: 'idle', currentVersion: version, version: null, progress: 0, error: null, httpError: null, retryAt: null, installMode: 'custom-user-owned-explicit-restart' };
   let busy = false, timer, controller, disposed = false;
   try {
     const saved = await helper.readJSON(stateFile);
@@ -129,12 +206,13 @@ async function createUpdater(options) {
     need(!disposed && !busy, 'Updater is busy or disposed', 'UPDATE_BUSY'); busy = true;
     controller = new AbortController(); const timeoutTimer = setTimeout(() => controller.abort(new Error('Update operation timed out')), timeout);
     try { return await work(controller.signal); }
-    catch (error) { emit({ phase: 'error', error: error.message }); throw error; }
+    catch (error) { emit({ phase: 'error', error: error.message, httpError: error.http || null, retryAt: error.http?.retryAt ?? null }); throw error; }
     finally { clearTimeout(timeoutTimer); controller = null; busy = false; }
   }
   async function check() {
+    need(state.retryAt === null || state.retryAt <= Date.now(), 'Update server requested backoff; check again at retryAt', 'UPDATE_RETRY_LATER');
     await operation(async signal => {
-      emit({ phase: 'checking', error: null });
+      emit({ phase: 'checking', error: null, httpError: null, retryAt: null });
       const bytes = await smallBody(API, 256 * 1024, fetcher, signal);
       selected = selectRelease(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)), version, arch); lastCheck = Date.now();
       emit({ phase: ready ? 'ready' : selected ? 'available' : 'idle', version: ready?.version || selected?.version || null }); await persist();
@@ -262,4 +340,4 @@ async function createUpdater(options) {
   await persist(); onState(getState()); schedule();
   return { check, download, install, reveal, confirmRestart, setPreferences, getState, dispose };
 }
-module.exports = { createUpdater, selectRelease, compareVersions, checksumFor, allowedURL, responseFor, smallBody, downloadFile, API, RELEASES };
+module.exports = { createUpdater, selectRelease, compareVersions, checksumFor, allowedURL, httpHeaders, retryTiming, responseFor, smallBody, downloadFile, API, RELEASES };

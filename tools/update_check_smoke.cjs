@@ -55,7 +55,7 @@ async function runCheck({ arch, output }, { fetcher = globalThis.fetch, snapshot
       // Only observe the ordinary transport. Never change routing, TLS, headers,
       // response bodies, status codes, or the client's redirect behavior.
       const response = await fetcher(url, options), address = new URL(url);
-      report.statuses.push({ endpoint: address.origin + address.pathname, status: response.status, accept: options.headers.Accept });
+      report.statuses.push({ endpoint: address.origin + address.pathname, status: response.status, accept: options.headers.Accept, headers: client.httpHeaders(response) });
       requireThat(!Object.keys(options.headers).some(name => ['authorization', 'cookie'].includes(name.toLowerCase())), 'Unexpected credential-bearing request');
       return response;
     };
@@ -81,7 +81,8 @@ async function runCheck({ arch, output }, { fetcher = globalThis.fetch, snapshot
   } catch (error) {
     failure = error;
     report.error = { name: error.name, code: error.code || null, cause_code: error.cause?.code || null,
-      message: String(error.message).replace(/https?:\/\/\S+/g, '[HTTPS endpoint]').slice(0, 512) };
+      message: String(error.message).replace(/https?:\/\/\S+/g, '[HTTPS endpoint]').slice(0, 512),
+      http: error.http || null };
   } finally {
     try {
       const after = await snapshot(), afterHashes = await hashes();

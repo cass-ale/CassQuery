@@ -131,5 +131,35 @@ class ReleaseContractTests(unittest.TestCase):
     def test_moving_checkout_ref_is_rejected(self):
         self.mutation('ref: ${{ github.sha }}', 'ref: main')
 
+    def test_native_features_precede_network_transport_and_candidate_staging(self):
+        import yaml
+        document = yaml.safe_load((ROOT / '.github/workflows/macos-candidate.yml').read_text())
+        names = [step.get('name') for step in document['jobs']['candidate']['steps']]
+        gates = ['Native workbench editor and file dialogs', 'Native update installation and rollback',
+                 'Verify GitHub update channel transport', 'Candidate identity and hashes']
+        self.assertEqual([name for name in names if name in gates], gates)
+        self.assertTrue(module.check()['pass'])
+
+    def test_network_transport_before_native_features_is_rejected(self):
+        source = (ROOT / '.github/workflows/macos-candidate.yml').read_text()
+        start = source.index('      - name: Native workbench editor and file dialogs\n')
+        network = source.index('      - name: Verify GitHub update channel transport\n')
+        stage = source.index('      - name: Candidate identity and hashes\n')
+        self.mutation(source[start:stage], source[network:stage] + source[start:network])
+
+    def test_network_transport_after_candidate_staging_is_rejected(self):
+        source = (ROOT / '.github/workflows/macos-candidate.yml').read_text()
+        network = source.index('      - name: Verify GitHub update channel transport\n')
+        stage = source.index('      - name: Candidate identity and hashes\n')
+        diagnostics = source.index('      - name: Retain failure diagnostics\n')
+        self.mutation(source[network:diagnostics], source[stage:diagnostics] + source[network:stage])
+
+    def test_network_gate_remains_mandatory_and_cannot_fail_open(self):
+        gate = '      - name: Verify GitHub update channel transport\n'
+        for bypass in ('        if: false\n', '        continue-on-error: true\n'):
+            with self.subTest(bypass=bypass):
+                self.mutation(gate, gate + bypass)
+        self.mutation(gate, '      - name: Optional network check\n')
+
     def test_missing_freeze_is_not_green(self):
         self.mutation('name: Native worker freeze', 'name: optional freeze')

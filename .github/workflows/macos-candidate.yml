@@ -97,8 +97,6 @@ jobs:
           if [ "$ARCH" = x64 ]; then ARCH=x86_64; fi
           APP=$(printf '%s\n' dist/mac-app/mac*/CassQuery.app)
           python tools/dmg_smoke.py --dmg "$(printf '%s\n' dist/mac-app/*.dmg)" --arch "$ARCH" --output evidence/dmg-${{ matrix.arch }} --checked-app "$APP" --checked-inventory evidence/mac-${{ matrix.arch }}/bundle-before.json
-      - name: Verify GitHub update channel transport
-        run: node tools/update_check_smoke.cjs --arch ${{ matrix.arch }} --output evidence/updatecheck-${{ matrix.arch }}.json
       - name: Native workbench editor and file dialogs
         run: |
           APP=$(printf '%s\n' dist/mac-app/mac*/CassQuery.app)
@@ -107,6 +105,8 @@ jobs:
         run: |
           APP=$(printf '%s\n' dist/mac-app/mac*/CassQuery.app)
           python tools/update_smoke.py --app "$APP" --arch ${{ matrix.arch }} --output evidence/update-${{ matrix.arch }}
+      - name: Verify GitHub update channel transport
+        run: node tools/update_check_smoke.cjs --arch ${{ matrix.arch }} --output evidence/updatecheck-${{ matrix.arch }}.json
       - name: Candidate identity and hashes
         run: |
           python tools/sbom.py --output evidence/sbom.json

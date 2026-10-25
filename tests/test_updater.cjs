@@ -75,6 +75,82 @@ test('bounded download validates actual bytes and digest', async t => {
   await assert.rejects(updater.downloadFile({ ...asset, sha256: '0'.repeat(64) }, path.join(root, 'bad.zip'), async () => new Response(bytes)), /SHA-256/);
   await assert.rejects(updater.smallBody(updater.API, 2, async () => new Response('oversized')), /limit/);
 });
+test('HTTP errors retain bounded public diagnostics without guessing or retrying generic403', async () => {
+  let calls = 0;
+  const response = new Response(JSON.stringify({ message: 'Access denied for 192.0.2.1 https://example.test/x?sig=PRIVATE Bearer SECRETTOKEN', documentation_url: 'https://docs.github.com/rest/rate-limits?token=SECRET', status: '403', token: 'DO_NOT_COPY' }), {
+    status: 403, headers: { 'x-ratelimit-remaining': '5', 'x-ratelimit-reset': '1799999999', 'date': 'Sun, 25 Oct 2026 14:00:00 GMT', 'set-cookie': 'private', 'x-github-request-id': 'PUBLIC:1' } });
+  await assert.rejects(updater.responseFor(updater.API, async () => { calls++; return response; }), error => {
+    assert.equal(error.code, 'UPDATE_HTTP'); assert.equal(error.http.status, 403); assert.equal(error.http.endpoint, updater.API); assert.equal(error.http.retryAt, null);
+    assert.equal(error.http.headers['x-ratelimit-remaining'], '5'); assert.equal(error.http.headers['set-cookie'], undefined);
+    assert.equal(error.http.body.format, 'json'); assert.equal(error.http.body.token, undefined);
+    assert.equal(error.http.body.documentation_url, 'https://docs.github.com/rest/rate-limits');
+    assert.equal(/PRIVATE|SECRETTOKEN|DO_NOT_COPY|192\.0\.2\.1/.test(JSON.stringify(error.http)), false); return true;
+  });
+  assert.equal(calls, 1);
+});
+test('documentation URLs cannot echo arbitrary token paths, addresses, credentials or ports', async () => {
+  for (const url of [
+    'https://docs.github.com/rest/github_pat_SYNTHETIC_DIAGNOSTIC_CANARY_123/limits',
+    'https://docs.github.com/rest/%67ithub_pat_SYNTHETIC_DIAGNOSTIC_CANARY_123/limits',
+    'https://docs.github.com/rest/192.0.2.1/limits', 'https://docs.github.com/rest/%31%39%32.0.2.1/limits',
+    'https://user:password@docs.github.com/rest/rate-limits', 'https://docs.github.com:8443/rest/rate-limits',
+    'https://evil.example/rest/rate-limits', 'https://docs.github.com/unknown/private-path',
+  ]) {
+    await assert.rejects(updater.responseFor(updater.API, async () => new Response(JSON.stringify({ message: 'Forbidden', documentation_url: url }), { status: 403 })), error => {
+      assert.equal(error.http.body.documentation_url, undefined);
+      assert.equal(/CANARY|192\.0\.2\.1|password|private-path/.test(JSON.stringify(error.http)), false); return true;
+    });
+  }
+  await assert.rejects(updater.responseFor(updater.API, async () => new Response(JSON.stringify({ message: 'Limit exceeded', documentation_url: 'https://docs.github.com/rest/overview/resources-in-the-rest-api?sig=SECRET#rate-limiting' }), { status: 403 })), error => {
+    assert.equal(error.http.body.documentation_url, 'https://docs.github.com/rest/overview/resources-in-the-rest-api'); return true;
+  });
+});
+test('never-settling error-body cancellation cannot delay the existing caller deadline', async () => {
+  let cancelRequested = false;
+  const response = new Response(new ReadableStream({ pull() {}, cancel() { cancelRequested = true; return new Promise(() => {}); } }), { status: 403 });
+  const guard = setTimeout(() => {}, 1000);
+  try {
+    const result = await Promise.race([
+      updater.responseFor(updater.API, async () => response, AbortSignal.timeout(20)).then(() => null, error => error),
+      new Promise(resolve => setTimeout(() => resolve('late'), 300)),
+    ]);
+    assert.notEqual(result, 'late'); assert.equal(result.http.status, 403); assert.ok(result.http.body.read_error); assert.equal(cancelRequested, true);
+  } finally { clearTimeout(guard); }
+});
+
+test('retry timing is derived only from server guidance, with clock-skew-safe reset', () => {
+  const now = 1000000;
+  assert.equal(updater.retryTiming(403, { 'x-ratelimit-remaining': '4', 'x-ratelimit-reset': '2000' }, now), null);
+  assert.equal(updater.retryTiming(403, { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '2000', date: new Date(1900000).toUTCString() }, now), 1100000);
+  assert.equal(updater.retryTiming(429, { 'retry-after': '35' }, now), 1035000);
+  assert.equal(updater.retryTiming(415, { 'retry-after': '1' }, now), null);
+  assert.equal(updater.retryTiming(403, { 'retry-after': 'invalid', 'x-ratelimit-reset': '-1' }, now), null);
+});
+test('oversized or idle HTTP error body remains bounded and preserves status', async () => {
+  await assert.rejects(updater.responseFor(updater.API, async () => new Response('x'.repeat(20000), { status: 403 })), error => {
+    assert.equal(error.http.body.bytes, 8192); assert.equal(error.http.body.truncated, true); assert.ok(error.http.body.message.length <= 512); return true;
+  });
+  let cancelled = false;
+  const response = new Response(new ReadableStream({ pull() {}, cancel() { cancelled = true; } }), { status: 429 });
+  const hold = setTimeout(() => {}, 1000); // The synthetic idle stream has no socket/event-loop handle.
+  try {
+    await assert.rejects(updater.responseFor(updater.API, async () => response, AbortSignal.timeout(30)), error => {
+      assert.equal(error.http.status, 429); assert.ok(error.http.body.read_error); return true;
+    });
+    assert.equal(cancelled, true);
+  } finally { clearTimeout(hold); }
+});
+
+test('later checks respect server retryAt without sleeping, retrying, or controlling the app', async t => {
+  const root = await scratch(t); let requests = 0, quits = 0;
+  const client = await updater.createUpdater({ version: '0.2.0', arch: 'arm64', userData: root, appPath: '/never-read.app', autoCheck: false,
+    requestQuit: () => { quits++; }, fetch: async () => { requests++; return new Response(JSON.stringify({ message: 'API rate limit exceeded' }), { status: 403,
+      headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(Math.floor(Date.now() / 1000) + 3600) } }); } });
+  t.after(() => client.dispose()); await assert.rejects(client.check(), /HTTP 403/);
+  assert.ok(client.getState().retryAt > Date.now()); assert.equal(client.getState().httpError.status, 403);
+  await assert.rejects(client.check(), /server requested backoff/); assert.equal(requests, 1); assert.equal(quits, 0);
+});
+
 test('healthy ZIP and internal relative links validate without extraction', async t => {
   const root = await scratch(t), entries = appEntries(); entries.push({ name: 'CassQuery.app/alias', data: 'Contents/Info.plist', mode: 0o120777 });
   const file = path.join(root, 'app.zip'); await fs.writeFile(file, zip(entries)); const proof = await helper.validateZip(file); assert.equal(proof.entries, entries.length);

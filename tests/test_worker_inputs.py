@@ -234,10 +234,14 @@ class ActualCADInputTests(unittest.TestCase):
         (self.project / "entry.py").write_text(
             "from pathlib import Path\nimport time\nimport cadquery as cq\n"
             f"CONTROLS = Path({str(self.controls)!r})\n"
+            "def publish_read(value):\n"
+            "    pending = CONTROLS / 'read.pending'\n"
+            "    pending.write_text(value)\n"
+            "    pending.replace(CONTROLS / 'read')\n"
             "def build():\n"
             "    shape = cq.importers.importStep(str(Path(__file__).parent / 'part.step')).val()\n"
             "    if (CONTROLS / 'hold').exists():\n"
-            "        (CONTROLS / 'read').write_text(str(shape.Volume()))\n"
+            "        publish_read(str(shape.Volume()))\n"
             "        deadline = time.monotonic() + 5\n"
             "        while (CONTROLS / 'hold').exists() and time.monotonic() < deadline:\n"
             "            time.sleep(.01)\n"
@@ -257,6 +261,49 @@ class ActualCADInputTests(unittest.TestCase):
 
     def write_step(self, width):
         self.cq.exporters.export(self.cq.Workplane("XY").box(width, 3, 4), str(self.asset))
+
+    def test_read_witness_is_not_published_until_complete(self):
+        witness = self.controls / "read"
+        witness.write_text("")
+        self.assertTrue(witness.exists())  # The old existence-only poll admits this state.
+        with self.assertRaises(ValueError):
+            float(witness.read_text())
+        witness.unlink()
+        with worker._project_imports(self.p.root):
+            entry = self.p.load_module("entry.py")
+        pending = self.controls / "read.pending"
+        empty_created, release = threading.Event(), threading.Event()
+        errors = []
+        write_text = Path.write_text
+        def staged_write(path, value, *args, **kwargs):
+            if path == pending:
+                write_text(path, "")
+                empty_created.set()
+                if not release.wait(timeout=5):
+                    raise RuntimeError("test synchronization timed out")
+            return write_text(path, value, *args, **kwargs)
+        def publish():
+            try:
+                entry.publish_read("24")
+            except BaseException as error:
+                errors.append(error)
+        thread = threading.Thread(target=publish)
+        with mock.patch.object(Path, "write_text", staged_write):
+            thread.start()
+            try:
+                self.assertTrue(empty_created.wait(timeout=5))
+                self.assertTrue(pending.exists())
+                self.assertEqual(pending.read_text(), "")
+                self.assertFalse(witness.exists())  # Complete-publication poll cannot return yet.
+            finally:
+                release.set()
+                thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "owned witness publisher must exit")
+        self.assertEqual(errors, [])
+        self.assertEqual(witness.read_text(), "24")
+        self.assertEqual(float(witness.read_text()), 24)
+        self.assertFalse(pending.exists())
+        self.assertFalse(worker._inside(self.p.root, str(witness)))
 
     def test_step_save_during_real_build_cannot_commit_old_certificate(self):
         (self.controls / "hold").write_text("hold")

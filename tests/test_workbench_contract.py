@@ -705,6 +705,10 @@ for(const field of ['model_hash','model_gen','model_built_at','theme','panel','s
                     self.assertEqual(pid,1234);scripts.append((clock[0],commands,deadline))
                     if 'keystroke "g"' in commands:
                         self.assertNotIn('Trust and Open',commands); selected[0]=True;clock[0]+=1.4
+                    elif 'clickedOpen' in commands:
+                        self.assertIn('if exists button "Open"', commands)
+                        self.assertIn('if enabled of button "Open"', commands)
+                        self.assertLessEqual(deadline, 20)
                     elif 'clickedTrust' in commands:
                         self.assertTrue(ledger()['calls'][0].get('completed_at'));self.assertEqual(ledger()['calls'][1]['action_id'],2)
                         self.assertGreaterEqual(clock[0],10.8);self.assertIn('if exists button "Trust and Open"',commands)

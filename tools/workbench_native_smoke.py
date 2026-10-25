@@ -502,8 +502,20 @@ def serve_native_actions(process, proof, challenge, user):
                          '\n    key code 36\n    delay 0.5\n    keystroke "a" using command down\n    keystroke ' + json.dumps(target_path.name) + '\n    key code 36\n    delay 0.5')
             else:
                 action_deadline = min(deadline, time.monotonic() + 20)
-                commands = '    keystroke "g" using {command down, shift down}\n    delay 0.4\n    keystroke ' + json.dumps(target) + '\n    key code 36\n    delay 0.5\n    key code 36\n    delay 0.5'
+                commands = '    keystroke "g" using {command down, shift down}\n    delay 0.4\n    keystroke ' + json.dumps(target) + '\n    key code 36\n    delay 0.5'
                 os_input(process.pid, commands, deadline=action_deadline)
+                remaining = max(0, action_deadline - time.monotonic())
+                os_input(process.pid, '    set openDeadline to (current date) + ' + str(remaining) + '\n'
+                         '    set clickedOpen to false\n    repeat while (current date) < openDeadline\n'
+                         '      if exists window 1 then\n        if exists sheet 1 of window 1 then\n'
+                         '          if exists button "Open" of sheet 1 of window 1 then\n'
+                         '            if enabled of button "Open" of sheet 1 of window 1 then\n'
+                         '              click button "Open" of sheet 1 of window 1\n              set clickedOpen to true\n              exit repeat\n            end if\n          end if\n'
+                         '        else if exists button "Open" of window 1 then\n'
+                         '          if enabled of button "Open" of window 1 then\n'
+                         '            click button "Open" of window 1\n            set clickedOpen to true\n            exit repeat\n          end if\n        end if\n      end if\n'
+                         '      delay 0.1\n    end repeat\n'
+                         '    if not clickedOpen then error "Matching native Open control unavailable" number -1728', deadline=action_deadline)
                 if action.get('trust') is True:
                     def current_calls():
                         value = read_json(proof / 'native-dialogs.json')

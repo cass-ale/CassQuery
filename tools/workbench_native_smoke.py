@@ -327,14 +327,17 @@ def status(port):
     return json.loads(data)
 
 
-def os_input(pid, commands):
+def os_input(pid, commands, *, deadline=None):
     require(type(pid) is int and pid > 0, 'Native input needs the owned app PID')
+    timeout = 20 if deadline is None else min(20, deadline - time.monotonic())
+    require(timeout > 0, 'Standard native input exceeded its existing deadline')
     script = ('tell application "System Events"\n'
               f'  set targetProcess to first process whose unix id is {pid}\n'
               '  set frontmost of targetProcess to true\n'
               '  tell targetProcess\n' + commands + '\n  end tell\nend tell')
-    result = subprocess.run(['/usr/bin/osascript', '-e', script], capture_output=True, text=True, timeout=20)
+    result = subprocess.run(['/usr/bin/osascript', '-e', script], capture_output=True, text=True, timeout=timeout)
     require(result.returncode == 0, 'Standard native input unavailable: ' + result.stderr.strip()[:1500])
+    return result.stdout[:16000]
 
 
 def screenshot(file):
@@ -427,6 +430,10 @@ def serve_native_actions(process, proof, challenge, user):
                 time.sleep(0.1)
             else:
                 raise RuntimeError('Real native panel did not open inside its deadline')
+            if action.get('trust') is True:
+                require(ledger['calls'][index].get('method') == 'showOpenDialog' and ledger['calls'][index].get('action_id') == identity
+                        and ('openDirectory' if kind == 'folder' else 'openFile') in ledger['calls'][index].get('properties', []),
+                        'Unrelated native panel before trusted selection')
             image = screenshot(proof / f'native-os-{identity}.png'); image['path'] = Path(image['path']).name; response['image'] = image
             commands = ''
             if kind == 'cancel':
@@ -436,15 +443,84 @@ def serve_native_actions(process, proof, challenge, user):
                 os_input(process.pid, '    keystroke "g" using {command down, shift down}\n    delay 0.4\n    keystroke ' + json.dumps(str(target_path.parent)) +
                          '\n    key code 36\n    delay 0.5\n    keystroke "a" using command down\n    keystroke ' + json.dumps(target_path.name) + '\n    key code 36\n    delay 0.5')
             else:
+                action_deadline = min(deadline, time.monotonic() + 20)
                 commands = '    keystroke "g" using {command down, shift down}\n    delay 0.4\n    keystroke ' + json.dumps(target) + '\n    key code 36\n    delay 0.5\n    key code 36\n    delay 0.5'
+                os_input(process.pid, commands, deadline=action_deadline)
                 if action.get('trust') is True:
-                    commands += '\n    try\n      click button "Trust and Open" of sheet 1 of window 1\n    on error\n      click button "Trust and Open" of window 1\n    end try'
-                os_input(process.pid, commands)
-            if action.get('trust') is True:
-                time.sleep(0.2)
+                    def current_calls():
+                        value = read_json(proof / 'native-dialogs.json')
+                        require(value.get('challenge') == challenge and value.get('app_pid') == process.pid, 'Native trust observer identity mismatch')
+                        return value['calls']
+                    def await_dialog(label, predicate):
+                        while time.monotonic() < action_deadline:
+                            require(process.poll() is None and not main_file.is_file(), 'Driver stopped before matching native trust completed')
+                            found = predicate(current_calls())
+                            if found is not None:
+                                return found
+                            time.sleep(0.1)
+                        raise RuntimeError('Matching native dialog deadline: ' + label)
+                    def selected_call(calls):
+                        if len(calls) <= index:
+                            return None
+                        call = calls[index]
+                        require(call.get('method') == 'showOpenDialog' and call.get('action_id') == identity, 'Unrelated native chooser result')
+                        if call.get('result') is None or call.get('completed_at') is None:
+                            return None
+                        require(type(call['completed_at']) in (int, float) and type(call.get('started_at')) in (int, float)
+                                and call['completed_at'] >= call['started_at'], 'Invalid native chooser completion chronology')
+                        result = call['result']
+                        require(result.get('canceled') is False and isinstance(result.get('filePaths'), list) and len(result['filePaths']) == 1
+                                and isinstance(result['filePaths'][0], str) and Path(result['filePaths'][0]).resolve() == Path(target).resolve(),
+                                'Actual native chooser result differs from requested target')
+                        return call
+                    selected = await_dialog('actual chooser completion', selected_call)
+                    def trust_call(calls):
+                        if len(calls) <= index + 1:
+                            return None
+                        require(len([entry for entry in calls[index + 1:] if entry.get('method') == 'showMessageBox' and entry.get('action_id') == identity]) == 1,
+                                'Duplicate native trust dialog for this action')
+                        call = calls[index + 1]
+                        require(call.get('method') == 'showMessageBox' and call.get('action_id') == identity
+                                and call.get('buttons') == ['Trust and Open', 'Cancel']
+                                and call.get('started_at', 0) >= selected['completed_at'], 'Unrelated native trust dialog')
+                        return call
+                    trust = await_dialog('actual Trust and Open start', trust_call)
+                    require(trust.get('result') is None, 'Native trust responded before the owned input')
+                    remaining = max(0, action_deadline - time.monotonic())
+                    os_input(process.pid, '    set trustDeadline to (current date) + ' + str(remaining) + '\n'
+                             '    set clickedTrust to false\n    repeat while (current date) < trustDeadline\n'
+                             '      if exists window 1 then\n        if exists sheet 1 of window 1 then\n'
+                             '          if exists button "Trust and Open" of sheet 1 of window 1 then\n'
+                             '            if enabled of button "Trust and Open" of sheet 1 of window 1 then\n'
+                             '              click button "Trust and Open" of sheet 1 of window 1\n              set clickedTrust to true\n              exit repeat\n            end if\n          end if\n        end if\n'
+                             '        if exists button "Trust and Open" of window 1 then\n'
+                             '          if enabled of button "Trust and Open" of window 1 then\n'
+                             '            click button "Trust and Open" of window 1\n            set clickedTrust to true\n            exit repeat\n          end if\n        end if\n      end if\n'
+                             '      delay 0.1\n    end repeat\n'
+                             '    if not clickedTrust then error "Matching Trust and Open control unavailable" number -1728', deadline=action_deadline)
+                    def trust_response(calls):
+                        call = trust_call(calls)
+                        if call is None or call.get('result') is None or call.get('completed_at') is None:
+                            return None
+                        require(type(call['result'].get('response')) is int and call['result']['response'] == 0 and type(call['completed_at']) in (int, float)
+                                and call['completed_at'] >= call['started_at'], 'Actual native trust was not accepted')
+                        return call
+                    response['trust_call'] = await_dialog('actual Trust and Open response', trust_response)
+                    response['native_call'] = selected
             response['pass'] = True
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
             response['error'] = str(error)
+            try:
+                failed_image = screenshot(proof / f'native-os-error-{identity}.png'); failed_image['path'] = Path(failed_image['path']).name
+                response['failure_image'] = failed_image
+                response['accessibility'] = os_input(process.pid,
+                    '    set names to {}\n    if exists window 1 then\n      repeat with itemButton in buttons of window 1\n'
+                    '        if (count names) >= 20 then exit repeat\n        set end of names to name of itemButton\n      end repeat\n'
+                    '      if exists sheet 1 of window 1 then\n        repeat with itemButton in buttons of sheet 1 of window 1\n'
+                    '          if (count names) >= 40 then exit repeat\n          set end of names to name of itemButton\n        end repeat\n      end if\n    end if\n    return names',
+                    deadline=min(deadline, time.monotonic() + 5))
+            except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as diagnostic:
+                response['diagnostic_error'] = str(diagnostic)
         temporary = proof / 'native-action-result.tmp'
         temporary.write_text(json.dumps(response) + '\n'); os.replace(temporary, proof / 'native-action-result.json'); completed.add(identity)
     require(main_file.is_file(), 'Native workbench did not complete its bounded editor/full phases')

@@ -43,6 +43,18 @@ function harness(Workbench, TextDocument, text = 'saved') {
   return { w, doc, calls, nodes };
 }
 
+test('editor flex constraints keep source controls inside the available column', () => {
+  const css = fs.readFileSync(path.join(ROOT, 'viewer/style.css'), 'utf8');
+  const rule = (selector) => css.slice(css.indexOf(selector + ' {')).match(/\{([^}]+)\}/)[1];
+  assert.match(rule('.editor-area'), /min-height:\s*calc\(2 \* var\(--editor-font-size\) \* var\(--editor-line-height\) \+ 2 \* var\(--space-2\)\)/);
+  assert.match(rule('.editor-pane'), /overflow:\s*hidden\s*;/);
+  assert.match(rule('.source-heading'), /flex:\s*none\s*;/);
+  assert.match(rule('.document-pane > .notice, .document-pane > .find-bar, .document-pane > .parameter-panel'), /flex:\s*none\s*;/);
+  assert.match(rule('#source-editor'), /min-height:\s*0\s*;/);
+  assert.match(rule('.editor-footer'), /flex:\s*none\s*;/);
+  assert.match(rule('.document-pane'), /overflow:\s*auto\s*;/);
+});
+
 test('camera controls occupy a normal-flow row outside the model canvas', () => {
   const html = fs.readFileSync(path.join(ROOT, 'viewer/index.html'), 'utf8');
   const css = fs.readFileSync(path.join(ROOT, 'viewer/style.css'), 'utf8');

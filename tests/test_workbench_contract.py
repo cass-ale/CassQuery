@@ -636,6 +636,63 @@ for(const field of ['model_hash','model_gen','model_built_at','theme','panel','s
             with self.subTest(kind=kind): self.assertNotEqual(self.validate(value).returncode, 0)
             if kind == 'missing-image': (self.output / shot['raster_attempts'][0]['image']['path']).write_bytes(parser_png())
 
+    def test_native_trust_waits_for_matching_dialog_events(self):
+        # MODELS ONLY: actual wrapper function, fixed OS script stub, virtual event clock; not native macOS proof.
+        from unittest.mock import patch
+        import workbench_native_smoke as native
+        challenge = 'a' * 64
+        cases = ('delayed', 'late-button', 'missing-trust', 'wrong-action', 'wrong-path', 'wrong-buttons', 'cancel-response', 'early-trust', 'no-button', 'duplicate-trust', 'foreign-ledger', 'wrong-panel', 'boolean-response')
+        for mode in cases:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                proof = Path(directory).resolve(); target = proof / 'project'; target.mkdir(); clock = [0.0]; selected = [False]; clicked = [False]; scripts = []
+                action = {'schema':1,'id':2,'app_pid':1234,'challenge':challenge,'kind':'folder','target':str(target),'trust':True,'observer_index':0}
+                (proof / 'native-action.json').write_text(json.dumps(action))
+                class Process:
+                    pid = 1234
+                    def poll(self):
+                        if (proof / 'native-action-result.json').exists(): (proof / 'native-workbench-main.json').write_text('{}')
+                        return None
+                def ledger():
+                    chooser = {'method':'showMessageBox' if mode=='wrong-panel' else 'showOpenDialog','action_id':2,'properties':['openDirectory'],'started_at':1000,'result':None}
+                    if selected[0] and clock[0] >= 10.7:
+                        chooser.update(result={'canceled':False,'filePaths':[str(target) if mode!='wrong-path' else str(proof / 'foreign')]},completed_at=11700)
+                    calls = [chooser]
+                    if selected[0] and clock[0] >= 10.8 and mode!='missing-trust':
+                        trust = {'method':'showMessageBox','action_id':99 if mode=='wrong-action' else 2,
+                                 'buttons':['Other','Cancel'] if mode=='wrong-buttons' else ['Trust and Open','Cancel'],
+                                 'started_at':11000 if mode=='early-trust' else 11800,'result':None}
+                        if clicked[0]: trust.update(result={'response':1 if mode=='cancel-response' else False if mode=='boolean-response' else 0},completed_at=12000)
+                        calls.append(trust)
+                        if mode=='duplicate-trust': calls.append(copy.deepcopy(trust))
+                    return {'schema':1,'app_pid':1234,'challenge':'foreign' if mode=='foreign-ledger' else challenge,'calls':calls}
+                def read(file): return ledger() if file.name=='native-dialogs.json' else json.loads(file.read_text())
+                def os_input(pid, commands, *, deadline=None):
+                    self.assertEqual(pid,1234);scripts.append((clock[0],commands,deadline))
+                    if 'keystroke "g"' in commands:
+                        self.assertNotIn('Trust and Open',commands); selected[0]=True;clock[0]+=1.4
+                    elif 'clickedTrust' in commands:
+                        self.assertTrue(ledger()['calls'][0].get('completed_at'));self.assertEqual(ledger()['calls'][1]['action_id'],2)
+                        self.assertGreaterEqual(clock[0],10.8);self.assertIn('if exists button "Trust and Open"',commands)
+                        self.assertIn('if enabled of button "Trust and Open"',commands)
+                        self.assertLessEqual(deadline,20);self.assertIn('repeat while (current date) < trustDeadline',commands)
+                        if mode=='no-button': raise RuntimeError('Matching Trust and Open control unavailable')
+                        if mode=='late-button': clock[0]+=2.0
+                        clicked[0]=True
+                    return 'bounded button names'
+                def screenshot(file): file.write_bytes(b'raw panel');return {'path':str(file),'bytes':9,'sha256':'b'*64,'width':1000,'height':700}
+                with patch.object(native.time,'monotonic',side_effect=lambda:clock[0]), patch.object(native.time,'sleep',side_effect=lambda amount:clock.__setitem__(0,clock[0]+amount)), \
+                     patch.object(native,'read_json',side_effect=read), patch.object(native,'os_input',side_effect=os_input), patch.object(native,'screenshot',side_effect=screenshot):
+                    native.serve_native_actions(Process(),proof,challenge,proof)
+                response = json.loads((proof / 'native-action-result.json').read_text())
+                self.assertEqual(response['pass'],mode in ('delayed','late-button'))
+                if response['pass']:
+                    self.assertEqual(response['trust_call']['result']['response'],0)
+                    self.assertEqual(response['native_call']['result']['filePaths'],[str(target)])
+                    self.assertTrue(clicked[0]);self.assertLess(clock[0],20)
+                else:
+                    self.assertTrue(response['error']);self.assertIn('failure_image',response)
+                    if mode in ('missing-trust','wrong-action','wrong-path','wrong-buttons','early-trust','duplicate-trust','foreign-ledger','wrong-panel'): self.assertFalse(clicked[0])
+
     def test_native_closed_select_typeahead_requires_real_effects(self):
         # MODELS ONLY: execute the actual helper; no model success claims native platform qualification.
         code = r"""

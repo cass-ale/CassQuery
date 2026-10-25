@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Source identity and portable candidate evidence; never publishes anything."""
 import argparse
+from functools import lru_cache
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -9,6 +11,7 @@ from pathlib import Path, PurePosixPath
 import plistlib
 import re
 import shutil
+import stat
 import subprocess
 import time
 
@@ -760,21 +763,43 @@ def validate_preload_proof(main, result, source_records=None):
     return identity
 
 
+QUALIFICATION_FILES = {'workbench': 'workbench_native_smoke.py', 'update': 'update_smoke.py'}
+
+
+@lru_cache(maxsize=2)
+def _compile_qualification_module(path, code_sha256, data):
+    """Cache trusted code only; execute the exact freshly hashed bytes, never stale pyc."""
+    spec = importlib.util.spec_from_file_location('qualification_' + Path(path).stem, path)
+    module = importlib.util.module_from_spec(spec)
+    exec(compile(data, path, 'exec', dont_inherit=True), module.__dict__)
+    return module
+
+
+def load_qualification_module(name):
+    """Recheck local producer code every call; no report selects a path or executor."""
+    require(name in QUALIFICATION_FILES, 'unknown trusted qualification producer')
+    path = Path(__file__).absolute().with_name(QUALIFICATION_FILES[name])
+    require(path.resolve() == path and not path.is_symlink(), 'qualification producer path is not canonical trusted local code')
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, 'rb') as source:
+        info = os.fstat(source.fileno())
+        require(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= 1024 * 1024,
+                'qualification producer must be bounded regular local source')
+        data = source.read(1024 * 1024 + 1)
+    require(0 < len(data) <= 1024 * 1024, 'qualification producer code exceeds limit')
+    return _compile_qualification_module(str(path), hashlib.sha256(data).hexdigest(), data)
+
+
 def verify_feature_report(root, report_path, report, manifest, records, name):
     """Replay trusted producer contracts without running CAD or app code in promotion."""
     require(report.get('source_fingerprint') == manifest['source_fingerprint']
             and report.get('after_fingerprint') == manifest['source_fingerprint'], 'native feature source changed during proof')
     if name == 'workbench':
         require(report.get('qualifies_workbench') is True, 'editor subset/blocked native dialogs cannot qualify the workbench')
-        filename, function = 'workbench_native_smoke.py', 'validate_qualification'
     else:
         require(report.get('kind') == 'native-update-fixture' and report.get('native_execution') is True
                 and report.get('fixture_only') is True, 'missing native install/rollback mechanism proof')
-        filename, function = 'update_smoke.py', 'validate_report'
-    import importlib.util
-    spec = importlib.util.spec_from_file_location('qualification_' + name, Path(__file__).with_name(filename))
-    producer = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(producer)
+    producer = load_qualification_module(name)
     directory = relative_file(root, report_path).parent
     try:
         if name == 'workbench':

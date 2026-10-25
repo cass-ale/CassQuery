@@ -292,6 +292,58 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
   const key = (keyCode, modifiers = []) => { win.webContents.sendInputEvent({ type: 'keyDown', keyCode, modifiers }); win.webContents.sendInputEvent({ type: 'keyUp', keyCode, modifiers }); };
   const modifier = process.platform === 'darwin' ? 'meta' : 'control';
   const shortcut = (code) => key(code, [modifier]);
+  async function selectOption(selector, value) {
+    const specification = selector === '#theme-select' ? { key:'theme', allowed:['counterform-dark','counterform-light','graphite','midnight','forest','sand','paper','high-contrast'] }
+      : selector === '#tab-size' ? { key:'tabSize', allowed:['2','4'] } : null;
+    assert.ok(specification && specification.allowed.includes(value), 'Unsupported assurance select target');
+    report.select_diagnostics ||= [];
+    const audit={method:'native keyboard closed-select typeahead',selector,expected_value:value,phases:[],pass:false};
+    const persist=()=>fs.writeFileSync(path.join(directory,'select-diagnostics.json'),JSON.stringify(report.select_diagnostics,null,2)+'\n');
+    report.select_diagnostics.push(audit);
+    async function observed(phase) {
+      const result=await js(`(() => {const e=document.querySelector(${JSON.stringify(selector)}),r=window.__cqNativeSelectAudit;
+        if(r)r.phase=${JSON.stringify(phase)};
+        return {phase:${JSON.stringify(phase)},active:document.activeElement?.id,disabled:e.disabled,open:e.matches(':open'),value:e.value,index:e.selectedIndex,
+          theme:document.documentElement.dataset.theme,events:r?.events||[],dropped:r?.dropped||0};})()`);
+      result.persisted=JSON.parse(fs.readFileSync(path.join(process.env.CASSQUERY_USER_DATA,'workbench-settings.json')));
+      audit.phases.push(result);persist();return result;
+    }
+    await js(`(() => {if(window.__cqNativeSelectAudit)throw new Error('Native select observer already owned');
+      const recorder={phase:'focus navigation',events:[],dropped:0};recorder.listener=event=>{if(recorder.events.length>=500){recorder.dropped++;return;}
+        const select=document.querySelector(${JSON.stringify(selector)});recorder.events.push({type:event.type,key:event.key,phase:recorder.phase,
+          target:event.target?.id,value:select.value,index:select.selectedIndex,trusted:event.isTrusted});};
+      for(const type of ['focusin','focusout','keypress','input','change'])document.addEventListener(type,recorder.listener,true);
+      window.__cqNativeSelectAudit=recorder;})()`);
+    try {
+      await waitFor(win,`document.getElementById('settings-dialog').open && !!document.activeElement?.closest('#settings-dialog')`,5000);
+      const target=selector.slice(1);
+      if(await js(`document.activeElement.id===${JSON.stringify(target)}`)){key('Tab');await waitFor(win,`document.activeElement.id!==${JSON.stringify(target)}`,5000);}
+      for(let steps=0;await js(`document.activeElement.id!==${JSON.stringify(target)}`);steps++){
+        assert.ok(steps<32,'Native select focus was not reached within bounded keyboard navigation');key('Tab');
+        await js('new Promise(resolve=>requestAnimationFrame(resolve))');
+      }
+      const before=await observed('closed select focused');assert.equal(before.active,target);assert.equal(before.disabled,false);assert.equal(before.open,false);
+      const option=await js(`Array.from(document.querySelector(${JSON.stringify(selector)}).options).map((option,index)=>({value:option.value,label:option.text,index})).filter(option=>option.value===${JSON.stringify(value)})`);
+      assert.equal(option.length,1);assert.ok(option[0].label.length>0&&option[0].label.length<=80&&/^[\x20-\x7e]+$/.test(option[0].label));
+      await js("window.__cqNativeSelectAudit.phase='native typeahead characters'");
+      for(const character of option[0].label)win.webContents.sendInputEvent({type:'char',keyCode:character});
+      await waitFor(win,`(() => {const e=document.querySelector(${JSON.stringify(selector)}),r=window.__cqNativeSelectAudit;
+        return document.activeElement===e&&!e.matches(':open')&&e.value===${JSON.stringify(value)}&&e.selectedIndex===${option[0].index}&&
+          ['input','change'].every(type=>r.events.some(event=>event.phase==='native typeahead characters'&&event.type===type&&event.target===e.id&&event.value===${JSON.stringify(value)}&&event.trusted));})()`,5000);
+      if(specification.key==='theme')await waitFor(win,`document.documentElement.dataset.theme===${JSON.stringify(value)}`,5000);
+      await until('actual selected setting persisted',()=>{
+        const stored=JSON.parse(fs.readFileSync(path.join(process.env.CASSQUERY_USER_DATA,'workbench-settings.json')));
+        return stored[specification.key]===(specification.key==='tabSize'?Number(value):value);
+      });
+      await observed('native value/change/persistence acknowledged');key('Tab');
+      await waitFor(win,`document.activeElement.id!==${JSON.stringify(target)}`,5000);
+      await observed('native blur resets typeahead');audit.pass=true;persist();
+    }catch(error){
+      try{await observed('failure before throw');}catch(diagnosticError){audit.diagnostic_error=diagnosticError.message;persist();}
+      try{await image('select-failure-'+specification.key);}catch(captureError){audit.capture_error=captureError.message;persist();}
+      throw error;
+    }finally{await js(`(() => {const r=window.__cqNativeSelectAudit;if(r){for(const type of ['focusin','focusout','keypress','input','change'])document.removeEventListener(type,r.listener,true);delete window.__cqNativeSelectAudit;}})()`);}
+  }
   async function text(selector, value) {
     assert.ok(Buffer.byteLength(value) <= 16384, 'Probe text exceeds public-fixture input bound');
     report.text_diagnostics ||= [];
@@ -486,17 +538,15 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
     const themeIds = ['counterform-dark', 'counterform-light', 'graphite', 'midnight', 'forest', 'sand', 'paper', 'high-contrast'];
     const states = [];
     for (let i = 0; i < themeIds.length; i++) {
-      await click(win, '#settingsbtn'); await click(win, '#theme-select'); key('Escape'); key('Home');
-      const options = await js(`Array.from(document.getElementById('theme-select').options).map((o)=>o.value)`), index = options.indexOf(themeIds[i]); assert.ok(index >= 0);
-      for (let j = 0; j < index; j++) key('Down'); key('Enter');
-      await waitFor(win, `document.documentElement.dataset.theme === ${JSON.stringify(themeIds[i])}`); await click(win, '#settings-close');
+      await click(win, '#settingsbtn'); await selectOption('#theme-select', themeIds[i]);
+      await click(win, '#settings-close');
       const stored = JSON.parse(fs.readFileSync(path.join(process.env.CASSQUERY_USER_DATA, 'workbench-settings.json'))); assert.equal(stored.theme, themeIds[i]);
       const styling = await js(`(() => {const s=getComputedStyle(document.body);return [s.backgroundColor,s.color,getComputedStyle(document.documentElement).getPropertyValue('--panel')].join('|')})()`);
       const captured = await image('theme-' + themeIds[i]); states.push({ name: THEMES[i], styling, persisted: true, visible: true, image_sha256: captured.sha256 });
     }
     check('eight-themes', { states });
     await click(win, '#settingsbtn'); await text('#editor-font-size', '22'); key('Tab');
-    await click(win, '#tab-size'); key('Escape'); key('Home'); key('Enter'); await click(win, '#settings-close');
+    await selectOption('#tab-size', '2'); await click(win, '#settings-close');
     await waitFor(win, `parseFloat(getComputedStyle(document.getElementById('source-editor')).fontSize) === 22`);
     await new Promise((resolve, reject) => {
       const contents = win.webContents;

@@ -469,30 +469,55 @@ async function settledCamera(win, timeoutMs = 10000) {
 }
 
 async function dragCamera(win, button) {
-  const point = await evaluate(win, `(() => { const canvas=document.querySelector('#stage canvas'), r=canvas.getBoundingClientRect();
-    window.__cqSmokePointer = null;
-    window.__cqSmokeMove = e => { window.__cqSmokePointer={x:e.clientX,y:e.clientY,buttons:e.buttons}; };
+  assert.ok(button === 'left' || button === 'right', 'Unsupported native camera button');
+  const trace = {button,method:'observed native pointer gesture',status:'pending',sent:[],observations:[]};
+  const point = await evaluate(win, `(() => { const canvas=document.querySelector('#stage canvas'),r=canvas.getBoundingClientRect();
+    window.__cqSmokePointer = null;window.__cqSmokeDown=null;window.__cqSmokeUp=null;window.__cqSmokePointerEvents=[];window.__cqSmokePointerDropped=0;
+    window.__cqSmokeMove=e=>{window.__cqSmokePointer={x:e.clientX,y:e.clientY,buttons:e.buttons};};
+    window.__cqSmokeEvent=e=>{const record={type:e.type,x:e.clientX,y:e.clientY,button:e.button,buttons:e.buttons,pointer_id:e.pointerId,
+      trusted:e.isTrusted,target:e.target===canvas?'canvas':e.target?.id||e.target?.tagName,captured:Number.isInteger(e.pointerId)&&canvas.hasPointerCapture(e.pointerId),
+      movement_x:e.movementX,movement_y:e.movementY};
+      if(window.__cqSmokePointerEvents.length<80)window.__cqSmokePointerEvents.push(record);else window.__cqSmokePointerDropped++;
+      if(e.type==='pointerdown'&&e.target===canvas)window.__cqSmokeDown=record;
+      if(e.type==='pointerup'&&e.target===canvas)window.__cqSmokeUp=record;};
     canvas.addEventListener('pointermove',window.__cqSmokeMove);
-    return {x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2)}; })()`);
-  const modifiers = [button === 'left' ? 'leftButtonDown' : 'rightButtonDown'];
-  let error;
+    for(const type of ['pointerdown','pointermove','pointerup','pointercancel','gotpointercapture','lostpointercapture','contextmenu'])document.addEventListener(type,window.__cqSmokeEvent,true);
+    const x=Math.round(r.left+r.width/2),y=Math.round(r.top+r.height/2);
+    return{x,y,rect:[r.left,r.top,r.right,r.bottom],viewport:[innerWidth,innerHeight],scroll:[scrollX,scrollY],hit:document.elementFromPoint(x,y)===canvas}; })()`);
+  trace.start=point;
+  const mask=button==='left'?1:2,number=button==='left'?0:2,modifiers=[button==='left'?'leftButtonDown':'rightButtonDown'];
+  let error,pressed=false,last={x:point.x,y:point.y};
+  const send=input=>{trace.sent.push(input);win.webContents.sendInputEvent(input);};
+  async function observe(phase){const state=await evaluate(win,`(() => {const c=document.querySelector('#stage canvas'),r=c.getBoundingClientRect();return{phase:${JSON.stringify(phase)},pointer:window.__cqSmokePointer,down:window.__cqSmokeDown,up:window.__cqSmokeUp,events:window.__cqSmokePointerEvents,dropped_events:window.__cqSmokePointerDropped,
+    rect:[r.left,r.top,r.right,r.bottom],viewport:[innerWidth,innerHeight],scroll:[scrollX,scrollY],document_focused:document.hasFocus(),
+    hit:document.elementFromPoint(${last.x},${last.y})===c,capture:window.__cqSmokeDown?c.hasPointerCapture(window.__cqSmokeDown.pointer_id):false};})()`);
+    state.window_focused=typeof win.isFocused==='function'?win.isFocused():null;trace.observations.push(state);return state;}
   try {
-    win.webContents.sendInputEvent({ type: 'mouseMove', ...point });
-    win.webContents.sendInputEvent({ type: 'mouseDown', button, clickCount: 1, ...point });
-    for (let step = 1; step <= 10; step++) {
-      const x = point.x + step * 8, y = point.y + step * 3;
-      win.webContents.sendInputEvent({ type: 'mouseMove', x, y, modifiers });
-      await waitFor(win, `window.__cqSmokePointer?.x===${x} && window.__cqSmokePointer?.y===${y} && window.__cqSmokePointer?.buttons===${button === 'left' ? 1 : 2}`, 2000);
+    assert.ok(point.hit&&point.x>=0&&point.y>=0&&point.x+80<Math.min(point.rect[2],point.viewport[0])&&point.y+30<Math.min(point.rect[3],point.viewport[1]),'Native camera drag is outside its visible canvas');
+    win.focus();await waitFor(win,'document.hasFocus()',2000);assert.equal(win.isFocused(),true,'Native camera window is not focused');
+    const ready=await observe('before native press');assert.ok(ready.hit&&JSON.stringify(ready.rect)===JSON.stringify(point.rect)&&JSON.stringify(ready.viewport)===JSON.stringify(point.viewport),'Native camera canvas moved before press');
+    send({type:'mouseMove',button,x:point.x,y:point.y});
+    pressed=true;send({type:'mouseDown',button,clickCount:1,modifiers,x:point.x,y:point.y});
+    await waitFor(win,`window.__cqSmokeDown?.trusted===true&&window.__cqSmokeDown?.x===${point.x}&&window.__cqSmokeDown?.y===${point.y}&&window.__cqSmokeDown?.button===${number}&&window.__cqSmokeDown?.buttons===${mask}&&document.hasFocus()&&document.querySelector('#stage canvas').hasPointerCapture(window.__cqSmokeDown.pointer_id)`,2000);
+    await observe('pointerdown acknowledged');
+    for(let step=1;step<=10;step++){
+      last={x:point.x+step*8,y:point.y+step*3};send({type:'mouseMove',button,...last,modifiers});
+      await waitFor(win,`window.__cqSmokePointerDropped===0&&window.__cqSmokePointerEvents.some(e=>e.type==='pointermove'&&e.trusted&&e.target==='canvas'&&e.pointer_id===window.__cqSmokeDown.pointer_id&&e.x===${last.x}&&e.y===${last.y}&&e.buttons===${mask})`,2000);
+      await observe(`move ${step} acknowledged`);
     }
-  } catch (cause) { error = cause; throw cause; }
+  }catch(cause){error=cause;trace.status='failed';try{await observe('failure before release');}catch(diagnostic){trace.diagnostic_error=diagnostic.message;}throw cause;}
   finally {
-    try {
-      if (!win.isDestroyed()) {
-        win.webContents.sendInputEvent({ type: 'mouseUp', button, clickCount: 1, x: point.x + 80, y: point.y + 30 });
-        await evaluate(win, 'document.querySelector("#stage canvas").removeEventListener("pointermove",window.__cqSmokeMove);delete window.__cqSmokeMove;delete window.__cqSmokePointer');
-      }
-    } catch (cleanup) { if (error) error.message += `; pointer cleanup: ${cleanup.message}`; else throw cleanup; }
+    let cleanupError;
+    try{
+      if(win.isDestroyed())throw new Error('Native window closed before pointer release');
+      if(pressed){send({type:'mouseUp',button,clickCount:1,...last});await waitFor(win,`window.__cqSmokeUp?.trusted===true&&window.__cqSmokeUp?.buttons===0&&window.__cqSmokeUp?.button===${number}&&!document.querySelector('#stage canvas').hasPointerCapture(window.__cqSmokeDown.pointer_id)&&window.__cqSmokePointerEvents.some(e=>e.type==='lostpointercapture'&&e.pointer_id===window.__cqSmokeDown.pointer_id)`,2000);await observe('pointerup acknowledged');}
+    }catch(cleanup){cleanupError=cleanup;}
+    try{if(!win.isDestroyed())await evaluate(win,`(() => {const c=document.querySelector('#stage canvas');c.removeEventListener('pointermove',window.__cqSmokeMove);for(const type of ['pointerdown','pointermove','pointerup','pointercancel','gotpointercapture','lostpointercapture','contextmenu'])document.removeEventListener(type,window.__cqSmokeEvent,true);delete window.__cqSmokeMove;delete window.__cqSmokeEvent;delete window.__cqSmokePointer;delete window.__cqSmokePointerEvents;delete window.__cqSmokePointerDropped;delete window.__cqSmokeDown;delete window.__cqSmokeUp;})()`);}
+    catch(cleanup){if(cleanupError)cleanupError.message+=`; listener cleanup: ${cleanup.message}`;else cleanupError=cleanup;}
+    if(cleanupError){trace.status='failed';trace.cleanup_error=cleanupError.message;if(error)error.message+=`; pointer cleanup: ${cleanupError.message}`;else error=cleanupError;}
+    if(error){error.pointer_trace=trace;throw error;}
   }
+  trace.status='checked';return trace;
 }
 
 function assertResetCamera(state) {
@@ -546,7 +571,7 @@ async function productionControls(win, directory, evidence) {
     const row = { mode, status: 'pending', method: 'native pointer drag then Reset; observed at 700ms and 3s' };
     evidence.camera_checks.push(row);
     row.before = await cameraSnapshot(win);
-    await dragCamera(win, button);
+    try{row.pointer_drag=await dragCamera(win,button);}catch(error){row.pointer_drag=error.pointer_trace;throw error;}
     row.after_drag = await cameraSnapshot(win);
     if (mode === 'orbit') assert.ok(row.before.direction.reduce((n, v, i) => n + v * row.after_drag.direction[i], 0) < 0.999, 'Orbit input did not move camera');
     else assert.ok(Math.hypot(...row.after_drag.target.map((v, i) => v - row.before.target[i])) > row.before.radius * 0.001, 'Pan input did not move target');
@@ -597,7 +622,7 @@ async function smoke(win, directory, { nativeTheme, errors = [], evidence = {} }
     await click(win, '#resetview'); await delay(700);
     report.camera_save = { method: 'native orbit to non-default direction; observe settled camera before saving' };
     report.camera_save.before_drag = await cameraSnapshot(win);
-    await dragCamera(win, 'left');
+    try{report.camera_save.pointer_drag=await dragCamera(win,'left');}catch(error){report.camera_save.pointer_drag=error.pointer_trace;throw error;}
     report.camera_save.before_save = await settledCamera(win);
     assert.ok(report.camera_save.before_drag.direction.reduce((n, v, i) => n + v * report.camera_save.before_save.direction[i], 0) < 0.999, 'Save camera check used unchanged default view');
     report.camera_save.image = await capture(win, path.join(directory, 'save-camera.png')); report.images.push(report.camera_save.image);

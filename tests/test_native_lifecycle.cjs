@@ -7,6 +7,33 @@ const api=require('../shell/smoke.cjs');
 const graphics=require('../shell/renderer_config.cjs');
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
+test('native camera gesture carries coherent button state, observed capture and an event ledger through release',async()=>{
+ const source=fs.readFileSync(path.join(__dirname,'../shell/smoke.cjs'),'utf8').replaceAll(',2000)',',20)');
+ for(const mode of ['left','right','superseded','no-down','no-capture','lost-move','untrusted','no-release','covered','cleanup-error']){
+  const canvasListeners=new Map(),docListeners=new Map(),sent=[];let captured=false,cleaned=false;
+  const canvas={getBoundingClientRect:()=>({left:0,top:0,right:400,bottom:300,width:400,height:300}),hasPointerCapture:()=>captured,
+   addEventListener:(t,f)=>canvasListeners.set(t,f),removeEventListener:t=>canvasListeners.delete(t)};
+  const document={querySelector:()=>canvas,elementFromPoint:()=>mode==='covered'?{}:canvas,hasFocus:()=>true,
+   addEventListener:(t,f)=>docListeners.set(t,f),removeEventListener:t=>docListeners.delete(t)};
+  const renderer=vm.createContext({document,window:{},innerWidth:400,innerHeight:300,scrollX:0,scrollY:0});
+  const emit=(type,input,buttons)=>{const e={type,target:canvas,clientX:input.x,clientY:input.y,buttons,button:type==='pointermove'?-1:input.button==='right'?2:0,pointerId:1,isTrusted:mode!=='untrusted',movementX:8,movementY:3};docListeners.get(type)?.(e);canvasListeners.get(type)?.(e);};
+  const win={focus(){},isFocused:()=>true,isDestroyed:()=>false,webContents:{executeJavaScript:async code=>{
+   if(code.includes("c.removeEventListener('pointermove'")){cleaned=true;if(mode==='cleanup-error')throw Error('listener cleanup sentinel');}
+   return vm.runInContext(code,renderer);},sendInputEvent:input=>{
+    sent.push(input);const mask=input.modifiers?.includes('rightButtonDown')?2:input.modifiers?.includes('leftButtonDown')?1:0;
+    if(input.type==='mouseDown'){assert.equal(mask,input.button==='right'?2:1);if(mode==='no-down')return;captured=mode!=='no-capture';emit('pointerdown',input,mask);if(captured)emit('gotpointercapture',input,mask);}
+    if(input.type==='mouseMove'){assert.equal(input.button,mode==='left'?'left':'right');if(mode==='lost-move'&&mask)return;emit('pointermove',input,mask);if(mode==='superseded'&&mask)emit('pointermove',{...input,x:input.x+1,y:input.y+1},mask);}
+    if(input.type==='mouseUp'){if(mode==='no-release')return;captured=false;emit('pointerup',input,0);emit('lostpointercapture',input,0);}
+   }}};
+  const main=vm.createContext({require,process,Buffer,setTimeout,clearTimeout,module:{exports:{}}});vm.runInContext(source+'\nglobalThis.drag=dragCamera;',main);
+  if(['left','right','superseded'].includes(mode)){
+   const result=await main.drag(win,mode==='left'?'left':'right');assert.equal(result.status,'checked');assert.equal(sent.filter(e=>e.type==='mouseDown').length,1);assert.equal(sent.filter(e=>e.type==='mouseMove'&&e.modifiers?.length).length,10);assert.equal(sent.at(-1).type,'mouseUp');assert.equal(result.observations.at(-1).phase,'pointerup acknowledged');
+   if(mode==='superseded')assert.notEqual(result.observations[2].pointer.x,sent[2].x,'Ledger must admit an observed requested move even after the last scalar changes');
+  }else{await assert.rejects(main.drag(win,'right'),error=>{assert.equal(error.pointer_trace.status,'failed');assert.ok(error.pointer_trace.observations.length||mode==='covered');return true;});}
+  assert.equal(cleaned,true);if(mode!=='cleanup-error'){assert.equal(canvasListeners.size,0);assert.equal(docListeners.size,0);}
+ }
+});
+
 test('normal close waits for actual closed; veto/throw/already-dead/false-closed stay red with no destroy bypass',async()=>{
  for(const mode of ['immediate','pending','veto','throw','false-closed','already-dead']){
   const win=new EventEmitter();let dead=mode==='already-dead',destroyCalls=0;

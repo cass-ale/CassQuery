@@ -484,6 +484,48 @@ class WorkbenchContractTests(unittest.TestCase):
         result = subprocess.run([self.node, str(SUITE), '--skip-native'], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 2)
 
+    def test_native_closed_select_typeahead_requires_real_effects(self):
+        # MODELS ONLY: execute the actual helper; no model success claims native platform qualification.
+        code = r"""
+const fs=require('node:fs'),path=require('node:path'),os=require('node:os'),vm=require('node:vm'),assert=require('node:assert/strict');
+const source=fs.readFileSync(process.argv[2],'utf8'),start=source.indexOf('  async function selectOption(selector, value) {'),end=source.indexOf('  async function text(selector, value)',start);assert.ok(start>0&&end>start);
+async function model(mode){
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'cq-select-MODEL-')),report={},events=new Map(),tabs=mode==='tabs';
+ const selector=tabs?'#tab-size':'#theme-select',value=tabs?'2':'counterform-dark',label=tabs?'2 spaces':'Counterform Dark';
+ const input={id:selector.slice(1),disabled:mode==='disabled',value:tabs?'4':'system',selectedIndex:0,matches:()=>mode==='popup',
+  options:[{value:tabs?'4':'system',text:tabs?'4 spaces':'System'},{value,text:label}]};
+ const close={id:'settings-close',closest:()=>({})},after={id:'after',closest:()=>({})};input.closest=()=>({});
+ const document={activeElement:close,documentElement:{dataset:{theme:'counterform-light'}},querySelector:()=>input,getElementById:()=>({open:true}),
+  addEventListener(type,listener){events.set(type,listener);},removeEventListener(type){events.delete(type);}};
+ const window={},context=vm.createContext({window,document,JSON,requestAnimationFrame:callback=>callback()});let typed='';
+ const settingsFile=path.join(directory,'workbench-settings.json');fs.writeFileSync(settingsFile,JSON.stringify({theme:'system',tabSize:4}));
+ const win={webContents:{sendInputEvent(event){assert.equal(event.type,'char');assert.ok(!event.modifiers);typed+=event.keyCode;
+  if(typed===label&&mode!=='noop'){
+   input.value=mode==='wrong-value'?'foreign':value;input.selectedIndex=mode==='wrong-value'?0:1;
+   if(mode!=='no-event')for(const type of ['input','change'])events.get(type)?.({type,target:input,isTrusted:mode!=='untrusted'});
+   document.documentElement.dataset.theme=value;
+   if(mode!=='unchanged-persist')fs.writeFileSync(settingsFile,JSON.stringify({theme:value,tabSize:Number(value)}));
+  }
+ }}};
+ const globals={assert,report,fs,path,directory,win,process:{env:{CASSQUERY_USER_DATA:directory}},
+  js:async code=>vm.runInContext(code,context),waitFor:async(_win,code)=>{if(!vm.runInContext(code,context))throw Error('Observed condition missing');},
+  key:code=>{assert.equal(code,'Tab');if(mode!=='wrong-focus')document.activeElement=document.activeElement===input?after:input;},
+  until:async(_label,predicate)=>{const value=await predicate();if(!value)throw Error('Persisted effect missing');return value;},image:async()=>{}};
+ vm.runInNewContext(source.slice(start,end)+'globalThis.actualSelect=selectOption;',globals);
+ try{
+  if(['healthy','tabs'].includes(mode)){await globals.actualSelect(selector,value);assert.equal(input.value,value);assert.equal(document.activeElement,after);}
+  else await assert.rejects(globals.actualSelect(selector,value));
+  const audit=JSON.parse(fs.readFileSync(path.join(directory,'select-diagnostics.json')))[0];assert.equal(audit.pass,['healthy','tabs'].includes(mode));
+  assert.equal(audit.method,'native keyboard closed-select typeahead');assert.ok(audit.phases.length>0);
+  assert.ok(!window.__cqNativeSelectAudit&&events.size===0);
+ }finally{fs.rmSync(directory,{recursive:true,force:true});}
+}
+(async()=>{for(const mode of['healthy','tabs','wrong-focus','popup','disabled','noop','no-event','untrusted','wrong-value','unchanged-persist'])await model(mode);})().catch(error=>{console.error(error);process.exitCode=1;});
+"""
+        file = self.output / 'native-select-models.cjs'; file.write_text(code)
+        result = subprocess.run([self.node, str(file), str(ROOT / 'tools/native_workbench_probe.cjs')], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_capture_waits_for_certified_identity_not_stable_preview(self):
         # Explicit scheduler/layout MODELS exercising the real serialized readiness code.
         code = r"""

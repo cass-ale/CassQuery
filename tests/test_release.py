@@ -113,6 +113,12 @@ class ReleaseContractTests(unittest.TestCase):
     def test_explicit_packaged_software_renderer_is_required(self):
         self.mutation("CASSQUERY_ANGLE: 'swiftshader'", "CASSQUERY_ANGLE: 'metal'")
 
+    def test_whole_candidate_budget_is_explicit_and_bounded(self):
+        for value in ('60', '0', '360'):
+            with self.subTest(value=value):
+                self.mutation('timeout-minutes: 90', 'timeout-minutes: ' + value)
+        self.mutation('    timeout-minutes: 90\n', '')
+
     def test_job_level_skip_is_rejected(self):
         self.mutation('  candidate:\n', '  candidate:\n    if: false\n')
 

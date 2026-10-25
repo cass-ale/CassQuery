@@ -12,8 +12,17 @@ test('normal close waits for actual closed; veto/throw/already-dead/false-closed
   const win=new EventEmitter();let dead=mode==='already-dead',destroyCalls=0;
   win.isDestroyed=()=>dead;win.destroy=()=>{destroyCalls++;throw Error('destroy forbidden');};
   win.close=()=>{const closed=()=>{dead=mode!=='false-closed';win.emit('closed');};if(mode==='immediate'||mode==='false-closed')closed();if(mode==='pending')setTimeout(closed,5);if(mode==='throw')throw Error('close sentinel');};
-  if(mode==='immediate'||mode==='pending')await api.closeWindow(win,30);else await assert.rejects(api.closeWindow(win,30));
+  if(mode==='immediate'||mode==='pending')await api.closeWindow(win,1000);else await assert.rejects(api.closeWindow(win,30));
   assert.equal(win.listenerCount('closed'),0);assert.equal(destroyCalls,0);
+ }
+});
+test('controlled scheduler delay exposes too-tight positive budget without relaxing deadline rejection',async()=>{
+ for(const budget of [30,1000]){
+  const win=new EventEmitter();const events=[];let dead=false,destroyCalls=0;
+  win.isDestroyed=()=>dead;win.destroy=()=>{destroyCalls++;throw Error('destroy forbidden');};
+  win.close=()=>{events.push('close');setTimeout(()=>{dead=true;events.push('closed');win.emit('closed');},5);queueMicrotask(()=>{const end=performance.now()+45;while(performance.now()<end){}});};
+  if(budget===30)await assert.rejects(api.closeWindow(win,budget),/timed out|deadline/);else await api.closeWindow(win,budget);
+  assert.deepEqual(events,['close','closed']);assert.equal(dead,true);assert.equal(win.listenerCount('closed'),0);assert.equal(destroyCalls,0);
  }
 });
 test('pending execution and late true result cannot exceed the budget and be graded ready',async()=>{
@@ -55,7 +64,7 @@ async function mainFixture({closeMode='pending',failSmoke=false,lateError=false,
   if(name==='electron')return{app,BrowserWindow:Win,Menu:{},nativeTheme:{},screen:{getDisplayMatching:()=>({bounds:{width:1920,height:1080},workArea:{width:1920,height:1080},scaleFactor:1})}};
   if(name==='./renderer_config.cjs')return graphics;
   if(name==='./runtime.cjs')return{stopWorker:async()=>{worker.exitCode=0;if(shutdownError)throw Error('shutdown sentinel');}};
-  if(name==='./smoke.cjs')return{...api,closeWindow:win=>api.closeWindow(win,30),smoke:async(_w,_d,{evidence})=>{if(failSmoke)throw Error('primary smoke sentinel');evidence.pass=true;return evidence;}};
+  if(name==='./smoke.cjs')return{...api,closeWindow:win=>api.closeWindow(win,closeMode==='veto'?30:1000),smoke:async(_w,_d,{evidence})=>{if(failSmoke)throw Error('primary smoke sentinel');evidence.pass=true;return evidence;}};
   if(name==='node:child_process')return{spawn:()=>{const secondary=Object.assign(new EventEmitter(),{pid:101,kill(){}});setImmediate(()=>{app.emit('second-instance');secondary.emit('exit',0);});return secondary;}};
   return require(name);
  };
@@ -72,7 +81,7 @@ test('capture uses one absolute budget across dimensions and native CDP phases',
    let attached=false,detached=0;const file=path.join(directory,`phase-${phaseMs}.png`);
    const debuggerAPI={isAttached:()=>attached,attach:()=>{attached=true;},detach:()=>{attached=false;detached++;},sendCommand:async()=>{await sleep(phaseMs);return{data:bytes.toString('base64')};}};
     const win={webContents:{debugger:debuggerAPI,executeJavaScript:async expression=>{if(expression.includes('decodeVisibleImages'))return;await sleep(phaseMs);return{width:100,height:100};}}};
-   if(pass){const image=await api.capture(win,file,100);assert.equal(image.width,100);assert.equal(fs.existsSync(file),true);}
+   if(pass){const image=await api.capture(win,file,1000);assert.equal(image.width,100);assert.equal(fs.existsSync(file),true);}
    else{await assert.rejects(api.capture(win,file,100),/timed out|deadline/);assert.equal(fs.existsSync(file),false);}
    assert.equal(attached,false);assert.equal(detached,1);
   }
@@ -93,7 +102,7 @@ test('capture waits pending image decode but rejects broken rendered images with
   const file=path.join(directory,'frame.png');
   try{
    if(mode==='broken'||mode==='decode-rejected'){await assert.rejects(context.module.exports.capture(win,file,100),/Image.*brand.svg/);assert.equal(sendCalls,0);assert.equal(fs.existsSync(file),false);}
-   else{await context.module.exports.capture(win,file,100);assert.equal(sendCalls,1);assert.equal(fs.existsSync(file),true);}
+   else{await context.module.exports.capture(win,file,1000);assert.equal(sendCalls,1);assert.equal(fs.existsSync(file),true);}
    assert.equal(attached,false);assert.equal(detached,1);if(mode==='broken'||mode==='hidden-broken')assert.equal(decodeCalls,0);
   }finally{fs.rmSync(directory,{recursive:true,force:true});}
  }
@@ -103,14 +112,14 @@ test('native input waits reachable geometry and rejects a persistent overlay/dis
  for(const mode of ['transient','overlay','disabled']){
   let reads=0;const events=[];
   const win={isDestroyed:()=>false,webContents:{executeJavaScript:async()=>({ready:mode==='transient'&&++reads>1,x:10,y:20,reason:mode}),sendInputEvent:e=>events.push(e)}};
-  if(mode==='transient'){await api.click(win,'#target',250);assert.equal(reads,2);assert.equal(events.length,3);}
+  if(mode==='transient'){await api.click(win,'#target',1000);assert.equal(reads,2);assert.equal(events.length,3);}
   else{await assert.rejects(api.click(win,'#target',20),/Unreachable control/);assert.equal(events.length,0);}
  }
 });
 test('renderer readiness waits actual stage/canvas dimensions and camera aspect, not viewport alone',async()=>{
  for(const mode of ['transient','stale']){
   let reads=0;const win={isDestroyed:()=>false,webContents:{executeJavaScript:async source=>{assert.ok(source.includes('canvas.width'));assert.ok(source.includes('camera.aspect'));return{ready:mode==='transient'&&++reads>1,viewport:[450,700],stage:[0,0,450,364],canvas:[0,0,1024,773,1024,773]};}}};
-  if(mode==='transient'){await api.waitRendererLayout(win,250);assert.equal(reads,2);}
+  if(mode==='transient'){await api.waitRendererLayout(win,1000);assert.equal(reads,2);}
   else await assert.rejects(api.waitRendererLayout(win,20),/(?:layout timed out|exceeded its deadline).*1024/);
  }
 });

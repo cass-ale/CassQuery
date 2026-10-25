@@ -107,6 +107,7 @@ def check(root=ROOT, python_manifest=None):
     document = yaml.safe_load(workflow)
     assert document['permissions'] == {'contents': 'read'}, 'excess workflow permissions'
     job = document['jobs']['candidate']
+    assert type(job.get('timeout-minutes')) is int and job['timeout-minutes'] == 90, 'native candidate requires its reviewed bounded 90-minute whole-job budget'
     assert job['env'].get('CSC_FOR_PULL_REQUEST') == 'true', 'PR ad-hoc sealing must not be skipped'
     assert job['env'].get('CASSQUERY_ANGLE') == 'swiftshader' and 'CASSQUERY_SOFTWARE_GL' not in job['env'], 'macOS CI must explicitly exercise the bundled software renderer'
     assert builder.get('afterPack') == './tools/package_renderer.cjs', 'software renderer discovery closure must be installed before sealing'

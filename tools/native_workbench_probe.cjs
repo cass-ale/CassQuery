@@ -4,8 +4,66 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
+const { isDeepStrictEqual } = require('node:util');
 const { pngDimensions } = require('./integration_suite.cjs');
 const { request, recordWorkbenchTraffic, validateEvidence, THEMES, captureScripts, canvasPixels, validateRendering } = require('./workbench_suite.cjs');
+const { settings: validateSettings } = require('../shell/desktop.cjs');
+const PRELOAD_KEYS = ['bytes','method','path','resources_path','schema','sha256','web_contents_id'];
+const BRIDGE_KEYS = ['onCommand','recovery','setDirty','settings','update','workbench'];
+
+function validatePreloadRecord(identity, { resourcesPath, webContentsId, nativeSource }) {
+  assert.ok(identity && typeof identity === 'object' && !Array.isArray(identity), 'Missing constructor preload identity');
+  assert.deepEqual(Object.keys(identity).sort(), PRELOAD_KEYS, 'Invalid constructor preload identity fields');
+  assert.equal(identity.schema, 1); assert.equal(identity.method, 'owned BrowserWindow constructor');
+  assert.ok(typeof resourcesPath === 'string' && path.isAbsolute(resourcesPath) && path.resolve(resourcesPath) === resourcesPath);
+  assert.equal(identity.resources_path, resourcesPath);
+  assert.ok(Number.isSafeInteger(webContentsId) && webContentsId > 0); assert.equal(identity.web_contents_id, webContentsId);
+  const expected = path.join(resourcesPath, 'app.asar', 'shell', 'preload.cjs');
+  assert.ok(typeof identity.path === 'string' && path.isAbsolute(identity.path));
+  assert.equal(identity.path, expected, 'Constructor preload path does not match actual app resources');
+  assert.ok(Number.isSafeInteger(identity.bytes) && identity.bytes > 0 && identity.bytes <= 1024 ** 2);
+  assert.match(identity.sha256, /^[a-f0-9]{64}$/);
+  assert.ok(nativeSource && Array.isArray(nativeSource.files) && nativeSource.files.length === 8 && new Set(nativeSource.files.map(file => file.path)).size === 8);
+  const source = nativeSource.files.find(file => file.path === 'shell/preload.cjs');
+  assert.ok(source && source.bytes === identity.bytes && source.sha256 === identity.sha256, 'Preload identity differs from executed shell source');
+  return expected;
+}
+function validatePreloadIdentity(identity, context) {
+  const expected = validatePreloadRecord(identity, context);
+  assert.equal(fs.lstatSync(expected).isSymbolicLink(), false, 'Preload must be a regular app resource');
+  assert.equal(fs.realpathSync(expected), expected, 'Preload path is not canonical');
+  const bytes = fs.readFileSync(expected);
+  assert.equal(bytes.length, identity.bytes); assert.equal(hash(bytes), identity.sha256, 'Actual preload bytes differ from constructor/source identity');
+}
+function validatePreloadIPC(evidence, report) {
+  assert.equal(evidence.node_integration, false); assert.equal(evidence.context_isolation, true); assert.equal(evidence.sandbox, true);
+  assert.equal(evidence.bridge_present, true); assert.equal(evidence.project_root_matches, true);
+  validatePreloadRecord(evidence.preload_identity, { resourcesPath: report.resources_path, webContentsId: report.web_contents_id, nativeSource: report.native_source });
+  assert.deepEqual(evidence.preload_identity, report.preload_identity);
+  assert.ok(Number.isSafeInteger(report.window_id) && report.window_id > 0);
+  assert.deepEqual(evidence.bridge.keys, BRIDGE_KEYS); assert.deepEqual(evidence.bridge.function_types, BRIDGE_KEYS.map(() => 'function'));
+  assert.equal(evidence.bridge.node_require_type, 'undefined'); assert.equal(evidence.bridge.node_process_type, 'undefined');
+  const ipc = evidence.ipc;
+  assert.equal(ipc.method, 'actual contextBridge invoke'); assert.equal(ipc.window_id, report.window_id); assert.equal(ipc.web_contents_id, report.web_contents_id);
+  assert.equal(ipc.origin, report.worker_origin);
+  const origin = new URL(ipc.origin); assert.equal(origin.protocol, 'http:'); assert.equal(origin.hostname, '127.0.0.1');
+  assert.ok(Number.isInteger(Number(origin.port)) && Number(origin.port) > 0 && Number(origin.port) <= 65535 && origin.origin === ipc.origin);
+  assert.deepEqual(ipc.settings_result, validateSettings(ipc.settings_result), 'Actual settings IPC response is incomplete or invalid');
+  assert.equal(ipc.workbench_http_status, 200); assert.deepEqual(ipc.workbench_http_response, ipc.workbench_result);
+  assert.ok(Array.isArray(report.worker_requests) && report.worker_requests.some(record => record.action === 'list' && record.project === 'WORKBENCHPLATE'
+    && record.status === 200 && isDeepStrictEqual(record.response, ipc.workbench_result)), 'Preload IPC response is not bound to an actual worker HTTP trace');
+  const listed = ipc.workbench_result;
+  assert.equal(listed.project, 'WORKBENCHPLATE'); assert.equal(listed.root, report.project_root);
+  assert.equal(listed.entry, 'part_entry.py'); assert.equal(Object.hasOwn(listed, 'error'), false);
+  assert.ok(typeof report.project_root === 'string' && path.isAbsolute(report.project_root));
+  assert.ok(Array.isArray(listed.files) && listed.files.length > 0 && listed.files.length <= 2048 && listed.files.every(file =>
+    typeof file.path === 'string' && file.path && !path.isAbsolute(file.path) && !file.path.includes('\\') && file.path.split('/').every(part => part && part !== '.' && part !== '..')
+    && Number.isSafeInteger(file.bytes) && file.bytes >= 0 && ['python','json','asset'].includes(file.kind)) &&
+    listed.files.some(file => file.path === listed.entry && file.kind === 'python' && Number.isSafeInteger(file.bytes) && file.bytes > 0) &&
+    listed.files.some(file => file.path === 'viewer.json' && file.kind === 'json' && file.bytes > 0) && new Set(listed.files.map(file => file.path)).size === listed.files.length,
+    'Actual worker IPC project/file response is incomplete');
+  assert.equal(listed.read_only, false);
+}
 const CHECKS = ['preload-ipc', 'edit-save-volume', 'external-conflict', 'syntax-retains-certified', 'eight-themes', 'font-tabs'];
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -27,8 +85,7 @@ function validateEditorReport(report, directory) {
   for (const check of report.checks) {
     assert.equal(check.pass, true);
     if (check.id === 'preload-ipc') {
-      assert.equal(check.evidence.node_integration, false); assert.equal(check.evidence.context_isolation, true); assert.equal(check.evidence.sandbox, true);
-      assert.equal(check.evidence.bridge_present, true); assert.equal(check.evidence.project_root_matches, true);
+      validatePreloadIPC(check.evidence, report);
     } else validateEvidence(check.id, check.evidence);
   }
   const root = fs.realpathSync(directory);
@@ -188,7 +245,7 @@ async function qualifyWorkbench(win, directory, context) {
   full.completed_at = Date.now(); write(); return full;
 }
 
-async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WORKBENCHPLATE', workerPort, workerPid, challenge, driver, native_source }) {
+async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WORKBENCHPLATE', workerPort, workerPid, challenge, driver, native_source, preload_identity, resources_path, worker_origin, window_id, web_contents_id }) {
   const { app } = require('electron');
   const bundled = path.join(process.resourcesPath, 'app.asar', 'shell');
   const { click, waitFor, evaluate, bounded, measureFrame } = require(path.join(bundled, 'smoke.cjs'));
@@ -206,12 +263,14 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
   const report = { schema: 1, platform: 'native-electron-workbench-editor', editor_checks_pass: false,
     qualifies_workbench: false, pass: false, packaged: app.isPackaged, app_pid: process.pid, worker_pid: workerPid,
     started_at: Date.now(), checks: [], images: [], errors: [], challenge, driver, native_source, worker_port: workerPort,
+    preload_identity, resources_path, worker_origin, window_id: win.id, web_contents_id: win.webContents.id, project_root: projectRoot,
     initial_project_selection: 'configured startup public fixture; not native OS dialog proof',
     native_dialog_selection: { status: 'blocked', reason: 'Native OS dialog selection was not exercised by this editor probe' },
     not_checked: ['native OS dialog selection/open-file events', 'STEP export/import through native chooser', 'update install/rollback', 'human visual approval'] };
   let end = Date.now() + 240000;
   const origin = 'http://127.0.0.1:' + workerPort;
   const traffic = recordWorkbenchTraffic(workerPort), frames = [], debuggerAPI = win.webContents.debugger;
+  report.worker_requests = traffic.trace;
   let ownsDebugger = false;
   const observeFrame = (_event, method, params) => {
     if (method === 'Network.webSocketFrameReceived' && frames.length < 1000) {
@@ -284,13 +343,29 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
     await bounded(() => debuggerAPI.sendCommand('Network.enable'), 10000, 'Native workbench network observer');
     const prefs = win.webContents.getLastWebPreferences();
     assert.equal(prefs.nodeIntegration, false); assert.equal(prefs.contextIsolation, true); assert.equal(prefs.sandbox, true);
-    assert.ok(typeof prefs.preload === 'string' && path.basename(prefs.preload) === 'preload.cjs', 'Actual restrictive preload is missing');
+    // Electron45's preference snapshot intentionally omits preload paths. Verify the constructor-bound identity and real bridge instead.
+    assert.equal(resources_path, process.resourcesPath); assert.equal(window_id, win.id); assert.equal(web_contents_id, win.webContents.id);
+    assert.equal(worker_origin, origin); assert.equal(new URL(win.webContents.getURL()).origin, worker_origin);
+    validatePreloadIdentity(preload_identity, { resourcesPath: process.resourcesPath, webContentsId: win.webContents.id, nativeSource: native_source });
     const status = (await request(origin, '/api/status')).json;
     const selected = status.projects.find((p) => p.name === projectName);
     assert.ok(selected && path.resolve(selected.root) === projectRoot, 'Wrapper must register the owned fixture through the actual startup project path');
     await waitFor(win, `!!window.cassquery?.workbench && !!document.getElementById('source-editor')`);
-    check('preload-ipc', { node_integration: prefs.nodeIntegration, context_isolation: prefs.contextIsolation,
-      sandbox: prefs.sandbox, bridge_present: true, project_root_matches: true });
+    const invocationStart = traffic.trace.length;
+    const observed = await js(`(async () => {
+      const bridge=window.cassquery,keys=Object.keys(bridge).sort();
+      return {bridge:{keys,function_types:keys.map(key=>typeof bridge[key]),node_require_type:typeof window.require,node_process_type:typeof window.process},
+        settings_result:await bridge.settings('get'),workbench_result:await bridge.workbench('list',{project:'WORKBENCHPLATE'})};
+    })()`);
+    assert.deepEqual(observed.bridge.keys, BRIDGE_KEYS); assert.deepEqual(observed.bridge.function_types, BRIDGE_KEYS.map(() => 'function'));
+    const listedResponse = await until('actual preload worker IPC response', () => traffic.trace.slice(invocationStart).find(record =>
+      record.action === 'list' && record.project === projectName && record.status === 200 && record.response && isDeepStrictEqual(record.response, observed.workbench_result)));
+    assert.deepEqual(observed.settings_result, require(path.join(bundled, 'desktop.cjs')).settings(observed.settings_result));
+    const preloadEvidence = { node_integration: prefs.nodeIntegration, context_isolation: prefs.contextIsolation,
+      sandbox: prefs.sandbox, bridge_present: true, project_root_matches: true, preload_identity, bridge: observed.bridge,
+      ipc: { method:'actual contextBridge invoke',window_id:win.id,web_contents_id:win.webContents.id,origin:worker_origin,
+        settings_result:observed.settings_result,workbench_result:observed.workbench_result,workbench_http_status:listedResponse.status,workbench_http_response:listedResponse.response } };
+    validatePreloadIPC(preloadEvidence, report); check('preload-ipc', preloadEvidence);
     const entry = path.join(projectRoot, 'part_entry.py'), original = fs.readFileSync(entry, 'utf8');
     assert.ok(original.includes('.box(40, 30, 6,'), 'Probe requires the unmodified public TESTPLATE geometry');
     await waitFor(win, `document.getElementById('source-editor').value === ${JSON.stringify(original)}`);
@@ -366,4 +441,4 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
   }
   return report;
 }
-module.exports = { CHECKS, FULL_CHECKS, ownedPath, probe, validateEditorReport };
+module.exports = { CHECKS, FULL_CHECKS, ownedPath, validatePreloadRecord, validatePreloadIdentity, validatePreloadIPC, probe, validateEditorReport };

@@ -664,6 +664,102 @@ def verify_dmg_mount(root, report_path, report, records):
     require(info.get('WritableVolume') is False, 'DMG mounted volume is not verifiably read-only')
 
 
+def validate_preload_proof(main, result, source_records=None):
+    """Constructor-bound preload plus real isolated bridge/IPC, not a getter field."""
+    required = {'schema', 'method', 'path', 'bytes', 'sha256', 'web_contents_id', 'resources_path'}
+    identity = main.get('preload_identity')
+    require(isinstance(identity, dict) and set(identity) == required and type(identity.get('schema')) is int
+            and identity['schema'] == 1 and identity.get('method') == 'owned BrowserWindow constructor',
+            'missing or unsupported constructor preload identity')
+    require(result.get('preload_identity') == identity, 'preload identity differs between actual main and renderer probe')
+    resources = main.get('resources_path')
+    require(isinstance(resources, str) and PurePosixPath(resources).is_absolute()
+            and resources == PurePosixPath(resources).as_posix() and '..' not in PurePosixPath(resources).parts
+            and resources.endswith('/Contents/Resources') and identity.get('resources_path') == resources
+            and result.get('resources_path') == resources, 'preload resource root differs from actual native application')
+    require(identity.get('path') == resources + '/app.asar/shell/preload.cjs', 'constructor preload is not the exact packed source path')
+    contents_id = main.get('web_contents_id')
+    require(type(contents_id) is int and contents_id > 0 and identity.get('web_contents_id') == contents_id
+            and type(identity['web_contents_id']) is int and result.get('web_contents_id') == contents_id
+            and type(result.get('web_contents_id')) is int, 'preload identity belongs to another web contents')
+    window_id = main.get('window_id')
+    require(type(window_id) is int and window_id > 0 and type(result.get('window_id')) is int
+            and result['window_id'] == window_id, 'preload proof belongs to another native window')
+    files = main.get('native_source', {}).get('files', [])
+    preload = [item for item in files if isinstance(item, dict) and item.get('path') == 'shell/preload.cjs']
+    require(len(preload) == 1 and type(identity.get('bytes')) is int and identity['bytes'] > 0
+            and identity['bytes'] == preload[0].get('bytes') and re.fullmatch(r'[0-9a-f]{64}', identity.get('sha256', ''))
+            and identity['sha256'] == preload[0].get('sha256'), 'constructor preload bytes differ from the native source closure')
+    if source_records is not None:
+        original = source_records.get('shell/preload.cjs', {})
+        require(original.get('sha256') == identity['sha256'] and original.get('bytes') == identity['bytes'],
+                'constructor preload differs from original release source')
+    checks = [check for check in result.get('checks', []) if isinstance(check, dict) and check.get('id') == 'preload-ipc']
+    require(len(checks) == 1 and checks[0].get('pass') is True and isinstance(checks[0].get('evidence'), dict), 'missing actual preload IPC check')
+    evidence = checks[0]['evidence']
+    require(evidence.get('node_integration') is False and evidence.get('context_isolation') is True
+            and evidence.get('sandbox') is True and evidence.get('bridge_present') is True
+            and evidence.get('project_root_matches') is True and evidence.get('preload_identity') == identity,
+            'preload IPC security or constructor provenance mismatch')
+    bridge = evidence.get('bridge', {})
+    keys = ['onCommand', 'recovery', 'setDirty', 'settings', 'update', 'workbench']
+    require(bridge.get('keys') == keys and bridge.get('function_types') == ['function'] * len(keys)
+            and bridge.get('node_require_type') == 'undefined' and bridge.get('node_process_type') == 'undefined',
+            'restrictive bridge is missing methods or exposes Node globals')
+    ipc = evidence.get('ipc', {})
+    origin = main.get('worker_origin')
+    require(isinstance(origin, str) and re.fullmatch(r'http://127\.0\.0\.1:[1-9][0-9]{0,4}', origin)
+            and int(origin.rsplit(':', 1)[1]) < 65536 and result.get('worker_origin') == origin,
+            'preload IPC is not bound to the actual worker origin')
+    require(ipc.get('method') == 'actual contextBridge invoke' and type(ipc.get('web_contents_id')) is int
+            and ipc['web_contents_id'] == contents_id and type(ipc.get('window_id')) is int
+            and ipc['window_id'] == window_id and ipc.get('origin') == origin,
+            'IPC receipt came from another frame/origin')
+    settings = ipc.get('settings_result', {})
+    settings_keys = {'schema', 'theme', 'editorFont', 'editorFontSize', 'tabSize', 'lineWrap', 'editorVisible',
+                     'autoBuild', 'reducedMotion', 'updateCheck', 'updateAutoDownload', 'updateChannel', 'recentProjects'}
+    require(isinstance(settings, dict) and set(settings) == settings_keys
+            and type(settings.get('schema')) is int and settings['schema'] == 1
+            and settings.get('theme') in ('system', 'counterform-dark', 'counterform-light', 'graphite', 'midnight', 'forest', 'sand', 'paper', 'high-contrast')
+            and settings.get('editorFont') in ('system-mono', 'menlo', 'sf-mono', 'consolas', 'monospace')
+            and type(settings.get('editorFontSize')) is int and 12 <= settings['editorFontSize'] <= 24
+            and type(settings.get('tabSize')) is int and settings['tabSize'] in (2, 4)
+            and all(type(settings.get(key)) is bool for key in ('lineWrap', 'editorVisible', 'autoBuild', 'updateAutoDownload'))
+            and settings.get('reducedMotion') in ('system', 'on') and settings.get('updateCheck') in ('enabled', 'manual')
+            and settings.get('updateChannel') == 'stable' and isinstance(settings.get('recentProjects'), list)
+            and len(settings['recentProjects']) <= 10 and all(isinstance(path, str) and PurePosixPath(path).is_absolute()
+                                                          for path in settings['recentProjects'])
+            and len(set(settings['recentProjects'])) == len(settings['recentProjects']), 'actual settings IPC response is missing or invalid')
+    project_root = main.get('project_root')
+    require(isinstance(project_root, str) and PurePosixPath(project_root).is_absolute()
+            and project_root == PurePosixPath(project_root).as_posix() and '..' not in PurePosixPath(project_root).parts
+            and result.get('project_root') == project_root, 'preload project root differs from actual native launch')
+    workbench = ipc.get('workbench_result', {})
+    require(isinstance(workbench, dict) and 'error' not in workbench and workbench.get('project') == 'WORKBENCHPLATE'
+            and workbench.get('entry') == 'part_entry.py' and workbench.get('root') == project_root
+            and workbench.get('read_only') is False
+            and ipc.get('workbench_http_status') == 200 and type(ipc.get('workbench_http_status')) is int
+            and ipc.get('workbench_http_response') == workbench, 'workbench IPC response does not match real worker HTTP evidence')
+    traffic = result.get('worker_requests')
+    require(isinstance(traffic, list) and 0 < len(traffic) <= 10000 and any(isinstance(record, dict)
+            and record.get('action') == 'list' and record.get('project') == 'WORKBENCHPLATE'
+            and type(record.get('status')) is int and record['status'] == 200 and record.get('response') == workbench
+            for record in traffic), 'preload IPC response is not present in actual worker HTTP observations')
+    entries = workbench.get('files')
+    require(isinstance(entries, list) and entries and len(entries) <= 2048 and all(isinstance(item, dict)
+            and isinstance(item.get('path'), str) and not PurePosixPath(item['path']).is_absolute()
+            and all(part not in ('', '.', '..') for part in item['path'].split('/'))
+            and type(item.get('bytes')) is int and item['bytes'] >= 0 and item.get('kind') in ('python', 'json', 'asset')
+            for item in entries) and len({item['path'] for item in entries}) == len(entries)
+            and {'part_entry.py', 'viewer.json'}.issubset({item['path'] for item in entries}),
+            'workbench IPC omitted or duplicated the actual project source inventory')
+    by_path = {item['path']: item for item in entries}
+    require(by_path['part_entry.py']['kind'] == 'python' and by_path['part_entry.py']['bytes'] > 0
+            and by_path['viewer.json']['kind'] == 'json' and by_path['viewer.json']['bytes'] > 0,
+            'workbench IPC entry/manifest must be positive typed source files')
+    return identity
+
+
 def verify_feature_report(root, report_path, report, manifest, records, name):
     """Replay trusted producer contracts without running CAD or app code in promotion."""
     require(report.get('source_fingerprint') == manifest['source_fingerprint']
@@ -684,6 +780,10 @@ def verify_feature_report(root, report_path, report, manifest, records, name):
         if name == 'workbench':
             producer.validate_qualification(report, directory, expected_sha=manifest['source_sha'],
                                              expected_arch=manifest['architecture'], verify_geometry=False)
+            editor_path, editor = linked_json(root, report_path, report.get('editor_component'), records)
+            _, main = linked_json(root, editor_path, editor.get('native_main'), records)
+            original = read_json(relative_file(root, 'evidence/source-before.json'))
+            validate_preload_proof(main, main.get('result', {}), {item['path']: item for item in original['files']})
         else:
             producer.validate_report(report, directory, expected_sha=manifest['source_sha'],
                                      expected_arch=manifest['architecture'], expected_version=manifest['version'])

@@ -122,6 +122,26 @@ test('fresh application token stays out of parent env, preload and rendered diag
  }finally{fs.rmSync(directory,{recursive:true,force:true});}
 });
 
+test('actual main constructor records immutable preload bytes for only the current owned window',async()=>{
+ const directory=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'cq-main-preload-')));try{
+  const app=new EventEmitter();Object.assign(app,{commandLine:{appendSwitch(){}},isPackaged:true,getPath:()=>directory,getVersion:()=> '0.2.0',setPath(){},requestSingleInstanceLock:()=>false,quit(){},whenReady:()=>new Promise(()=>{})});
+  let nextId=1;class Window extends EventEmitter{
+   constructor(options){super();this.id=nextId++;this.options=options;this.dead=false;this.webContents=new EventEmitter();Object.assign(this.webContents,{id:nextId++,mainFrame:{url:'http://127.0.0.1:3939/'},getURL:()=> 'http://127.0.0.1:3939/',setWindowOpenHandler(){},session:{setPermissionRequestHandler(){}},send(){}});}
+   isDestroyed(){return this.dead;}show(){}loadURL(){return Promise.resolve();}close(){this.dead=true;this.emit('closed');}
+  }
+  const electron={app,BrowserWindow:Window,Menu:{},nativeTheme:{},screen:{},ipcMain:{handle(){}},dialog:{},shell:{}};
+  const req=name=>name==='electron'?electron:name==='./runtime.cjs'?{}:name.startsWith('./')?require(path.join(__dirname,'../shell',name)):require(name);
+  const context=vm.createContext({require:req,__dirname:path.join(__dirname,'../shell'),module:{},console,AbortController,setTimeout,clearTimeout,setImmediate,process:{env:{},platform:process.platform,arch:process.arch,versions:process.versions,argv:[],pid:999,resourcesPath:'/owned/CassQuery.app/Contents/Resources',execPath:'/owned/CassQuery.app/Contents/MacOS/CassQuery',hrtime:process.hrtime,on(){}}});
+  vm.runInContext(fs.readFileSync(path.join(__dirname,'../shell/main.js'),'utf8')+'\nglobalThis.observer={openWindow,getWindow:()=>window,identity:configuredPreloadIdentity,ready:()=>{workerPort=3939;}};',context);
+  context.observer.ready();await context.observer.openWindow();const first=context.observer.getWindow(),identity=context.observer.identity(first);
+  assert.equal(Object.isFrozen(identity),true);assert.equal(identity.schema,1);assert.equal(identity.method,'owned BrowserWindow constructor');assert.equal(identity.path,first.options.webPreferences.preload);assert.equal(identity.resources_path,'/owned/CassQuery.app/Contents/Resources');assert.equal(identity.web_contents_id,first.webContents.id);
+  const bytes=fs.readFileSync(identity.path);assert.equal(identity.bytes,bytes.length);assert.equal(identity.sha256,require('node:crypto').createHash('sha256').update(bytes).digest('hex'));assert.deepEqual(Object.keys(identity).sort(),['schema','method','path','bytes','sha256','web_contents_id','resources_path'].sort());
+  const unrelated=new Window(first.options);unrelated.webContents.id=first.webContents.id;assert.throws(()=>context.observer.identity(unrelated),/another window/);
+  first.close();assert.throws(()=>context.observer.identity(first),/another window/);await context.observer.openWindow();const second=context.observer.getWindow();assert.notEqual(second,first);assert.notEqual(context.observer.identity(second).web_contents_id,identity.web_contents_id);assert.throws(()=>context.observer.identity(first),/another window/);
+  second.webContents.id=0;assert.throws(()=>context.observer.identity(second),/binding/);
+ }finally{fs.rmSync(directory,{recursive:true,force:true});}
+});
+
 test('preload exposes only fixed methods and strips Electron events with unsubscribe cleanup',()=>{
  const listeners=new Map(),calls=[];let exposed;const electron={contextBridge:{exposeInMainWorld:(name,api)=>{assert.equal(name,'cassquery');exposed=api;}},ipcRenderer:{invoke:(...args)=>{calls.push(args);return Promise.resolve({});},on:(name,fn)=>listeners.set(name,fn),removeListener:(name,fn)=>{if(listeners.get(name)===fn)listeners.delete(name);}}};vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../shell/preload.cjs'),'utf8'),{require:name=>{assert.equal(name,'electron');return electron;}});assert.deepEqual(Object.keys(exposed).sort(),['onCommand','recovery','setDirty','settings','update','workbench'].sort());assert.equal(Object.isFrozen(exposed),true);exposed.workbench('read',{project:'P',path:'entry.py'});assert.equal(calls[0][0],'cassquery:workbench');let value;const off=exposed.onCommand(command=>{value=command;});listeners.get('cassquery:command')({sender:{private:true}},{command:'build'});assert.equal(value.command,'build');assert.equal(value.sender,undefined);off();assert.equal(listeners.size,0);
 });

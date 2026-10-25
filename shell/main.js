@@ -25,6 +25,13 @@ const startup = new AbortController();
 const workbenchToken = crypto.randomBytes(32).toString('hex');
 let desktop = null, updater = null, decidingQuit = false, updateProofWatch = null;
 const pendingNativePaths = [];
+const preloadIdentities = new WeakMap();
+function configuredPreloadIdentity(win) {
+  if(!win||win!==window||win.isDestroyed()||!preloadIdentities.has(win))throw new Error('Preload identity belongs to another window');
+  const identity=preloadIdentities.get(win);
+  if(!Number.isSafeInteger(identity.web_contents_id)||identity.web_contents_id<=0||identity.web_contents_id!==win.webContents.id)throw new Error('Preload identity has no current web contents binding');
+  return identity;
+}
 
 async function ensureWorker() {
   const port = startingPort(process.env.CASSQUERY_PORT);
@@ -110,11 +117,14 @@ async function createWindow() {
   if (quitting) return;
   const up = workerPort !== null || await ensureWorker();
   if (quitting) return;
+  const preloadPath = path.join(__dirname, 'preload.cjs'), preloadBytes = fs.readFileSync(preloadPath);
   const win = new BrowserWindow({ width: 1320, height: 880, title: 'CassQuery',
     enableLargerThanScreen: !!process.env.CASSQUERY_SMOKE_DIR,
     webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true,
-      preload: path.join(__dirname, 'preload.cjs') } });
+      preload: preloadPath } });
   window = win;
+  preloadIdentities.set(win,Object.freeze({schema:1,method:'owned BrowserWindow constructor',path:preloadPath,bytes:preloadBytes.length,
+    sha256:crypto.createHash('sha256').update(preloadBytes).digest('hex'),web_contents_id:win.webContents.id,resources_path:process.resourcesPath}));
   desktop.attachWindow(win);
   win.on('closed', () => { window = null; });
   const origin = `http://127.0.0.1:${workerPort}`;
@@ -335,9 +345,12 @@ async function nativeReady(win) {
     const Module=require('node:module'),loaded=new Module(driver,module);loaded.filename=driver;loaded.paths=Module._nodeModulePaths(path.dirname(driver));loaded._compile(bytes.toString('utf8'),driver);
     if(typeof loaded.exports.probe!=='function')throw new Error('Workbench driver lacks a probe');
     const result=await loaded.exports.probe(win,path.resolve(workbenchOutput),{ownedRoot:process.env.CASSQUERY_USER_DATA,projectRoot:process.env.CASSQUERY_PROJECTS,workerPort:port,workerPid:ownedWorker.pid,
-      challenge:process.env.CASSQUERY_WORKBENCH_SMOKE_CHALLENGE,driver:{path:driver,bytes:bytes.length,sha256:expected},native_source:shellSourceProof()});
+      challenge:process.env.CASSQUERY_WORKBENCH_SMOKE_CHALLENGE,driver:{path:driver,bytes:bytes.length,sha256:expected},
+      resources_path:process.resourcesPath,worker_origin:`http://127.0.0.1:${port}`,window_id:win.id,web_contents_id:win.webContents.id,
+      native_source:shellSourceProof(),preload_identity:configuredPreloadIdentity(win)});
     const record={schema:1,source_sha:process.env.GITHUB_SHA||null,app_pid:process.pid,worker_pid:ownedWorker.pid,challenge:process.env.CASSQUERY_WORKBENCH_SMOKE_CHALLENGE,
-      driver:{path:driver,bytes:bytes.length,sha256:expected},native_source:shellSourceProof(),result};
+      driver:{path:driver,bytes:bytes.length,sha256:expected},resources_path:process.resourcesPath,worker_origin:`http://127.0.0.1:${port}`,project_root:process.env.CASSQUERY_PROJECTS,
+      window_id:win.id,web_contents_id:win.webContents.id,native_source:shellSourceProof(),preload_identity:configuredPreloadIdentity(win),result};
     fs.mkdirSync(directory,{recursive:true});fs.writeFileSync(path.join(directory,'native-workbench-main.json'),JSON.stringify(record,null,2));
   }
   while(pendingNativePaths.length && window===win && !win.isDestroyed())await desktop.openNative(pendingNativePaths.shift());

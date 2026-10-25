@@ -97,6 +97,22 @@ def native_qualification_model(directory):
     package = json.loads((ROOT / 'package.json').read_text())
     shell_files = [{'path': name, 'bytes': (ROOT / name).stat().st_size, 'sha256': sha((ROOT / name).read_bytes())} for name in package['cassquerySources']['shell']]
     native_source = {'files': shell_files}
+    resources = '/parser-only/CassQuery.app/Contents/Resources'
+    preload_source = next(item for item in shell_files if item['path'] == 'shell/preload.cjs')
+    preload_identity = {'schema': 1, 'method': 'owned BrowserWindow constructor', 'path': resources + '/app.asar/shell/preload.cjs',
+                        'resources_path': resources, 'bytes': preload_source['bytes'], 'sha256': preload_source['sha256'], 'web_contents_id': 102}
+    window = {'window_id': 101, 'web_contents_id': 102, 'resources_path': resources, 'worker_origin': 'http://127.0.0.1:3939',
+              'project_root': '/parser-only/projects/WORKBENCHPLATE', 'preload_identity': preload_identity}
+    settings = {'schema': 1, 'theme': 'system', 'editorFont': 'system-mono', 'editorFontSize': 14, 'tabSize': 4,
+                'lineWrap': False, 'editorVisible': True, 'autoBuild': False, 'reducedMotion': 'system', 'updateCheck': 'enabled',
+                'updateAutoDownload': False, 'updateChannel': 'stable', 'recentProjects': []}
+    listed = {'project': 'WORKBENCHPLATE', 'root': window['project_root'], 'entry': 'part_entry.py', 'source': 'part_entry.py',
+              'files': [{'path': 'part_entry.py', 'kind': 'python', 'bytes': 100}, {'path': 'viewer.json', 'kind': 'json', 'bytes': 200}], 'read_only': False}
+    preload_evidence = {'node_integration': False, 'context_isolation': True, 'sandbox': True, 'bridge_present': True, 'project_root_matches': True,
+        'preload_identity': preload_identity, 'bridge': {'keys': ['onCommand', 'recovery', 'setDirty', 'settings', 'update', 'workbench'],
+        'function_types': ['function'] * 6, 'node_require_type': 'undefined', 'node_process_type': 'undefined'},
+        'ipc': {'method': 'actual contextBridge invoke', 'window_id': 101, 'web_contents_id': 102, 'origin': window['worker_origin'],
+        'settings_result': settings, 'workbench_result': listed, 'workbench_http_status': 200, 'workbench_http_response': copy.deepcopy(listed)}}
     png = parser_png(1320, 880)
     images = []
     labels = ['counterform-dark', 'counterform-light', 'graphite', 'midnight', 'forest', 'sand', 'paper', 'high-contrast', 'edit-certified', 'external-conflict', 'syntax-retained']
@@ -105,10 +121,11 @@ def native_qualification_model(directory):
         name = label + '.png'; (proof / name).write_bytes(png)
         images.append(native_render_model({'path': name, 'bytes': len(png), 'sha256': sha(png), 'width': 1320, 'height': 880, 'viewport': [1320, 880]}, png))
     data['eight-themes']['states'] = [{'name': name, 'styling': f'parser-style-{i}', 'persisted': True, 'visible': True, 'image_sha256': sha(png)} for i, name in enumerate(theme_labels)]
-    checks = [{'id': 'preload-ipc', 'pass': True, 'evidence': {'node_integration': False, 'context_isolation': True, 'sandbox': True, 'bridge_present': True, 'project_root_matches': True}}]
+    checks = [{'id': 'preload-ipc', 'pass': True, 'evidence': preload_evidence}]
     checks += [{'id': name, 'pass': True, 'evidence': data[name]} for name in ['edit-save-volume', 'external-conflict', 'syntax-retains-certified', 'eight-themes', 'font-tabs']]
     editor_result = {'schema': 1, 'platform': 'native-electron-workbench-editor', 'pass': False, 'qualifies_workbench': False, 'editor_checks_pass': True,
-                     **identity, 'driver': driver, 'native_source': native_source, 'checks': checks, 'images': images, 'errors': []}
+                     **identity, **window, 'driver': driver, 'native_source': native_source, 'checks': checks, 'images': images, 'errors': [],
+                     'worker_requests': [{'action': 'list', 'project': 'WORKBENCHPLATE', 'status': 200, 'response': copy.deepcopy(listed)}]}
     full_checks = {
         'native-open-file': {'path': '/parser-only/selected.py'},
         'native-open-folder': {'root': '/parser-only/folder'},
@@ -149,7 +166,7 @@ def native_qualification_model(directory):
         raw = file.read_bytes(); return {'path': relative, 'bytes': len(raw), 'sha256': sha(raw)}
     full_file = proof / 'workbench-qualification.json'; full_file.write_text(json.dumps(full))
     editor_result['qualification'] = record(full_file, 'workbench-qualification.json')
-    main = {'schema': 1, 'source_sha': 'a' * 40, **identity, 'driver': driver, 'native_source': native_source, 'result': editor_result}
+    main = {'schema': 1, 'source_sha': 'a' * 40, **identity, **window, 'driver': driver, 'native_source': native_source, 'result': editor_result}
     main_file = proof / 'native-workbench-main.json'; main_file.write_text(json.dumps(main))
     editor = {'schema': 1, 'pass': True, 'qualifies_workbench': False, 'source_sha': 'a' * 40, 'architecture': 'arm64', **identity,
               'driver': driver, 'native_main': record(main_file, 'proof/native-workbench-main.json')}
@@ -466,6 +483,85 @@ class WorkbenchContractTests(unittest.TestCase):
     def test_unknown_skip_option_cannot_select_partial_suite(self):
         result = subprocess.run([self.node, str(SUITE), '--skip-native'], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 2)
+
+    def test_constructor_preload_identity_and_ipc_contract_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve(); outer = native_qualification_model(root)
+            main = json.loads((root / 'proof/native-workbench-main.json').read_text())
+            report = main['result']; resources = root / 'CassQuery.app/Contents/Resources'
+            preload = resources / 'app.asar/shell/preload.cjs'; preload.parent.mkdir(parents=True)
+            original = (ROOT / 'shell/preload.cjs').read_bytes(); preload.write_bytes(original)
+            identity = {**report['preload_identity'], 'resources_path': str(resources), 'path': str(preload)}
+            report.update(preload_identity=identity, resources_path=str(resources))
+            evidence = report['checks'][0]['evidence']; evidence['preload_identity'] = identity
+            packet = {'identity': identity, 'report': report, 'evidence': evidence,
+                      'context': {'resourcesPath': str(resources), 'webContentsId': report['web_contents_id'], 'nativeSource': report['native_source']}}
+            file = root / 'preload-model.json'
+            code = "const fs=require('node:fs'),n=require(process.argv[1]),p=JSON.parse(fs.readFileSync(process.argv[2]));n.validatePreloadIdentity(p.identity,p.context);n.validatePreloadIPC(p.evidence,p.report);"
+            def validate(value):
+                file.write_text(json.dumps(value))
+                return subprocess.run([self.node, '-e', code, str(ROOT / 'tools/native_workbench_probe.cjs'), str(file)], capture_output=True, text=True, timeout=10)
+            positive = validate(packet); self.assertEqual(positive.returncode, 0, positive.stderr)
+            mutations = [lambda p: p.update(identity=None), lambda p: p['identity'].update(path=str(root / 'foreign/preload.cjs')),
+                lambda p: p['identity'].update(path=preload.as_uri()), lambda p: p['identity'].update(sha256='0' * 64),
+                lambda p: p['identity'].update(bytes=0), lambda p: p['identity'].update(web_contents_id=999),
+                lambda p: p['context'].update(resourcesPath=str(root / 'foreign')), lambda p: p['evidence']['bridge']['keys'].pop(),
+                lambda p: p['evidence']['bridge']['keys'].append('invoke'), lambda p: p['evidence']['bridge'].update(node_require_type='function'),
+                lambda p: p['evidence']['bridge'].update(node_process_type='object'), lambda p: p['evidence']['ipc'].update(window_id=999),
+                lambda p: p['evidence']['ipc'].update(web_contents_id=999), lambda p: p['evidence']['ipc'].update(origin='http://127.0.0.1:4040'),
+                lambda p: p['evidence']['ipc'].update(settings_result={'schema': 1}), lambda p: p['evidence']['ipc'].update(workbench_http_status=500),
+                lambda p: p['evidence']['ipc'].update(workbench_result={}), lambda p: p['report'].update(worker_requests=[]),
+                lambda p: p['report']['worker_requests'][0].update(status=500)]
+            foreign = root / 'foreign/preload.cjs'; foreign.parent.mkdir(); foreign.write_bytes(original)
+            for mutation in mutations:
+                self.assertEqual(validate(packet).returncode, 0)
+                value = copy.deepcopy(packet); mutation(value)
+                with self.subTest(mutation=mutation): self.assertNotEqual(validate(value).returncode, 0)
+            for name, field, replacement in (('part_entry.py', 'bytes', 0), ('part_entry.py', 'kind', 'asset'),
+                                              ('viewer.json', 'bytes', 0), ('viewer.json', 'kind', 'python')):
+                self.assertEqual(validate(packet).returncode, 0)
+                value = copy.deepcopy(packet)
+                replies = [value['evidence']['ipc']['workbench_result'], value['evidence']['ipc']['workbench_http_response'],
+                           value['report']['worker_requests'][0]['response']]
+                for reply in replies: next(entry for entry in reply['files'] if entry['path'] == name)[field] = replacement
+                with self.subTest(required_file=name, field=field): self.assertNotEqual(validate(value).returncode, 0)
+            empty_helper = copy.deepcopy(packet)
+            for reply in (empty_helper['evidence']['ipc']['workbench_result'], empty_helper['evidence']['ipc']['workbench_http_response'],
+                          empty_helper['report']['worker_requests'][0]['response']):
+                reply['files'].append({'path': 'helper.py', 'kind': 'python', 'bytes': 0})
+            self.assertEqual(validate(empty_helper).returncode, 0, 'An unrelated empty helper is valid source inventory')
+            preload.write_bytes(original[:-1] + bytes((original[-1] ^ 1,)))
+            self.assertNotEqual(validate(packet).returncode, 0, 'Changed actual preload bytes must not reuse the identity')
+            preload.write_bytes(original)
+            self.assertEqual(validate(packet).returncode, 0)
+
+    def test_portable_preload_receipt_rehashed_contradictions_are_rejected(self):
+        import workbench_native_smoke as native
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); report = native_qualification_model(root)
+            native.validate_qualification(report, root, expected_sha='a' * 40, expected_arch='arm64')
+            full = json.loads((root / 'proof/workbench-qualification.json').read_text())
+            main_file = root / 'proof/native-workbench-main.json'; healthy_main = json.loads(main_file.read_text())
+            for kind in ('identity-path', 'identity-window', 'bridge', 'ipc-trace', 'ipc-closed', 'read-only', 'entry-empty', 'entry-asset', 'manifest-empty', 'manifest-python'):
+                main_file.write_text(json.dumps(healthy_main))
+                value = rehash_native_model(report, root, full)
+                native.validate_qualification(value, root, expected_sha='a' * 40, expected_arch='arm64')
+                main = copy.deepcopy(healthy_main); evidence = main['result']['checks'][0]['evidence']
+                if kind == 'identity-path': main['result']['preload_identity']['path'] = '/foreign/preload.cjs'
+                elif kind == 'identity-window': main['result']['web_contents_id'] = 999
+                elif kind == 'bridge': evidence['bridge']['keys'].pop()
+                elif kind == 'ipc-trace': main['result']['worker_requests'] = []
+                elif kind == 'ipc-closed': evidence['ipc']['workbench_http_status'] = 500
+                elif kind == 'read-only': evidence['ipc']['workbench_result']['read_only'] = True
+                else:
+                    name = 'part_entry.py' if kind.startswith('entry-') else 'viewer.json'
+                    field = 'bytes' if kind.endswith('empty') else 'kind'
+                    replacement = 0 if field == 'bytes' else 'asset' if kind == 'entry-asset' else 'python'
+                    for reply in (evidence['ipc']['workbench_result'], evidence['ipc']['workbench_http_response'], main['result']['worker_requests'][0]['response']):
+                        next(entry for entry in reply['files'] if entry['path'] == name)[field] = replacement
+                main_file.write_text(json.dumps(main)); value = rehash_native_model(report, root, full)
+                with self.subTest(rehashed=kind), self.assertRaises((ValueError, RuntimeError)):
+                    native.validate_qualification(value, root, expected_sha='a' * 40, expected_arch='arm64')
 
     def test_native_probe_root_accepts_self_and_children_not_prefix_siblings(self):
         code = "const assert=require('node:assert/strict'),n=require(process.argv[1]);assert.equal(n.ownedPath('/tmp/owned','/tmp/owned'),true);assert.equal(n.ownedPath('/tmp/owned','/tmp/owned/user/proof'),true);assert.equal(n.ownedPath('/tmp/owned','/tmp/owned-other/proof'),false);assert.equal(n.ownedPath('/tmp/owned','/tmp/owned/../foreign'),false);"

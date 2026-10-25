@@ -143,6 +143,8 @@ def validate_editor(report, directory, *, expected_sha, expected_arch):
     require(main.get('source_sha') == expected_sha and main.get('app_pid') == report.get('app_pid') and main.get('worker_pid') == report.get('worker_pid')
             and main.get('challenge') == report.get('challenge') and main.get('driver') == report.get('driver'), 'Native process/driver identity mismatch')
     result = main.get('result', {})
+    from release_evidence import validate_preload_proof
+    validate_preload_proof(main, result)
     require(result.get('editor_checks_pass') is True and result.get('qualifies_workbench') is False and result.get('pass') is False,
             'Native editor result is incomplete or claims full workbench')
     require(result.get('challenge') == main['challenge'] and result.get('app_pid') == main['app_pid'] and result.get('worker_pid') == main['worker_pid'], 'Editor result contradicts native identity')

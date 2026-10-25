@@ -61,10 +61,12 @@
   </section>
   <div id="pane-divider" class="pane-divider" role="separator" aria-label="Resize code and model panes" aria-orientation="vertical" aria-valuemin="25" aria-valuemax="65" aria-valuenow="44" tabindex="0" hidden></div>
   <section class="model-pane" aria-label="CAD viewport and inspector">
-    <div id="stage">
-      <div id="stage-msg" role="status"><strong>Loading</strong>Fetching projects from the worker.</div>
-      <div id="selection"><span class="name" id="selname"></span><button id="selisolate" type="button">Isolate</button><button id="selhide" type="button">Hide</button><button id="selshow" type="button">Show all</button></div>
+    <div class="viewport-pane">
       <nav class="camera-tools" aria-label="Camera views"><button id="camera-fit" type="button">Fit</button><button id="camera-front" type="button">Front −Y</button><button id="camera-side" type="button">Side +X</button><button id="camera-top" type="button">Top +Z</button></nav>
+      <div id="stage">
+        <div id="stage-msg" role="status"><strong>Loading</strong>Fetching projects from the worker.</div>
+        <div id="selection"><span class="name" id="selname"></span><button id="selisolate" type="button">Isolate</button><button id="selhide" type="button">Hide</button><button id="selshow" type="button">Show all</button></div>
+      </div>
     </div>
     <aside aria-label="Model controls">
       <p class="caption" id="caption"></p>

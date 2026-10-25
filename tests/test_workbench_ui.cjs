@@ -43,6 +43,21 @@ function harness(Workbench, TextDocument, text = 'saved') {
   return { w, doc, calls, nodes };
 }
 
+test('camera controls occupy a normal-flow row outside the model canvas', () => {
+  const html = fs.readFileSync(path.join(ROOT, 'viewer/index.html'), 'utf8');
+  const css = fs.readFileSync(path.join(ROOT, 'viewer/style.css'), 'utf8');
+  const viewport = html.indexOf('<div class="viewport-pane">');
+  const toolbar = html.indexOf('<nav class="camera-tools"', viewport);
+  const toolbarEnd = html.indexOf('</nav>', toolbar);
+  const stage = html.indexOf('<div id="stage">', viewport);
+  assert.ok(viewport >= 0 && toolbar > viewport && toolbarEnd < stage);
+  for (const id of ['camera-fit', 'camera-front', 'camera-side', 'camera-top'])
+    assert.ok(html.slice(toolbar, toolbarEnd).includes(`id="${id}"`));
+  const rule = css.match(/\.camera-tools\s*\{([^}]+)\}/)[1];
+  assert.doesNotMatch(rule, /position\s*:\s*absolute|top\s*:|left\s*:/);
+  assert.match(rule, /flex\s*:\s*none/);
+});
+
 test('uniform scale uses no offset step lattice while enforcing a positive lower bound', () => {
   const html = fs.readFileSync(path.join(ROOT, 'viewer/index.html'), 'utf8');
   const scale = html.match(/<input id="uniform-scale"[^>]*>/)[0];

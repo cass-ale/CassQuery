@@ -1,5 +1,6 @@
 """Bounded real-byte fixtures for the protected publication boundary (no GitHub writes)."""
 import copy
+from functools import lru_cache
 import hashlib
 import importlib.util
 import io
@@ -68,7 +69,48 @@ def protocol_png(width, height, index=0):
     return PNG_BYTES[key]
 
 
+def _fixture_inputs_fingerprint():
+    """Rekey if a test deliberately changes captured input bytes or source records."""
+    digest = hashlib.sha256(json.dumps(SOURCE_FILES, sort_keys=True, separators=(',', ':')).encode())
+    for group in (SOURCE_INPUTS, LOCKED_INPUTS):
+        for name, data in sorted(group.items()):
+            digest.update(name.encode() + b'\0')
+            digest.update(hashlib.sha256(data).digest())
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=2)
+def _candidate_baseline(arch, source_fingerprint, source_sha, version, run_id, inputs_fingerprint):
+    """Immutable serialized PROTOCOL construction only; never a cached verifier verdict.
+
+    The fingerprint binds source/probe/test bytes. Two architecture baselines occupy
+    about12MiB here. Returned values are bytes/tuples, not shared mutable reports.
+    """
+    if (source_fingerprint, source_sha, version, run_id, inputs_fingerprint) != (FINGERPRINT, SHA, VERSION, RUN_ID, _fixture_inputs_fingerprint()):
+        raise ValueError('fixture baseline identity changed during construction')
+    archive, files = _build_candidate_bytes(arch)
+    return archive, tuple(sorted(files.items()))
+
+
 def candidate_bytes(arch, mutate=None, extra=None):
+    archive, immutable = _candidate_baseline(arch, FINGERPRINT, SHA, VERSION, RUN_ID, _fixture_inputs_fingerprint())
+    files = dict(immutable)  # Each test gets fresh mutable state; bytes are immutable.
+    if mutate is None and not extra:
+        return archive, files
+    manifest = json.loads(files.pop('candidate.json'))  # Fresh nested graph for every callback.
+    if mutate is not None:
+        mutate(manifest, files)
+    files['candidate.json'] = json.dumps(manifest, indent=2).encode()
+    if extra:
+        files.update(extra)
+    stream = io.BytesIO()
+    with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED) as output:
+        for name, data in files.items():
+            output.writestr(name, data)
+    return stream.getvalue(), files
+
+
+def _build_candidate_bytes(arch):
     # These are complete protocol fixtures, not claims of a rendered native app.
     files = dict(LOCKED_INPUTS)
     identity = {"schema": 1, "pass": True, "source_sha": SHA, "architecture": arch, "version": VERSION}
@@ -140,9 +182,9 @@ def candidate_bytes(arch, mutate=None, extra=None):
                 'vertices': 30, 'triangles': 10, 'degenerate': 0, 'meshes': 3, 'clipped': 0, 'nonfinite': 0, 'overflow': False,
                 'bad': [], 'overlaps': [], 'errors': [], 'realized_theme': theme, 'controls_checked': 15,
                 'gates_pass': True, 'tier': 'certified', 'viewport': [width, 700], 'diag': '',
-                'background': 'black' if theme == 'dark' else 'white', 'full_size': [width, 700], 'scroll_regions': [], 'vertical_scroll': False,
+                'background': 'black' if theme == 'dark' else 'white', 'full_size': [width, 700], 'scroll_regions': [], 'scroll_captures': [], 'vertical_scroll': False,
                 'step_pressed': ['true', 'false'] if state == 'assembled' else ['false', 'true'],
-                'explode': '0%' if state == 'assembled' else '100%', 'hash': 'protocol-certified-geometry',
+                'explode': '0%' if state == 'assembled' else '100%', 'hash': 'a' * 16, 'dpr': 1,
                 'canvas': {'width': width, 'height': 700, 'client_width': width, 'client_height': 700}, 'image': captured})
         for index, name in enumerate(('assembled', 'apart') if bundled else ('assembled', 'apart', 'save-camera', 'save-certified', 'gate-failed')):
             images.append(image(name + '.png', 1320, 700, 14 + index if name in ('assembled', 'apart') else 40 + index))
@@ -369,16 +411,122 @@ def candidate_bytes(arch, mutate=None, extra=None):
                 "run_id": RUN_ID, "run_attempt": 1, "distribution": "adhoc", "files": records,
                 "assets": [by_name[f"dist/mac-app/CassQuery-{VERSION}-mac-{arch}.{suffix}"] for suffix in ("zip", "dmg")],
                 "gates": {gate: by_name[template.format(arch=arch)] for gate, template in evidence.GATES.items()}}
-    if mutate:
-        mutate(manifest, files)
     files["candidate.json"] = json.dumps(manifest, indent=2).encode()
-    if extra:
-        files.update(extra)
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w", zipfile.ZIP_DEFLATED) as archive:
         for name, data in files.items():
             archive.writestr(name, data)
     return stream.getvalue(), files
+
+
+class CandidateBaselineCacheTests(unittest.TestCase):
+    """Serialized construction reuse only; every admission/mutation still executes."""
+
+    def setUp(self):
+        _candidate_baseline.cache_clear()
+
+    def test_two_architectures_and_returned_dictionaries_are_isolated(self):
+        arm_archive, arm = candidate_bytes('arm64')
+        intel_archive, intel = candidate_bytes('x64')
+        original_arm = dict(arm)
+        arm['candidate.json'] = b'poisoned caller dictionary'
+        arm.pop('evidence/preflight.json')
+        fresh_archive, fresh = candidate_bytes('arm64')
+        self.assertIsNot(arm, fresh)
+        self.assertEqual(fresh_archive, arm_archive)
+        self.assertEqual(fresh, original_arm)
+        self.assertEqual(json.loads(intel['candidate.json'])['architecture'], 'x64')
+        self.assertNotEqual(intel_archive, arm_archive)
+        self.assertTrue(all(isinstance(value, bytes) for value in fresh.values()))
+        self.assertEqual(_candidate_baseline.cache_info().currsize, 2)
+
+    def test_changed_source_fingerprint_reconstructs_the_baseline(self):
+        with patch(__name__ + '._build_candidate_bytes', wraps=_build_candidate_bytes) as built:
+            candidate_bytes('arm64')
+            candidate_bytes('arm64')
+            self.assertEqual(built.call_count, 1)
+            changed_files = [*SOURCE_FILES, {'path': 'cache-source-input.txt', 'bytes': 1, 'executable': False,
+                                             'sha256': hashlib.sha256(b'x').hexdigest()}]
+            changed = hashlib.sha256(json.dumps({'source_sha': SHA, 'files': changed_files},
+                                                sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+            with patch(__name__ + '.FINGERPRINT', changed), patch(__name__ + '.SOURCE_FILES', changed_files):
+                _, files = candidate_bytes('arm64')
+                self.assertEqual(json.loads(files['candidate.json'])['source_fingerprint'], changed)
+            self.assertEqual(built.call_count, 2)
+            candidate_bytes('arm64')
+            self.assertEqual(built.call_count, 2)
+
+    def test_raw_captured_input_change_rekeys_even_without_declared_fingerprint_change(self):
+        with patch(__name__ + '._build_candidate_bytes', wraps=_build_candidate_bytes) as built:
+            candidate_bytes('arm64')
+            with patch.dict(SOURCE_INPUTS, {'tests/cache-change-fixture.py': b'changed captured byte input'}):
+                candidate_bytes('arm64')
+            self.assertEqual(built.call_count, 2)
+
+    def test_fake_api_mutable_state_is_not_part_of_the_cached_baseline(self):
+        first = FakeAPI()
+        first.run['conclusion'] = 'failure'
+        first.jobs[0]['steps'].clear()
+        first.artifacts[0]['expired'] = True
+        first.calls.append(('PATCH', 'not a network request'))
+        first.originals['arm64']['candidate.json'] = b'caller poisoned dictionary'
+        second = FakeAPI()
+        self.assertEqual(second.run['conclusion'], 'success')
+        self.assertTrue(second.jobs[0]['steps'])
+        self.assertFalse(second.artifacts[0]['expired'])
+        self.assertEqual(second.calls, [])
+        self.assertNotEqual(second.originals['arm64']['candidate.json'], b'caller poisoned dictionary')
+
+    def test_mutation_callbacks_get_fresh_manifest_and_files(self):
+        observed = []
+        def mutate(manifest, files):
+            self.assertNotIn('candidate.json', files)
+            observed.append(manifest)
+            manifest['assets'][0]['sha256'] = '0' * 64
+            files[manifest['assets'][0]['path']] = b'deliberately corrupt callback'
+        _, bad = candidate_bytes('arm64', mutate)
+        _, second_bad = candidate_bytes('arm64', mutate)
+        self.assertIsNot(observed[0], observed[1])
+        _, pristine = candidate_bytes('arm64')
+        pristine_manifest = json.loads(pristine['candidate.json'])
+        self.assertNotEqual(pristine_manifest['assets'][0]['sha256'], '0' * 64)
+        self.assertNotEqual(pristine[pristine_manifest['assets'][0]['path']], b'deliberately corrupt callback')
+        self.assertEqual(bad[pristine_manifest['assets'][0]['path']], b'deliberately corrupt callback')
+
+    def test_warm_cache_same_size_rehashed_physical_png_still_reaches_decoder(self):
+        candidate_bytes('arm64')  # Warm serialized construction, not a verifier verdict.
+        from test_release_evidence import NativeConformanceTests
+        case = NativeConformanceTests('test_complete_producer_protocol_and_all_physical_images_pass')
+        case.setUp()
+        try:
+            file = case.root / 'evidence/mac-arm64/bundled/dark-450-assembled.png'
+            original = file.read_bytes()
+            changed = original[:-1] + bytes((original[-1] ^ 1,))
+            self.assertEqual(len(changed), len(original))
+            file.write_bytes(changed)
+            case.refresh()  # Rehash physical PNG and every legacy linked record; no stale digest escape.
+            with self.assertRaisesRegex(ValueError, 'PNG checksum mismatch'):
+                case.verify()
+            _, pristine = candidate_bytes('arm64')
+            self.assertEqual(pristine['evidence/mac-arm64/bundled/dark-450-assembled.png'], original)
+        finally:
+            case.doCleanups()
+
+    def test_unpatched_verifier_rejects_corruption_of_fresh_cached_copy(self):
+        _, files = candidate_bytes('arm64')
+        with tempfile.TemporaryDirectory(prefix='cq-cache-isolation-') as directory:
+            root = Path(directory)
+            for name, data in files.items():
+                file = root / name; file.parent.mkdir(parents=True, exist_ok=True); file.write_bytes(data)
+            manifest = json.loads(files['candidate.json'])
+            kwargs = dict(expected_sha=SHA, expected_run_id=RUN_ID, expected_arch='arm64', expected_attempt=1, expected_version=VERSION)
+            evidence.verify_candidate(root, **kwargs)
+            asset = root / manifest['assets'][0]['path']
+            data = asset.read_bytes(); asset.write_bytes(b'X' + data[1:])
+            with self.assertRaisesRegex(ValueError, 'bytes changed'):
+                evidence.verify_candidate(root, **kwargs)
+            _, pristine = candidate_bytes('arm64')
+            self.assertEqual(pristine[manifest['assets'][0]['path']], data)
 
 
 class FakeAPI:

@@ -283,10 +283,11 @@ def validate_renderer(report, output, challenge, pid, app, version, arch, starte
         require(image['width'] >= row['width'] and image['height'] >= 700, 'Matrix image dimensions do not cover frame')
         if row.get('full_size'):
             require(image['width'] >= row['full_size'][0] and image['height'] >= row['full_size'][1], 'Matrix capture misses complete document')
-        if row.get('scroll_regions'):
-            controls_image = row.get('controls_image', {})
-            require(controls_image in images and controls_image.get('path') == str(output / f"{row['theme']}-{row['width']}-{row['state']}-controls.png"), 'Missing scroll-region controls capture')
-            require(all(region.get('id') == 'ASIDE' and 0 < region.get('client_height', 0) < region.get('scroll_height', 0) <= region['client_height'] * 2 for region in row['scroll_regions']), 'Incomplete scroll-region coverage')
+        for index, capture in enumerate(row['scroll_captures']):
+            image = capture['image']
+            suffix = f'-controls-{index}' if index else ''
+            require(image in images and image.get('path') == str(output / f"{row['theme']}-{row['width']}-{row['state']}{suffix}.png"), 'Missing actual scroll capture')
+            require(image['width'] >= row['full_size'][0] and image['height'] >= row['full_size'][1], 'Scroll capture misses complete document')
     return report
 
 

@@ -43,11 +43,11 @@ class SmokeEvidenceTests(unittest.TestCase):
                     images.append(image)
                     matrix.append({'theme': theme, 'realized_theme': theme, 'background': theme,
                         'width': width, 'state': state, 'status': 'checked', 'viewport': [width, 700],
-                        'full_size': [width, 700], 'scroll_regions': [], 'vertical_scroll': False,
+                        'full_size': [width, 700], 'scroll_regions': [], 'scroll_captures': [], 'vertical_scroll': False,
                         'vertices': 30, 'triangles': 10, 'degenerate': 0, 'meshes': 3, 'controls_checked': 15, 'clipped': 0, 'nonfinite': 0,
                         'overflow': False, 'bad': [], 'overlaps': [], 'errors': [], 'diag': '', 'tier': 'certified',
                         'gates_pass': True, 'step_pressed': ['true', 'false'] if state == 'assembled' else ['false', 'true'],
-                        'explode': '0%' if state == 'assembled' else '100%',
+                        'explode': '0%' if state == 'assembled' else '100%', 'hash': 'a' * 16, 'dpr': 1,
                         'canvas': {'width': width, 'height': 600, 'client_width': width, 'client_height': 600}, 'image': image})
         for name in ('assembled', 'apart', 'save-certified', 'gate-failed'):
             file = self.output / f'{name}.png'

@@ -117,8 +117,17 @@ function measureFrame() {
   const canScroll = (e) => ['auto', 'scroll'].includes(getComputedStyle(e).overflowY);
   for (const e of elements) {
     const r = rect(e), style = getComputedStyle(e);
-    if (canScroll(e) && e.scrollHeight > e.clientHeight + 2)
-      scrollRegions.push({ id: e.id || e.tagName, client_height: e.clientHeight, scroll_height: e.scrollHeight });
+    if (canScroll(e) && e.scrollHeight > e.clientHeight + 2) {
+      const box=[r.left+e.clientLeft,r.top+e.clientTop,r.left+e.clientLeft+e.clientWidth,r.top+e.clientTop+e.clientHeight];
+      const shown=[Math.max(0,box[0]),Math.max(0,box[1]),Math.min(innerWidth,box[2]),Math.min(innerHeight,box[3])];
+      for(let ancestor=e.parentElement;ancestor;ancestor=ancestor.parentElement){
+        const a=rect(ancestor),s=getComputedStyle(ancestor);
+        if(['auto','scroll','hidden','clip'].includes(s.overflowX)){shown[0]=Math.max(shown[0],a.left+ancestor.clientLeft);shown[2]=Math.min(shown[2],a.left+ancestor.clientLeft+ancestor.clientWidth);}
+        if(['auto','scroll','hidden','clip'].includes(s.overflowY)){shown[1]=Math.max(shown[1],a.top+ancestor.clientTop);shown[3]=Math.min(shown[3],a.top+ancestor.clientTop+ancestor.clientHeight);}
+      }
+      scrollRegions.push({ id: e.id || e.tagName, client_height: e.clientHeight, scroll_height: e.scrollHeight, scroll_top: e.scrollTop, viewport_rect:box, visible_rect:shown });
+      if(box.some((value,index)=>!Number.isFinite(value)||Math.abs(value-shown[index])>1))bad.push({ id:e.id || e.tagName, category:'scroll-viewport-clipped', text:'' });
+    }
     let scrollParent = null;
     for (let p = e.parentElement; p && p !== document.body; p = p.parentElement)
       if (canScroll(p) && p.scrollHeight > p.clientHeight + 2) { scrollParent = p; break; }
@@ -208,6 +217,73 @@ function measureFrame() {
     tier: model.tier, gates_pass: model.gates?.pass === true, hash: model.hash };
 }
 
+const MAX_SCROLL_CAPTURES = 32;
+function scrollOffsets(clientHeight, scrollHeight) {
+  assert.ok(Number.isSafeInteger(clientHeight) && clientHeight > 0 && Number.isSafeInteger(scrollHeight) && scrollHeight > clientHeight, 'invalid scroll dimensions');
+  const step = Math.max(1, Math.floor(clientHeight * 0.9)), bottom = scrollHeight - clientHeight;
+  assert.ok(Math.ceil(bottom / step) + 1 <= MAX_SCROLL_CAPTURES, 'scroll coverage exceeds bounded capture limit');
+  const offsets = [0];
+  while (offsets.at(-1) < bottom) offsets.push(Math.min(bottom, offsets.at(-1) + step));
+  return offsets;
+}
+function validateScrollRegion(region, viewport) {
+  assert.ok(Number.isSafeInteger(region.client_height) && region.client_height > 0 && Number.isSafeInteger(region.scroll_height) && region.scroll_height > region.client_height, 'invalid scroll dimensions');
+  for(const key of ['viewport_rect','visible_rect'])assert.ok(Array.isArray(region[key])&&region[key].length===4&&region[key].every(Number.isFinite),'missing scroll visibility geometry');
+  const box=region.viewport_rect,shown=region.visible_rect;
+  assert.ok(box[0]>=-1&&box[1]>=-1&&box[2]<=viewport[0]+1&&box[3]<=viewport[1]+1&&box[2]>box[0]&&box[3]>box[1], 'scroll region is not inside viewport');
+  assert.ok(shown[2]>shown[0]&&shown[3]>shown[1]&&shown[0]>=-1&&shown[1]>=-1&&shown[2]<=viewport[0]+1&&shown[3]<=viewport[1]+1,'scroll region has no positive visible area');
+  assert.ok(Math.abs(box[3]-box[1]-region.client_height)<=1&&box.every((value,index)=>Math.abs(value-shown[index])<=1), 'scroll region client area is clipped');
+}
+function validateScrollFrame(frame, row, id, offset) {
+  assert.ok(frame && typeof frame === 'object' && !Object.hasOwn(frame,'image') && !Object.hasOwn(frame,'scroll_captures'), 'missing/recursive scroll frame evidence');
+  assert.ok(typeof frame.hash==='string'&&/^[a-f0-9]{16}$/.test(frame.hash),'missing certified scroll frame hash');
+  assert.ok(Number.isFinite(frame.dpr)&&frame.dpr>0&&frame.dpr<=16,'missing/invalid scroll frame DPR');
+  assert.deepEqual(frame.viewport, row.viewport); assert.deepEqual(frame.full_size, row.full_size);
+  assert.equal(frame.theme, row.theme); assert.equal(frame.background, row.background);
+  assert.equal(frame.hash, row.hash); assert.equal(frame.tier, 'certified'); assert.equal(frame.gates_pass, true);
+  assert.deepEqual(frame.step_pressed, row.step_pressed); assert.equal(frame.explode, row.explode);
+  assert.ok(Number.isInteger(frame.vertices) && frame.vertices > 0 && Number.isInteger(frame.meshes) && frame.meshes > 0 &&
+    Number.isInteger(frame.triangles) && frame.triangles > 0 && frame.vertices === frame.triangles * 3, 'empty/inconsistent scroll frame geometry');
+  assert.equal(frame.clipped, 0); assert.equal(frame.nonfinite, 0); assert.equal(frame.degenerate, 0);
+  assert.equal(frame.overflow, false); assert.deepEqual(frame.bad, []); assert.deepEqual(frame.overlaps, []); assert.deepEqual(frame.errors, []); assert.equal(frame.diag, '');
+  assert.deepEqual(frame.canvas, row.canvas); assert.equal(frame.dpr, row.dpr);
+  const expected = row.scroll_regions.find(region => region.id === id);
+  assert.ok(expected, 'unknown scroll frame region');
+  assert.equal(frame.scroll_regions.length, row.scroll_regions.length, 'scroll frame region inventory changed');
+  for (const region of frame.scroll_regions) {
+    const original = row.scroll_regions.find(item => item.id === region.id);
+    assert.ok(original, 'scroll region changed');
+    assert.equal(region.client_height, original.client_height); assert.equal(region.scroll_height, original.scroll_height);
+    validateScrollRegion(region,frame.viewport);assert.deepEqual(region.viewport_rect,original.viewport_rect);assert.deepEqual(region.visible_rect,original.visible_rect);
+    assert.equal(region.scroll_top, region.id === id ? offset : original.scroll_top, 'scroll offset not realized');
+  }
+}
+function validateScrollCoverage(row) {
+  assert.ok(Array.isArray(row.scroll_regions) && row.scroll_regions.length<=1 && Array.isArray(row.scroll_captures) && row.scroll_captures.length<=MAX_SCROLL_CAPTURES && !Object.hasOwn(row,'controls_image'), 'missing/legacy scroll coverage inventory');
+  assert.ok(typeof row.hash==='string'&&/^[a-f0-9]{16}$/.test(row.hash),'missing certified matrix hash');
+  assert.ok(Number.isFinite(row.dpr)&&row.dpr>0&&row.dpr<=16,'missing/invalid matrix DPR');
+  const seen = new Set();
+  for (const region of row.scroll_regions) {
+    assert.equal(region.id, 'ASIDE', 'unsupported scroll region'); assert.ok(!seen.has(region.id), 'duplicate scroll region'); seen.add(region.id);
+    assert.equal(region.scroll_top, 0, 'baseline scroll region was not at the top');validateScrollRegion(region,row.viewport);
+    const offsets = scrollOffsets(region.client_height, region.scroll_height);
+    const records = row.scroll_captures.filter(record => record.id === region.id);
+    assert.equal(records.length, offsets.length, 'incomplete scroll capture coverage');
+    let covered = 0;
+    for (const [index, record] of records.entries()) {
+      assert.equal(record.scroll_top, offsets[index], 'missing/reordered scroll interval');
+      assert.equal(record.client_height, region.client_height); assert.equal(record.scroll_height, region.scroll_height);
+      assert.ok(record.scroll_top <= covered, 'gap in scroll coverage'); covered = record.scroll_top + record.client_height;
+      assert.ok(record.image && /^[a-f0-9]{64}$/.test(record.image.sha256) && Number.isSafeInteger(record.image.width) && Number.isSafeInteger(record.image.height) && record.image.width >= row.full_size[0] && record.image.height >= row.full_size[1], 'missing complete scroll frame image');
+      if (index === 0) assert.deepEqual(record.image, row.image, 'scroll top frame does not match baseline image');
+      else assert.equal(path.basename(record.image.path), `${row.theme}-${row.width}-${row.state}-controls-${index}.png`, 'scroll image identity mismatch');
+      validateScrollFrame(record.frame, row, region.id, record.scroll_top);
+    }
+    assert.equal(covered, region.scroll_height, 'scroll bottom not covered');
+    assert.equal(new Set(records.map(record => record.image.path)).size, records.length, 'duplicate scroll image path');
+  }
+  assert.equal(row.scroll_captures.length, [...seen].reduce((total,id) => total + row.scroll_captures.filter(record => record.id === id).length, 0), 'foreign scroll capture region');
+}
 function validateMatrix(records) {
   assert.equal(records.length, THEMES.length * WIDTHS.length * STATES.length, 'incomplete native matrix');
   const seen = new Set();
@@ -232,8 +308,7 @@ function validateMatrix(records) {
     assert.deepEqual(r.step_pressed, r.state === 'assembled' ? ['true', 'false'] : ['false', 'true']);
     assert.equal(r.explode, r.state === 'assembled' ? '0%' : '100%');
     assert.ok(r.image && /^[a-f0-9]{64}$/.test(r.image.sha256) && r.image.width >= r.width && r.image.height >= 700);
-    if (r.scroll_regions?.length) assert.ok(r.controls_image && /^[a-f0-9]{64}$/.test(r.controls_image.sha256)
-      && r.controls_image.width >= r.width && r.controls_image.height >= 700, 'missing scrolled controls capture');
+    validateScrollCoverage(r);
     if (r.full_size) assert.ok(r.image.width >= r.full_size[0] && r.image.height >= r.full_size[1], 'capture does not cover complete document');
   }
   for (const width of WIDTHS) {
@@ -283,6 +358,44 @@ async function capture(win, file, timeoutMs = 15000) {
   return { path: file, sha256: crypto.createHash('sha256').update(bytes).digest('hex'), width, height };
 }
 
+async function captureScrollRegions(win, directory, row, baselineFrame, errors) {
+  // Model-matrix coverage currently owns one ASIDE; unexpected/nested regions fail closed.
+  assert.ok(row.scroll_regions.length <= 1 && row.scroll_regions.every(region => region.id === 'ASIDE'), 'unsupported scroll region inventory');
+  if (!row.scroll_regions.length) return;
+  const region = row.scroll_regions[0], offsets = scrollOffsets(region.client_height, region.scroll_height);
+  assert.equal(region.scroll_top, 0, 'baseline scroll position was not at the top');
+  let firstError;
+  try {
+    validateScrollFrame(baselineFrame, row, region.id, 0);
+    const initial = { id:region.id, scroll_top:0, client_height:region.client_height, scroll_height:region.scroll_height,
+      image:row.image, frame:baselineFrame };
+    row.scroll_captures.push(initial);
+    const afterTop = { ...await evaluate(win, `(${measureFrame.toString()})()`), errors:[...errors] };
+    validateScrollFrame(afterTop, row, region.id, 0);
+    for (const [index, offset] of offsets.entries()) {
+      if (!index) continue;
+      await evaluate(win, `document.querySelector('aside').scrollTop=${offset}`);
+      await waitFor(win, `document.querySelector('aside').scrollTop===${offset}`, 5000);
+      // Observe a naturally painted frame after the scroll; no renderer resize/control shortcut.
+      await evaluate(win, 'new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))', 5000);
+      const frame = { ...await evaluate(win, `(${measureFrame.toString()})()`), errors:[...errors] };
+      validateScrollFrame(frame, row, region.id, offset); assert.deepEqual(errors, [], 'renderer diagnostics during scroll coverage');
+      const image = await capture(win, path.join(directory, `${row.theme}-${row.width}-${row.state}-controls-${index}.png`));
+      if (win.cassqueryImages) win.cassqueryImages.push(image);
+      const record = { id:region.id, scroll_top:offset, client_height:region.client_height, scroll_height:region.scroll_height, image, frame };
+      row.scroll_captures.push(record);
+      const after = { ...await evaluate(win, `(${measureFrame.toString()})()`), errors:[...errors] };
+      validateScrollFrame(after, row, region.id, offset); assert.deepEqual(errors, [], 'renderer diagnostics after scroll capture');
+    }
+    validateScrollCoverage(row);
+  } catch (error) { firstError = error; throw error; }
+  finally {
+    try {
+      await evaluate(win, `document.querySelector('aside').scrollTop=${region.scroll_top}`);
+      await waitFor(win, `document.querySelector('aside').scrollTop===${region.scroll_top}`, 5000);
+    } catch (cleanup) { if (firstError) firstError.message += `; scroll restore failed: ${cleanup.message}`; else throw cleanup; }
+  }
+}
 async function matrix(win, directory, nativeTheme, errors, records = []) {
   const previousTheme = nativeTheme.themeSource;
   try {
@@ -313,18 +426,12 @@ async function matrix(win, directory, nativeTheme, errors, records = []) {
           const measured = await evaluate(win, `(${measureFrame.toString()})()`);
           const controls = await evaluate(win, 'document.querySelectorAll("button, input, label").length');
           const image = await capture(win, path.join(directory, `${theme}-${width}-${state}.png`));
-          const row = { ...measured, realized_theme: measured.theme, theme, width, state, status: 'checked',
-            controls_checked: controls, errors: [...errors], image };
+          const row = { ...measured, realized_theme: measured.theme, theme, width, state, status: 'pending',
+            controls_checked: controls, errors: [...errors], image, scroll_captures: [] };
           if (win.cassqueryImages) win.cassqueryImages.push(image);
           records.push(row);
-          if (measured.scroll_regions.length) {
-            assert.ok(measured.scroll_regions.every((r) => r.id === 'ASIDE' && r.scroll_height <= r.client_height * 2), 'scroll content exceeds complete two-frame coverage');
-            await evaluate(win, 'document.querySelector("aside").scrollTop=document.querySelector("aside").scrollHeight');
-            await delay(100);
-            row.controls_image = await capture(win, path.join(directory, `${theme}-${width}-${state}-controls.png`));
-            if (win.cassqueryImages) win.cassqueryImages.push(row.controls_image);
-            await evaluate(win, 'document.querySelector("aside").scrollTop=0');
-          }
+          await captureScrollRegions(win, directory, row, {...measured,errors:[...errors]}, errors);
+          row.status = 'checked';
 
         }
       }
@@ -525,4 +632,4 @@ async function smoke(win, directory, { nativeTheme, errors = [], evidence = {} }
   Object.assign(evidence, report);
   return report;
 }
-module.exports = { smoke, waitFor, evaluate, bounded, closeWindow, capture, waitRendererLayout, checkpoint, click, measureFrame, validateMatrix, certifiedRebuildComplete, WIDTHS, THEMES, STATES, CHECKS };
+module.exports = { smoke, waitFor, evaluate, bounded, closeWindow, capture, waitRendererLayout, checkpoint, click, measureFrame, validateMatrix, scrollOffsets, validateScrollCoverage, captureScrollRegions, MAX_SCROLL_CAPTURES, certifiedRebuildComplete, WIDTHS, THEMES, STATES, CHECKS };

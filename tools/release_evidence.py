@@ -115,6 +115,95 @@ def validate_checkpoint(mark):
             for k in ('wall_time_ms', 'monotonic_ms')), 'missing or invalid checkpoint times')
 
 
+MAX_SCROLL_CAPTURES = 32
+
+
+def scroll_offsets(client_height, scroll_height):
+    require(type(client_height) is int and type(scroll_height) is int
+            and 0 < client_height < scroll_height <= 9007199254740991, 'invalid scroll dimensions')
+    step = max(1, math.floor(client_height * .9))
+    bottom = scroll_height - client_height
+    require(math.ceil(bottom / step) + 1 <= MAX_SCROLL_CAPTURES, 'scroll coverage exceeds bounded capture limit')
+    offsets = [0]
+    while offsets[-1] < bottom:
+        offsets.append(min(bottom, offsets[-1] + step))
+    return offsets
+
+
+def validate_scroll_visibility(region, viewport):
+    box, shown = region.get('viewport_rect'), region.get('visible_rect')
+    require(all(isinstance(rect, list) and len(rect) == 4 and all(finite_number(value) for value in rect)
+                and rect[2] > rect[0] and rect[3] > rect[1] for rect in (box, shown)), 'invalid scroll panel visible geometry')
+    require(abs(box[3] - box[1] - region['client_height']) <= 1
+            and -1 <= box[0] < box[2] <= viewport[0] + 1 and -1 <= box[1] < box[3] <= viewport[1] + 1
+            and -1 <= shown[0] < shown[2] <= viewport[0] + 1 and -1 <= shown[1] < shown[3] <= viewport[1] + 1
+            and all(abs(a - b) <= 1 for a, b in zip(box, shown)), 'scroll panel is clipped/offscreen; client height is not fully visible')
+
+
+def validate_scroll_frame(frame, row, offset):
+    require(isinstance(frame, dict) and 'image' not in frame and 'scroll_captures' not in frame,
+            'missing/recursive scroll frame proof')
+    for field in ('viewport', 'full_size', 'theme', 'background', 'hash', 'step_pressed', 'explode', 'canvas', 'dpr'):
+        require(frame.get(field) == row.get(field), 'scroll frame changed native state: ' + field)
+    require(frame.get('tier') == 'certified' and frame.get('gates_pass') is True
+            and isinstance(frame.get('hash'), str) and re.fullmatch(r'[0-9a-f]{16}', frame['hash'])
+            and finite_number(frame.get('dpr')) and 0 < frame['dpr'] <= 16,
+            'scroll frame lost certified identity')
+    require(all(type(frame.get(field)) is int and frame[field] > 0 for field in ('vertices', 'meshes', 'triangles'))
+            and frame['vertices'] == frame['triangles'] * 3, 'empty/inconsistent scroll frame geometry')
+    require(all(type(frame.get(field)) is int and frame[field] == 0 for field in ('clipped', 'nonfinite', 'degenerate'))
+            and frame.get('overflow') is False and frame.get('diag') == ''
+            and all(frame.get(field) == [] for field in ('bad', 'overlaps', 'errors')), 'scroll frame geometry/layout failure')
+    regions = frame.get('scroll_regions')
+    require(isinstance(regions, list) and len(regions) == len(row['scroll_regions']), 'scroll frame region inventory changed')
+    for region in regions:
+        require(isinstance(region, dict) and region.get('id') == 'ASIDE', 'foreign scroll frame region')
+        baseline = row['scroll_regions'][0]
+        require(all(type(region.get(field)) is int for field in ('client_height', 'scroll_height'))
+                and region.get('client_height') == baseline['client_height'] and region.get('scroll_height') == baseline['scroll_height']
+                and type(region.get('scroll_top')) is int and region['scroll_top'] == offset
+                and region.get('viewport_rect') == baseline.get('viewport_rect')
+                and region.get('visible_rect') == baseline.get('visible_rect'), 'scroll frame offset/dimensions/visible bounds not realized')
+        validate_scroll_visibility(region, row['viewport'])
+
+
+def validate_scroll_coverage(row):
+    regions, captures = row.get('scroll_regions'), row.get('scroll_captures')
+    require(isinstance(regions, list) and len(regions) <= 1 and isinstance(captures, list)
+            and len(captures) <= MAX_SCROLL_CAPTURES and 'controls_image' not in row, 'missing/legacy scroll coverage inventory')
+    if not regions:
+        require(not captures, 'foreign scroll capture without a region')
+        return
+    region = regions[0]
+    require(isinstance(region, dict) and region.get('id') == 'ASIDE' and type(region.get('scroll_top')) is int
+            and region['scroll_top'] == 0, 'unsupported/untop scroll region')
+    offsets = scroll_offsets(region.get('client_height'), region.get('scroll_height'))
+    validate_scroll_visibility(region, row['viewport'])
+    require(len(captures) == len(offsets), 'incomplete scroll capture coverage')
+    covered, paths = 0, []
+    for index, capture in enumerate(captures):
+        require(isinstance(capture, dict) and capture.get('id') == 'ASIDE'
+                and type(capture.get('scroll_top')) is int and capture['scroll_top'] == offsets[index]
+                and all(type(capture.get(field)) is int for field in ('client_height', 'scroll_height'))
+                and capture.get('client_height') == region['client_height'] and capture.get('scroll_height') == region['scroll_height'],
+                'missing/reordered scroll interval or changed dimensions')
+        require(capture['scroll_top'] <= covered, 'gap in scroll coverage')
+        covered = capture['scroll_top'] + capture['client_height']
+        image = capture.get('image', {})
+        require(isinstance(image, dict) and isinstance(image.get('path'), str)
+                and re.fullmatch(r'[0-9a-f]{64}', image.get('sha256', ''))
+                and all(type(image.get(field)) is int for field in ('width', 'height'))
+                and image['width'] >= row['full_size'][0] and image['height'] >= row['full_size'][1], 'missing full-document scroll image')
+        paths.append(image['path'])
+        if index == 0:
+            require(image == row['image'], 'top scroll image differs from baseline')
+        else:
+            require(PurePosixPath(image['path']).name == f"{row['theme']}-{row['width']}-{row['state']}-controls-{index}.png",
+                    'scroll image identity mismatch')
+        validate_scroll_frame(capture.get('frame'), row, capture['scroll_top'])
+    require(covered == region['scroll_height'] and len(set(paths)) == len(paths), 'scroll bottom missing or duplicate images')
+
+
 def validate_native_matrix(matrix):
     """Pure producer contract shared by live native and portable qualification."""
     expected = {(theme, width, state) for theme in ('dark', 'light')
@@ -133,6 +222,8 @@ def validate_native_matrix(matrix):
         require(all(row.get(field) == [] for field in ('bad', 'overlaps', 'errors')), 'native render diagnostics')
         require(row.get('realized_theme') == row['theme'], 'missing realized native coverage')
         require(row.get('gates_pass') is True and row.get('tier') == 'certified', 'native render did not show certified geometry')
+        require(isinstance(row.get('hash'), str) and re.fullmatch(r'[0-9a-f]{16}', row['hash'])
+                and finite_number(row.get('dpr')) and 0 < row['dpr'] <= 16, 'missing native certificate hash/device pixel ratio')
         require(type(row.get('width')) is int and row.get('viewport') == [row['width'], 700], 'native viewport does not match requested state')
         full = row.get('full_size')
         require(isinstance(full, list) and len(full) == 2 and all(type(v) is int for v in full)
@@ -143,16 +234,12 @@ def validate_native_matrix(matrix):
         canvas = row.get('canvas', {})
         require(isinstance(canvas, dict) and all(finite_number(canvas.get(field)) and canvas[field] > 0
                 for field in ('width', 'height', 'client_width', 'client_height')), 'missing realized native canvas')
-        for key in ('image', 'controls_image') if row['scroll_regions'] else ('image',):
-            image = row.get(key, {})
-            require(isinstance(image, dict) and isinstance(image.get('path'), str)
-                    and re.fullmatch(r'[0-9a-f]{64}', image.get('sha256', ''))
-                    and all(type(image.get(k)) is int for k in ('width', 'height'))
-                    and image['width'] >= full[0] and image['height'] >= full[1], 'native image does not cover viewport/full document')
-        require(all(isinstance(region, dict) and region.get('id') == 'ASIDE'
-                    and finite_number(region.get('client_height')) and finite_number(region.get('scroll_height'))
-                    and 0 < region['client_height'] < region['scroll_height'] <= region['client_height'] * 2
-                    for region in row['scroll_regions']), 'incomplete scroll-region coverage')
+        image = row.get('image', {})
+        require(isinstance(image, dict) and isinstance(image.get('path'), str)
+                and re.fullmatch(r'[0-9a-f]{64}', image.get('sha256', ''))
+                and all(type(image.get(k)) is int for k in ('width', 'height'))
+                and image['width'] >= full[0] and image['height'] >= full[1], 'native image does not cover viewport/full document')
+        validate_scroll_coverage(row)
     for width in (450, 700, 1000, 1320):
         colors = [r.get('background') for r in matrix if r['width'] == width and r['state'] == 'assembled']
         require(all(isinstance(color, str) and color for color in colors) and colors[0] != colors[1], 'native theme style did not change')
@@ -336,7 +423,8 @@ def validate_native_renderer(report, *, expected_sha, expected_arch, expected_ve
     images = report.get('images')
     require(isinstance(images, list) and all(isinstance(image, dict) for image in images), 'missing native image inventory')
     required_images = {f"{row['theme']}-{row['width']}-{row['state']}.png" for row in report['matrix']}
-    required_images |= {f"{row['theme']}-{row['width']}-{row['state']}-controls.png" for row in report['matrix'] if row['scroll_regions']}
+    required_images |= {f"{row['theme']}-{row['width']}-{row['state']}-controls-{index}.png"
+                        for row in report['matrix'] for index in range(1, len(row['scroll_captures']))}
     required_images |= {'orbit-drag.png', 'orbit-reset.png', 'pan-drag.png', 'pan-reset.png', 'assembled.png', 'apart.png'}
     if not bundled:
         required_images |= {'save-camera.png', 'save-certified.png', 'gate-failed.png'}
@@ -344,9 +432,9 @@ def validate_native_renderer(report, *, expected_sha, expected_arch, expected_ve
     require(all(isinstance(path, str) and path for path in paths) and len(paths) == len(set(paths))
             and len(images) == len(required_images) and {PurePosixPath(path).name for path in paths} == required_images, 'native image inventory does not cover production captures')
     for row in report['matrix']:
-        for key in ('image', 'controls_image') if row['scroll_regions'] else ('image',):
-            image = row[key]
-            suffix = '-controls' if key == 'controls_image' else ''
+        capture_images = [row['image']] + [capture['image'] for capture in row['scroll_captures'][1:]]
+        for index, image in enumerate(capture_images):
+            suffix = f'-controls-{index}' if index else ''
             require(image in images and PurePosixPath(image['path']).name == f"{row['theme']}-{row['width']}-{row['state']}{suffix}.png", 'native matrix image not in checked inventory')
     validate_cameras(report, bundled, images)
     for state in ('assembled', 'apart'):
@@ -400,11 +488,17 @@ def matrix_identity(root, report_path, matrix):
     values = []
     for row in matrix:
         item = dict(row)
-        for key in ('image', 'controls_image'):
+        for key in ('image',):
             if key in item:
                 record = item[key]
                 name = verify_record(root, report_path, record)
                 item[key] = {**record, 'path': name}
+        if 'scroll_captures' in item:
+            item['scroll_captures'] = []
+            for capture in row['scroll_captures']:
+                record = capture['image']
+                name = verify_record(root, report_path, record)
+                item['scroll_captures'].append({**capture, 'image': {**record, 'path': name}})
         values.append(item)
     return values
 

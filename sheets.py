@@ -2,7 +2,9 @@
 state, generated worker-side from the OCP BREP shapes at payload build time.
 
 Two sheets per payload (assembled: front/top/right/isometric; exploded:
-isometric), SVG primary + PDF from the same SVG via PyMuPDF. Every part on
+isometric), SVG primary + PDF from the same SVG via PyMuPDF. Large
+assemblies (see LARGE_ASSEMBLY_ISO_S) drop top+right from the assembled
+sheet per SPEC §13's 2026-10-25 re-decision. Every part on
 a sheet comes from the payload inventory; the parts list is generated from
 the same list, and generation asserts the two agree before writing files.
 
@@ -20,6 +22,20 @@ import numpy as np
 
 PAGE_W, PAGE_H = 420.0, 297.0  # A3 landscape, units are mm
 ROLES = ("sharp", "outline", "smooth")
+
+# Large-assembly view reduction (SPEC §13; Cassian re-decision 2026-10-25,
+# after kill trigger 1 tripped on time). render_state times the isometric
+# pass; over this threshold the assembled sheet keeps front+isometric and
+# omits top+right. Calibration (this VM, isometric project_view):
+# TESTPLATE 0.03 s (19 BREP faces), BARD 0.13 s (314 faces), IFRIT 87.8 s
+# (4,659 faces) — and IFRIT's assembly-only ortho passes measured top
+# 542.1 s / right 109.5 s, the cost this rule avoids. 15 s is spec §4's
+# own expense line (>15 s/view put sheets on the build-time branch); the
+# measured fleet sits ~100x under and ~6x over it.
+# shortcut: a project within timing noise of the line could land on
+# either side across hosts; pin the decision per payload hash if a
+# project ever measures near 15 s.
+LARGE_ASSEMBLY_ISO_S = 15.0
 
 # view name -> (direction toward viewer, screen-right direction), CAD axes
 VIEWS = {
@@ -318,8 +334,21 @@ def render_state(project, state, tier, hash_, parts, inventory):
     else:
         cells = {"isometric": (8, 8, 268, 180), "front": (8, 196, 132, 93),
                  "top": (144, 196, 132, 93), "right": (280, 196, 132, 93)}
-        for view in ("isometric", "front", "top", "right"):
-            attributed, _ = project_view(parts, view)
+        t_iso = time.time()
+        iso_attr, _ = project_view(parts, "isometric")
+        iso_s = time.time() - t_iso
+        views = [("isometric", iso_attr)]
+        if iso_s > LARGE_ASSEMBLY_ISO_S:
+            notes.append(f"view set reduced (large assembly): isometric HLR "
+                         f"took {iso_s:.0f}s (> {LARGE_ASSEMBLY_ISO_S:.0f}s "
+                         f"threshold); top/right omitted — SPEC §13 "
+                         f"re-decision 2026-10-25")
+            cells["front"] = (8, 196, 404, 93)  # front spans the row alone
+            views.append(("front", project_view(parts, "front")[0]))
+        else:
+            for view in ("front", "top", "right"):
+                views.append((view, project_view(parts, view)[0]))
+        for view, attributed in views:
             labels = None
             if view == "isometric":
                 centers = _centers(parts, view)

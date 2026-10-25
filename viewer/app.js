@@ -270,6 +270,7 @@ function goStep(i, animate) {
 async function loadProject(name) {
   current = name;
   currentStep = -1;
+  document.getElementById("sheets").innerHTML = "";
   try {
     manifest = await api(`/api/manifest?project=${name}`);
   } catch (e) {
@@ -337,6 +338,7 @@ async function fetchPayload(name, tier, hash) {
     setBadge(tier, tier === "certified"
       ? `certified · gates ${payload.gates && payload.gates.pass ? "passed" : "FAILED"} · ${hash.slice(0, 8)}`
       : `preview · not gate-checked · ${hash.slice(0, 8)}`);
+    refreshSheets();
     if (currentStep >= 0) {
       const keep = currentStep;
       currentStep = -1;
@@ -345,6 +347,35 @@ async function fetchPayload(name, tier, hash) {
   } catch (e) {
     document.getElementById("diag").textContent =
       `Could not load the ${tier} model for ${name}: ${e.message || e}`;
+  }
+}
+
+// ---------- drawing sheets (§13): links for the displayed payload ----------
+async function refreshSheets() {
+  const box = document.getElementById("sheets");
+  box.innerHTML = "";
+  if (!current || !model) return;
+  let data;
+  try {
+    data = await api(`/api/sheets?project=${current}`);
+  } catch { return; }
+  const entry = (data.sheets || {})[model.tier];
+  if (!entry || entry.hash !== model.hash) return;
+  if (entry.status === "pending") {
+    const s = document.createElement("span");
+    s.className = "pending";
+    s.textContent = "sheet pending";
+    box.append(s);
+    return;
+  }
+  for (const state of ["assembled", "exploded"]) {
+    for (const fmt of ["svg", "pdf"]) {
+      const a = document.createElement("a");
+      a.href = `/payload/${entry.files[state][fmt]}`;
+      a.download = entry.files[state][fmt];
+      a.textContent = `${state} ${fmt.toUpperCase()}`;
+      box.append(a);
+    }
   }
 }
 
@@ -492,6 +523,8 @@ function connectWS() {
     } else if (m.type === "build_failed" && m.project === current) {
       document.getElementById("diag").textContent = "Build error: " + (m.detail || m.error);
       setStale("build failed");
+    } else if (m.type === "sheets" && m.project === current) {
+      refreshSheets();
     } else if (m.type === "manifest" && m.project === current) {
       try {
         manifest = await api(`/api/manifest?project=${current}`);

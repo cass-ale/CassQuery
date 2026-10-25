@@ -82,6 +82,15 @@
   .navrow button { flex: 1; border-radius: var(--radius); }
   .tools { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--line); padding-top: 12px; }
   .tools label { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
+  .sheets { display: flex; flex-wrap: wrap; gap: 8px; }
+  .sheets a {
+    font-size: 13px; color: var(--ink); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 999px; padding: 8px 16px;
+    text-decoration: none;
+  }
+  .sheets a:hover { border-color: var(--accent); }
+  .sheets a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .sheets .pending { font-size: 12px; color: var(--muted); align-self: center; }
   input[type="range"] { width: 100%; accent-color: var(--accent); }
   input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .chips { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; margin: 0; padding: 12px 0 0; border-top: 1px solid var(--line); }
@@ -130,6 +139,7 @@
       <button id="xraybtn" type="button" aria-pressed="false">X-ray</button>
       <button id="buildbtn" type="button">Rebuild certified</button>
       <button id="resetview" type="button">Reset view</button>
+      <div class="sheets" id="sheets"></div>
       <pre id="diag"></pre>
     </div>
     <ul class="chips" id="chips"></ul>

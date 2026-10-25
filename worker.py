@@ -548,7 +548,84 @@ def run_build(p, tier):
     broadcast({"type": "announce", "project": p.name, "tier": tier, "hash": h,
                "url": f"/payload/{p.name}-{tier}.json",
                "gates_pass": (summary["gates"] or {}).get("pass")})
+    enqueue_sheets(p, tier, h)
     return True
+
+
+# ---------- drawing sheets (§13): build-time artifacts, subprocess jobs ----------
+# Generation rides behind the announce, never inside it: a payload whose
+# sheet is still generating serves its 3D view immediately. Each job runs
+# sheet_runner.py as a subprocess — HLR holds the GIL through multi-second
+# OCP calls, and an in-process sheet thread starved this worker's HTTP
+# handlers for ~27 s during an IFRIT build (measured 2026-10-25); a child
+# process cannot. Jobs are keyed by (project, tier); a newer build
+# replaces a pending job, and a job whose hash is no longer current is
+# skipped. This supervisor thread only waits on subprocesses.
+SHEET_JOBS = {}
+SHEET_LOCK = threading.Lock()
+SHEET_WAKE = threading.Event()
+
+
+def enqueue_sheets(p, tier, h):
+    with SHEET_LOCK:
+        SHEET_JOBS[(p.name, tier)] = (p, tier, h)
+    SHEET_WAKE.set()
+
+
+def sheet_thread():
+    import signal
+    import subprocess
+    import tempfile
+    while True:
+        SHEET_WAKE.wait()
+        with SHEET_LOCK:
+            jobs = list(SHEET_JOBS.values())
+            SHEET_JOBS.clear()
+            SHEET_WAKE.clear()
+        for p, tier, h in jobs:
+            if p.hashes.get(tier) != h:
+                continue  # superseded by a newer build
+            # The live loop outranks sheets (spec §3): the runner is
+            # niced for general contention and SIGSTOPped for the whole
+            # duration of any build — nice alone still cost a concurrent
+            # IFRIT certified build 84.6 s vs its 62.75 s solo baseline
+            # on this 2-core VM (measured 2026-10-25). Output goes to a
+            # temp file, not a pipe the child could block on while stopped.
+            argv = [sys.executable, os.path.join(HERE, "sheet_runner.py"),
+                    p.root, p.name, tier, h, PAYLOAD_DIR]
+            if os.name == "posix":
+                argv = ["nice", "-n", "15"] + argv
+            with tempfile.TemporaryFile() as out:
+                proc = subprocess.Popen(argv, stdout=out,
+                                          stderr=subprocess.STDOUT)
+                stopped = False
+                while proc.poll() is None:
+                    building = any(q.state.startswith("building")
+                                   for q in PROJECTS.values())
+                    if building and not stopped:
+                        proc.send_signal(signal.SIGSTOP)
+                        stopped = True
+                    elif not building and stopped:
+                        proc.send_signal(signal.SIGCONT)
+                        stopped = False
+                    time.sleep(1)
+                if stopped:
+                    proc.send_signal(signal.SIGCONT)
+                out.seek(0)
+                text = out.read().decode(errors="replace")
+            if proc.returncode != 0:
+                p.log("sheets-failed", text.strip()[-800:])
+                print(f"CassQuery sheets {p.name}/{tier} FAILED:\n{text}", flush=True)
+                broadcast({"type": "sheets_failed", "project": p.name,
+                           "tier": tier, "hash": h})
+                continue
+            for line in text.splitlines():
+                if line.startswith("NOTE "):
+                    p.log("sheet-note", line[5:])
+                    print(f"CassQuery sheets {p.name}/{tier}: {line[5:]}", flush=True)
+                elif line.startswith("DONE "):
+                    p.log("sheets", line[5:] + "s")
+            broadcast({"type": "sheets", "project": p.name, "tier": tier, "hash": h})
 
 
 def build_thread():
@@ -680,6 +757,22 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/manifest":
             p = self._project((q.get("project") or [""])[0])
             return p and self._send(200, p.manifest)
+        if u.path == "/api/sheets":
+            p = self._project((q.get("project") or [""])[0])
+            if not p:
+                return
+            out = {}
+            for tier in ("certified", "preview"):
+                h = p.hashes.get(tier)
+                if not h:
+                    continue
+                fp = os.path.join(PAYLOAD_DIR, f"{p.name}-{tier}-{h}-sheets.json")
+                if os.path.exists(fp):
+                    out[tier] = json.load(open(fp))
+                else:
+                    out[tier] = {"project": p.name, "tier": tier, "hash": h,
+                                 "status": "pending"}
+            return self._send(200, {"project": p.name, "sheets": out})
         if u.path == "/api/gates":
             p = self._project((q.get("project") or [""])[0])
             return p and self._send(200, p.gates or {"pass": None, "note": "no certified build yet"})
@@ -695,7 +788,10 @@ class Handler(BaseHTTPRequestHandler):
         if u.path.startswith("/payload/"):
             fp = os.path.join(PAYLOAD_DIR, os.path.basename(u.path))
             if os.path.exists(fp):
-                return self._send(200, open(fp, "rb").read())
+                ctype = {"svg": "image/svg+xml", "pdf": "application/pdf",
+                         "json": "application/json"}.get(
+                             fp.rsplit(".", 1)[-1], "application/octet-stream")
+                return self._send(200, open(fp, "rb").read(), ctype)
             return self._send(404, {"error": "no such payload"})
         # static viewer
         rel = u.path.lstrip("/") or "index.html"
@@ -827,6 +923,7 @@ def main(argv=None):
               open(os.path.expanduser("~/.cassquery.json"), "w"))
     threading.Thread(target=ws_thread, args=(port + 1000,), daemon=True).start()
     threading.Thread(target=build_thread, daemon=True).start()
+    threading.Thread(target=sheet_thread, daemon=True).start()
     threading.Thread(target=watcher, args=(loaded,), daemon=True).start()
     print(f"CassQuery worker on http://127.0.0.1:{port} (ws {port + 1000}), "
           f"projects: {', '.join(PROJECTS) or '(none)'}", flush=True)

@@ -1,11 +1,13 @@
 # AGENTS.md — working rules for CassQuery
 
-CassQuery is a local viewer for CadQuery projects: a warm Python worker builds
-semantic payloads from a project's build-only entry point, and a three.js
-viewer (browser or Electron shell) shows them as a two-tier live loop —
-labelled previews for iteration, gate-checked certified builds for truth.
-The design contract is `SPEC.md` in the viewer-tool workspace (v0.3); this
-file is the standard of work for anyone — human or agent — changing the code.
+CassQuery is a local source-backed workbench for CadQuery projects: a warm Python
+worker builds semantic payloads from a project's build-only entry point, and a
+three.js viewer (browser or Electron shell) shows them as a two-tier live loop —
+labelled previews for iteration, gate-checked certified builds for truth. The
+v0.2 desktop editor and file/model/update boundaries are defined additively in
+`docs/WORKBENCH.md`; its behavior must be independently verified before release.
+The original design contract is `SPEC.md` in the viewer-tool workspace (v0.3);
+this file is the standard of work for anyone — human or agent — changing code.
 
 ## The depth standard
 
@@ -97,6 +99,29 @@ confiscates the camera — direction survives, distance is recomputed.
 - Release readiness and every checked/not-checked gap live in `docs/AUDIT.md` and
   `docs/MACOS_RELEASE.md`; preserve their distinctions rather than promising
   first-attempt success.
+
+## Workbench data and update safety
+
+- Python files and the project manifest are authoritative. Unsaved editor buffers
+  are inert drafts; restore them without executing or saving them automatically.
+- File saves preserve conflicting revisions. Do not claim universal filesystem
+  atomic CAS from a hash check followed by replacement. Recovery and interrupted
+  transaction tests must retain actual draft/external bytes.
+- Model transforms are real BREP edits with explicit units, pivot and order,
+  applied before nominal geometry truth. Camera/explode/visibility are display-only.
+- Inspect/export the retained current certificate, not the last preview or a
+  second execution of project Python. Stale/failed/dirty work must not be labelled
+  current certified export. STEP/STL/BREP do not reconstruct parametric history.
+- Native dialogs and a restrictive preload broker own file authority. Keep
+  sandbox, context isolation and no Node integration; never expose a general
+  filesystem/shell/URL execution bridge or private worker capability.
+- Drafts/settings live outside project and app resources. Recovery identity
+  includes the canonical project root and relative file, not just a basename.
+- Updates select the correct stable version/architecture and verify real bytes.
+  Check/download tests are not installation proof: native restart, acknowledgement,
+  backup/rollback and user-data preservation require separate qualification.
+- Never control or modify the person's running installed app for automated tests;
+  use owned isolated fixtures and userData, and honor host permission denials.
 
 ## Repo hygiene
 

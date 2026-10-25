@@ -38,7 +38,7 @@ function contextFor(THREE, OrbitControls, bounds, reduced = false, aspect = 4 / 
   return { context, camera, controls, model, variant };
 }
 function settle(context, frames = 180) {
-  vm.runInContext(app.slice(app.indexOf('function tick(now)'), app.indexOf('window.__cq')), context);
+  vm.runInContext(app.slice(app.indexOf('function tick(now)'), app.indexOf('window.__cq =', app.indexOf('function tick(now)'))), context);
   for (let i = 1; i <= frames; i++) vm.runInContext(`tick(${i * 1000 / 60})`, context);
 }
 

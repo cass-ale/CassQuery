@@ -273,22 +273,26 @@ class PackageAssuranceTests(unittest.TestCase):
 
     def fake_bundle(self):
         repo = self.root / 'repo'; repo.mkdir()
-        for name in ('assets/icons/cassquery.icns', 'worker.py', 'shell/main.js', 'shell/runtime.cjs', 'shell/smoke.cjs', 'shell/renderer_config.cjs'):
+        for name in ('assets/icons/cassquery.icns', *native.PYTHON_SOURCE_PATHS, *native.SHELL_FILES):
             file = repo / name; file.parent.mkdir(parents=True, exist_ok=True); file.write_bytes(name.encode())
+        (repo / 'package.json').write_bytes((ROOT / 'package.json').read_bytes())
         app = self.root / 'CassQuery.app'
         resources = app / 'Contents/Resources'; resources.mkdir(parents=True)
         (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': 'com.cassquery.desktop',
             'CFBundleExecutable': 'CassQuery', 'CFBundleShortVersionString': VERSION, 'CFBundleVersion': VERSION, 'CFBundleIconFile': 'icon.icns'}))
         (resources / 'icon.icns').write_bytes((repo / 'assets/icons/cassquery.icns').read_bytes())
         (resources / 'source').mkdir()
-        (resources / 'source/worker.py').write_bytes((repo / 'worker.py').read_bytes())
+        for name in native.PYTHON_SOURCE_PATHS:
+            for target in (resources / 'source' / name, resources / 'worker/_internal/source' / name):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((repo / name).read_bytes())
         for name in ('Contents/MacOS/CassQuery', 'Contents/Resources/worker/cassquery-worker', 'Contents/Resources/worker/_internal/lazy-extension.so',
                      'Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries/libvk_swiftshader.dylib'):
             file = app / name; file.parent.mkdir(parents=True, exist_ok=True); file.write_bytes(bytes.fromhex('cffaedfe') + b'native'); file.chmod(0o755)
         libraries = app / 'Contents/Frameworks/Electron Framework.framework/Versions/A/Libraries'
         (libraries / 'libvulkan.dylib').symlink_to('libvk_swiftshader.dylib')
-        packed = {'package.json': json.dumps({'version': VERSION}).encode()}
-        packed.update({name: (repo / name).read_bytes() for name in ('shell/main.js', 'shell/runtime.cjs', 'shell/smoke.cjs', 'shell/renderer_config.cjs')})
+        packed = {'package.json': (repo / 'package.json').read_bytes()}
+        packed.update({name: (repo / name).read_bytes() for name in native.SHELL_FILES})
         return repo, app, packed
 
     def test_all_macho_including_lazy_dependency_architecture_is_checked(self):

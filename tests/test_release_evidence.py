@@ -228,7 +228,11 @@ class NativeConformanceTests(unittest.TestCase):
             elif isinstance(value, list):
                 for item in value:
                     links(item, directory)
-        files = [p for p in (self.root / 'evidence').rglob('*.json') if p.name != 'source-before.json']
+        # This helper mutates legacy native reports only. New feature fixtures include
+        # intentionally opaque protected *.json bytes and exact raw API responses;
+        # never parse/reserialize those unrelated proof files during a legacy mutation.
+        files = [p for p in (self.root / 'evidence').rglob('*.json') if p.name != 'source-before.json'
+                 and not p.relative_to(self.root / 'evidence').as_posix().startswith(('workbench-', 'update-', 'updatecheck-'))]
         for file in sorted(files, key=lambda p: (len(p.parts), p.name not in ('renderer.json', 'package.json', 'preflight.json', 'worker-arm64.json')), reverse=True):
             value = json.loads(file.read_text())
             links(value, file.parent)
@@ -249,8 +253,12 @@ class NativeConformanceTests(unittest.TestCase):
         for name, data in self.files.items():
             if name.endswith('.png'):
                 width, height = png.dimensions(data)
-                self.assertGreaterEqual(width, 450)
-                self.assertEqual(height, 700)
+                self.assertGreaterEqual(min(width, height), 100)
+                if name.startswith(('evidence/mac-', 'evidence/zip-', 'evidence/dmg-')):
+                    self.assertGreaterEqual(width, 450)
+                    self.assertEqual(height, 700)  # The unchanged legacy16-cell viewport.
+                # New workbench/update images use their producer's realized viewport,
+                # validated by the corresponding full gate, not the legacy700px rule.
 
     def test_actual_producer_canonical_json_preserves_complete_package_inventory(self):
         from macos_smoke import write_report

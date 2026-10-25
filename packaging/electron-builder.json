@@ -4,10 +4,23 @@
   "asar": true,
   "afterPack": "./tools/package_renderer.cjs",
   "directories": { "output": "dist/mac-app" },
-  "files": ["shell/**", "package.json"],
+  "files": [
+    "shell/desktop.cjs",
+    "shell/main.js",
+    "shell/preload.cjs",
+    "shell/renderer_config.cjs",
+    "shell/runtime.cjs",
+    "shell/smoke.cjs",
+    "shell/update_install.cjs",
+    "shell/updater.cjs",
+    "package.json"
+  ],
+  "electronFuses": { "runAsNode": true },
   "extraResources": [
     { "from": "dist/cassquery-worker", "to": "worker" },
     { "from": "worker.py", "to": "source/worker.py" },
+    { "from": "workbench.py", "to": "source/workbench.py" },
+    { "from": "cad_io.py", "to": "source/cad_io.py" },
     { "from": "viewer", "to": "source/viewer" },
     { "from": "testpart", "to": "source/testpart" },
     { "from": "LICENSE", "to": "LICENSE" }

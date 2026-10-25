@@ -46,6 +46,15 @@ jobs:
         run: node tools/integration_suite.cjs
       - name: Validate independent report bytes
         run: node tools/integration_suite.cjs --validate-report evidence/live-integration/integration-results.json
+      - name: Real workbench editor and CAD roundtrip
+        env:
+          CASSQUERY_PYTHON: python
+          CASSQUERY_BROWSER: /usr/bin/google-chrome
+          CASSQUERY_BASELINE_REPORT: evidence/live-integration/integration-results.json
+          CASSQUERY_WORKBENCH_OUTPUT: evidence/workbench-integration
+        run: node tools/workbench_suite.cjs
+      - name: Validate workbench report bytes
+        run: node tools/workbench_suite.cjs --validate-report evidence/workbench-integration/workbench-results.json
       - name: Keep integration evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

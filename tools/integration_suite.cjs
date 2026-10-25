@@ -287,6 +287,19 @@ function validateReport(report, directory) {
   assert.equal(report.source.chromium_sandbox, true);
   assert.match(report.source.worker_sha256, /^[a-f0-9]{64}$/);
   assert.match(report.source.viewer_sha256, /^[a-f0-9]{64}$/);
+  const python = report.source.python_sources;
+  assert.ok(Array.isArray(python) && python.length >= 3 && python.length <= 10, 'missing Python source closure');
+  assert.equal(new Set(python.map((item) => item.path)).size, python.length, 'duplicate Python source record');
+  assert.ok(['worker.py', 'workbench.py', 'cad_io.py'].every((name) => python.some((item) => item.path === name)),
+    'incomplete workbench Python source closure');
+  for (const item of python) {
+    assert.match(item.path, /^[A-Za-z_][A-Za-z0-9_]*\.py$/, 'unsafe Python source path');
+    assert.ok(Number.isSafeInteger(item.bytes) && item.bytes > 0 && item.bytes <= 2 * 1024 ** 2,
+      'invalid Python source size');
+    assert.match(item.sha256, /^[a-f0-9]{64}$/);
+  }
+  assert.equal(python.find((item) => item.path === 'worker.py').sha256, report.source.worker_sha256,
+    'worker hash differs from source closure');
   return true;
 }
 
@@ -519,7 +532,20 @@ async function run(options = {}) {
     // Preparation is guarded too: missing source must leave a red report and no temp fixture.
     fs.mkdirSync(source);
     // Deliberately do not copy checked-in payloads, private projects, home preferences, or packages.
-    fs.copyFileSync(path.join(root, 'worker.py'), path.join(source, 'worker.py'));
+    const pythonSources = readJSON(path.join(root, 'package.json')).cassquerySources.python;
+    assert.ok(Array.isArray(pythonSources) && pythonSources.length >= 3 && pythonSources.length <= 10,
+      'missing or excessive declared Python source closure');
+    assert.equal(new Set(pythonSources).size, pythonSources.length, 'duplicate Python source');
+    for (const name of pythonSources) {
+      assert.match(name, /^[A-Za-z_][A-Za-z0-9_]*\.py$/, 'unsafe Python source path');
+      fs.copyFileSync(path.join(root, name), path.join(source, name));
+    }
+    assert.ok(['worker.py', 'workbench.py', 'cad_io.py'].every((name) => pythonSources.includes(name)),
+      'incomplete workbench Python source closure');
+    report.source.python_sources = pythonSources.map((name) => {
+      const bytes = fs.readFileSync(path.join(source, name));
+      return { path: name, bytes: bytes.length, sha256: digest(bytes) };
+    });
     fs.cpSync(path.join(root, 'viewer'), path.join(source, 'viewer'), { recursive: true });
     fs.cpSync(path.join(root, 'testpart'), path.join(source, 'testpart'), { recursive: true });
     originalWorker = fs.readFileSync(path.join(source, 'worker.py'), 'utf8');
@@ -910,6 +936,8 @@ async function run(options = {}) {
       // Isolated copied-source witness uses the SAME live production HTTP assertion as baseline.
       const mutantRoot = path.join(temporary, 'mutant'); fs.mkdirSync(mutantRoot);
       const hashes = mutateWorker(path.join(mutantRoot, 'worker.py'));
+      for (const name of pythonSources.filter((name) => name !== 'worker.py'))
+        fs.copyFileSync(path.join(source, name), path.join(mutantRoot, name));
       fs.cpSync(path.join(root, 'testpart'), path.join(mutantRoot, 'testpart'), { recursive: true });
       const mutant = await startWorker('mutant', [], mutantRoot);
       let detected = false;

@@ -5,13 +5,15 @@
   <img src="branding/readme-dark.svg" alt="CassQuery — a precision workspace for parametric design" width="1280">
 </picture>
 
-A local desktop viewer for CadQuery projects: edit the source, and the model in front of you updates — no export, no re-import, no twenty-second wait to find out what a fillet did.
+A local CadQuery workbench: edit Python, change source-backed parameters and part transforms, inspect certified solids, and export the geometry that was actually checked. The viewer remains available directly in a browser; filesystem editing and updates use the restricted desktop boundary.
 
 CassQuery was built for parametric jewelry design, where one project is a chain of interdependent parts and the honest way to check a change is to *look at it*: posed, sectioned, X-rayed, measured. It is a personal tool, built in the open.
 
-![CassQuery's Counterform interface showing the public TESTPLATE fixture](docs/viewer.png)
+![CassQuery workbench editing the public TESTPLATE source](docs/workbench.png)
 
-*The actual browser renderer with the public TESTPLATE fixture: three parts, authored steps and certified-state labels. This screenshot uses a disconnected fixture server; it is not evidence of a connected live CAD loop or native macOS launch.*
+*Actual v0.2 source browser/worker test: Python editing and a newly certified model.
+The desktop chooser in this source test is simulated; it is not native macOS dialog
+or updater-install proof. v0.2 release qualification is still in progress.*
 
 ## Why it exists
 
@@ -24,12 +26,31 @@ CassQuery splits the round trip in two:
 
 ## What it does
 
-- **Semantic payloads, not mesh dumps.** Parts arrive named, with face and edge identity intact — so picking, per-part finishes, and measurement work on the model, not on a triangle soup.
-- **A units gate on every payload.** Small parts are where unit handling silently dies (a 0.23 mm wall becoming 0.20 mm is a failed part, not a rounding choice). Every payload is checked for scale, extent, and per-part volume before it is allowed on screen.
+- **Named geometry payloads.** Parts arrive with stable names, packed triangle geometry and per-part finishes. Picking and visibility work on those named parts; payloads do not preserve BREP face/edge topology or provide CAD face-level editing.
+- **Units and geometry gates on certified payloads.** Certified builds check source-versus-mesh extents, volume, closure, triangulation and encoding. Previews are deliberately ungated and visibly labelled; they are not manufacturing truth.
 - **Authored steps.** A project can declare posed states — a joint bent, a component drawn out, an exploded view, an X-ray ghost — and the viewer steps through them instantly, because they are certified builds, not re-poses.
 - **Camera that respects you.** Rebuilds keep your camera direction by default (`keep` mode); the model updates, your viewpoint doesn't get confiscated.
 - **Finishes per part.** Brushed, polished, per material — assigned in the project manifest, applied in the payload.
 - **An agent protocol on loopback.** The same worker serves a small local API — rebuild, status, gate results as data, body list, set step/camera, screenshot — so an AI assistant can drive the viewer and verify its own work against the gates instead of admiring a render.
+
+## v0.2 workbench
+
+- Open project folders, trusted Python files, or import STEP into an editable project.
+- Edit actual Python/JSON files, find text, indent, undo/redo, and recover unsaved drafts.
+- Change supported top-level scalar parameters and named-part BREP transforms.
+- Inspect exact certified BREP bounds, volume and surface area. Camera/explode/hide
+  are display-only; stale or failed geometry cannot masquerade as a current export.
+- Export STEP/STP, STL, BREP, project ZIP, or an explicit Python copy. STEP imports
+  do not reconstruct parametric history; source ZIP preserves the editable project.
+- Eight offline themes and persistent editor/build/update settings.
+- Cmd/Ctrl+O open, Shift+O folder, N new, S save, Shift+S copy, F find, B rebuild,
+  E export, comma settings, Z/Shift+Z undo/redo. Model-view keys are focus-safe.
+- Stable GitHub release checks and optional downloads; explicit custom restart/install
+  requires a verified update and a writable user-owned installation. See [UPDATES.md](docs/UPDATES.md).
+
+Source behavior has been exercised; native dialog/package/update qualification is
+still pending. Contracts, limits and proof distinctions: [WORKBENCH.md](docs/WORKBENCH.md),
+[WORKBENCH_ASSURANCE.md](docs/WORKBENCH_ASSURANCE.md), and [AUDIT.md](docs/AUDIT.md).
 
 ## Viewer controls
 
@@ -50,7 +71,7 @@ CadQuery project ──► worker.py ──► semantic payload ──► viewer
 ```
 
 - `worker.py` — one warm process: file watcher, build thread, HTTP server for the viewer and payloads, websocket announce, and the agent protocol. A failed build announces nothing; the last good payload is retained.
-- `viewer/` — the three.js frontend (vendored three.js in `viewer/vendor/`), including the step player, X-ray and clipping views, and finish rendering.
+- `viewer/` — the three.js frontend (vendored three.js in `viewer/vendor/`), including the step player, per-part visibility, X-ray display and finish rendering.
 - `shell/` — a thin Electron shell that spawns the worker and hosts the viewer. The viewer also runs in any modern browser against the worker directly.
 - `testpart/` — a trivial public demo project (a plate with holes and a boss) with its manifest, used to prove the loop end to end.
 - `payloads/` — generated payloads. The TESTPLATE payloads are committed as a fixture; other projects' payloads are generated locally and are not committed.
@@ -120,13 +141,15 @@ Then open the viewer at the URL the worker prints. The port is **3939** unless i
 
 ## Status
 
-v1 is built and verified: both tiers live, all eight certified gates exercised (including a deliberate gate-failure run where the last certified model stayed on screen), the save → preview → certified loop proven end to end with render-checked screenshots, and the agent protocol driven headlessly against the running worker. The post-v1 passes are in: the zero-config demo boot, per-project load isolation, and the versioned status API above, plus a viewer polish pass — reset view with aspect-aware framing, click-vs-drag picking, loading and error states that always land somewhere visible, and every failure path in the viewer and the shell exercised live. Windows and macOS are the target desktops. The macOS development candidate now has an Electron `.app` build with bundled CadQuery and automated native worker/render/package gates for Apple Silicon and Intel. It is an ad-hoc-signed candidate, **not a published or notarized release**; see [the checked/not-checked release boundary](docs/MACOS_RELEASE.md). Windows packaging, onboarding and automatic updates remain unimplemented. The design projects it was built for are private; their models and payloads are not in this repository. The demo project (`testpart/`) and its payloads are the public proof of the loop.
+[v0.1.0 is published](https://github.com/cass-ale/CassQuery/releases/tag/v0.1.0) with Apple Silicon and Intel ZIP/DMG packages. Its exact source passed independent source, frozen-worker, native-renderer, extracted/copied ZIP, and mounted/copied DMG checks, and published package bytes were re-downloaded and matched to the qualified candidates. Distribution is **ad-hoc signed and non-hardened, not notarized**; macOS 14 clean-device, quarantined Finder launch and hardware-Metal execution are not claimed. Windows packaging is not implemented.
+
+v0.2.0 workbench development is in progress: source editing, safe project operations, CAD import/export, source-backed model transforms, themes/settings and GitHub updates. These are not released features until their production and package gates pass. The additive contracts and limitations are in [WORKBENCH.md](docs/WORKBENCH.md). Private models and payloads are not in this repository; only the public TESTPLATE fixture is used for proof.
 
 Working on this repo — human or agent? Read [AGENTS.md](AGENTS.md) first: it carries the depth standard and the verification laws this codebase is held to.
 
 ## Test and release gates
 
-The first release target is **v0.1.0**. Complete the separate
+The current workbench release target is **v0.2.0**. Complete the separate
 [pre-push checklist](docs/PRE_PUSH.md), [pre-release checklist](docs/PRE_RELEASE.md)
 and [test-method guide](docs/TESTING.md). A passing source test suite is not
 permission to tag or publish; exact-SHA native/package evidence and protected

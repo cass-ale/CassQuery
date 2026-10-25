@@ -5,6 +5,17 @@ A packaged launch needs neither Node nor Python on PATH. macOS 14+ is the initia
 build target; Apple Silicon and Intel are separate native candidates, not a
 universal bundle. The target is not evidence of a clean-machine or minimum-OS test.
 
+## Released baseline
+
+[v0.1.0](https://github.com/cass-ale/CassQuery/releases/tag/v0.1.0) is published
+at source `33c2d35f817ced4a3e85a54ed6ce148ce7030d62`. Its Apple Silicon and
+Intel app, extracted/copied ZIP, mounted/copied DMG and final staging all passed
+[candidate40152969599](https://github.com/cass-ale/CassQuery/actions/runs/40152969599).
+Same-source integration and protected publication passed. Final candidate bytes,
+inspected native frames and re-downloaded public assets match. Distribution is
+ad-hoc/non-hardened and not notarized; the minimum-OS and clean-device limits
+remain unchanged. v0.2 workbench source is not qualified by this baseline.
+
 ## Build and check
 
 Use Node 22.23.4 and a standalone CPython 3.12 (with a discoverable shared

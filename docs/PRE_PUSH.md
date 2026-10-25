@@ -1,7 +1,9 @@
 # Pre-push checklist
 
 This gate is for source changes—not permission to create a release or tag.
-Initial release target: **v0.1.0**.
+Current workbench release target: **v0.2.0**. Source may be pushed for exact-source
+native CI only after source/workbench gates pass; the tag waits for complete
+candidate qualification.
 
 ## Required before pushing
 

@@ -651,6 +651,87 @@ test('rebuild preserves inactive variant visibility when it loads lazily; new pa
   assert.equal(h.eval('activeVariant()[1].parts.get("Base").meshes[0].visible'), true);
 });
 
+test('dynamic projects snapshots render new registrations without switching or changing the visible inspection', async () => {
+  const h = harness(); const model = await h.prepare();
+  h.eval('camera.position.set(10, 20, 30); controls.target.set(1, 2, 3); selected = "Base"; applyXray(true); applyExplode(0.5); explodeTarget = 0.5');
+  const before = h.eval('({ projectRequest, workerEpoch, manifest, model, currentStep, displayedStep, camera: camera.position, target: controls.target })');
+  let guardCalls = 0, notifications = 0;
+  h.context.window.__cq.beforeProjectChange = async () => { guardCalls++; return false; };
+  h.context.CustomEvent = class { constructor(type) { this.type = type; } };
+  h.context.window.dispatchEvent = (event) => { if (event.type === 'cassquery:viewchange') notifications++; };
+  h.context.snapshot = [{ name: 'TESTPLATE', state: 'certified', hashes: { certified: model.hash } }, { name: 'ROUNDTRIPPLATE', root: '/roundtrip', state: 'idle', hashes: {} }];
+  await h.sockets[0].onmessage({ data: JSON.stringify({ type: 'projects', projects: h.context.snapshot }) });
+  assert.deepEqual(h.node('projects').children.map((b) => b.dataset.name), ['TESTPLATE', 'ROUNDTRIPPLATE']);
+  assert.equal(h.eval('current'), 'TESTPLATE'); assert.equal(h.eval('model'), before.model); assert.equal(h.eval('manifest'), before.manifest);
+  assert.equal(h.eval('projectRequest'), before.projectRequest); assert.equal(h.eval('workerEpoch'), before.workerEpoch);
+  assert.equal(h.eval('currentStep'), before.currentStep); assert.equal(h.eval('displayedStep'), before.displayedStep);
+  assert.equal(h.eval('camera.position'), before.camera); assert.equal(h.eval('camera.position.x'), 10); assert.equal(h.eval('controls.target.y'), 2);
+  assert.equal(h.eval('selected'), 'Base'); assert.equal(h.eval('xrayOn'), true); assert.equal(h.eval('explodeTarget'), 0.5);
+  assert.equal(guardCalls, 0); assert.equal(notifications, 1);
+});
+
+test('dynamic projects snapshot fences an older HTTP refresh so it cannot hide or auto-select a new project', async () => {
+  const wait = deferred(), h = harness({ boot: wait.promise });
+  h.routes.set('/api/manifest?project=TESTPLATE', manifestFor()); h.put(fixture());
+  h.context.testProject = { name: 'TESTPLATE', state: 'idle', hashes: {} }; h.eval('projects = [testProject]'); await h.eval('loadProject("TESTPLATE")');
+  const refresh = h.eval('refreshProjects("OLD")'); await flush();
+  await h.eval('handleMessage({type:"projects",projects:[{name:"TESTPLATE",state:"idle"},{name:"IMPORTED",state:"idle"}]})');
+  wait.resolve([{ name: 'OLD', state: 'idle' }]); await refresh; await flush();
+  assert.equal(h.eval('current'), 'TESTPLATE'); assert.deepEqual(h.node('projects').children.map((b) => b.dataset.name), ['TESTPLATE', 'IMPORTED']);
+});
+
+test('a validated registration snapshot preserves the latest explicit Open selection despite older HTTP data', async () => {
+  const wait = deferred(), h = harness({ boot: wait.promise });
+  await flush(); h.routes.set('/api/manifest?project=TESTPLATE', manifestFor());
+  h.routes.set('/api/manifest?project=OPENED', manifestFor('OPENED'));
+  h.context.testProject = { name: 'TESTPLATE', state: 'idle' }; h.eval('projects = [testProject]'); await h.eval('loadProject("TESTPLATE")');
+  const opening = h.eval('refreshProjects("OPENED")'); await flush();
+  await h.eval('handleMessage({type:"projects",projects:[{name:"TESTPLATE",state:"idle"},{name:"OPENED",root:"/opened",state:"idle"}]})');
+  assert.equal(h.eval('current'), 'TESTPLATE', 'snapshot alone must not switch');
+  wait.resolve([{ name: 'TESTPLATE', state: 'idle' }]); assert.equal(await opening, true);
+  assert.equal(h.eval('current'), 'OPENED'); assert.equal(h.eval('manifest.name'), 'OPENED');
+  assert.deepEqual(h.node('projects').children.map((button) => button.dataset.name), ['TESTPLATE', 'OPENED']);
+});
+
+test('newer explicit Open or direct project choice cancels an older selection intent, not the snapshot itself', async () => {
+  const first = deferred(), second = deferred(); let calls = 0;
+  const h = harness({ boot: () => ++calls === 1 ? [] : calls === 2 ? first.promise : second.promise }); await flush();
+  for (const name of ['TESTPLATE', 'OLDER', 'NEWER']) h.routes.set('/api/manifest?project=' + name, manifestFor(name));
+  h.context.testProject = { name: 'TESTPLATE', state: 'idle' }; h.eval('projects = [testProject]'); await h.eval('loadProject("TESTPLATE")');
+  const oldOpen = h.eval('refreshProjects("OLDER")'), newOpen = h.eval('refreshProjects("NEWER")'); await flush();
+  await h.eval('handleMessage({type:"projects",projects:[{name:"TESTPLATE",state:"idle"},{name:"OLDER",state:"idle"},{name:"NEWER",state:"idle"}]})');
+  first.resolve([{ name: 'OLDER', state: 'idle' }]); assert.equal(await oldOpen, false); assert.equal(h.eval('current'), 'TESTPLATE');
+  second.resolve([{ name: 'NEWER', state: 'idle' }]); assert.equal(await newOpen, true); assert.equal(h.eval('current'), 'NEWER');
+  h.context.window.__cq.beforeProjectChange = async () => false;
+  const blocked = h.eval('refreshProjects("OLDER")'); await flush();
+  assert.equal(await blocked, false); assert.equal(h.eval('current'), 'NEWER', 'dirty guard must still protect the active project');
+});
+
+test('a direct project selection and a denied dirty guard supersede pending explicit Open requests', async () => {
+  const first = deferred(), second = deferred(); let calls = 0;
+  const h = harness({ boot: () => ++calls === 1 ? [] : calls === 2 ? first.promise : second.promise }); await flush();
+  for (const name of ['TESTPLATE', 'OPENED', 'CLICKED']) h.routes.set('/api/manifest?project=' + name, manifestFor(name));
+  h.eval('projects = [{name:"TESTPLATE",state:"idle"},{name:"OPENED",state:"idle"},{name:"CLICKED",state:"idle"}]');
+  await h.eval('loadProject("TESTPLATE")');
+  const opening = h.eval('refreshProjects("OPENED")'); await flush(); await h.eval('loadProject("CLICKED")');
+  await h.eval('handleMessage({type:"projects",projects:[{name:"TESTPLATE",state:"idle"},{name:"OPENED",state:"idle"},{name:"CLICKED",state:"idle"}]})');
+  first.resolve([{ name: 'OPENED', state: 'idle' }]); assert.equal(await opening, false); assert.equal(h.eval('current'), 'CLICKED');
+  const another = h.eval('refreshProjects("OPENED")'); await flush();
+  h.context.window.__cq.beforeProjectChange = async () => false; assert.equal(await h.eval('loadProject("TESTPLATE")'), false);
+  await h.eval('handleMessage({type:"projects",projects:[{name:"TESTPLATE",state:"idle"},{name:"OPENED",state:"idle"},{name:"CLICKED",state:"idle"}]})');
+  second.resolve([{ name: 'OPENED', state: 'idle' }]); assert.equal(await another, false); assert.equal(h.eval('current'), 'CLICKED');
+});
+
+test('malformed dynamic project snapshots fail before mutating navigation or request ordering', async () => {
+  const h = harness(); await h.prepare(); h.eval('renderProjects()'); const request = h.eval('projectsRequest');
+  for (const projects of [null, [{ name: 'SAME' }, { name: 'SAME' }], [{ name: 3 }]]) {
+    h.context.badProjects = projects;
+    await assert.rejects(h.eval('handleMessage({type:"projects",projects:badProjects})'), /invalid projects response/);
+    assert.equal(h.eval('projectsRequest'), request); assert.equal(h.eval('current'), 'TESTPLATE');
+    assert.deepEqual(h.node('projects').children.map((b) => b.dataset.name), ['TESTPLATE']);
+  }
+});
+
 test('visibility uses variant identity without object-prototype aliases', async () => {
   const h = harness(); await h.prepare(fixture('TESTPLATE', 'certified', 0, ['neutral', 'constructor', 'toString']));
   assert.equal(await h.eval('goStep(1, false)'), true);

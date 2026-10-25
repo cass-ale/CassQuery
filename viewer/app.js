@@ -27,7 +27,7 @@ key.position.set(60, -40, 90);
 scene.add(key, new THREE.AmbientLight(0xffffff, 0.15));
 scene.environmentIntensity = 0.85;
 
-const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+let reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
 controls.enableDamping = !reduced;
 const httpPort = Number(location.port || 3939);
 async function api(path, options = {}, expectedHash = null) {
@@ -63,7 +63,7 @@ let xrayOn = false;
 let camAnim = null;
 let wsDown = false, rebuildPending = false;
 let workerEpoch = 0, cameraRequest = 0, explodeRequest = 0, xrayRequest = 0;
-let projectRequest = 0, manifestRequest = 0, variantRequest = 0, projectsRequest = 0;
+let projectRequest = 0, manifestRequest = 0, variantRequest = 0, projectsRequest = 0, selectionIntent = 0;
 const payloadRequests = { preview: 0, certified: 0 };
 
 // ---------- small helpers ----------
@@ -88,6 +88,10 @@ function validateManifest(value, name) {
   if (chips.some((c) => typeof c !== "string")) throw new Error("invalid manifest chips");
   return { ...value, steps, chips };
 }
+function notifyWorkbench() {
+  if (typeof CustomEvent !== "undefined" && window.dispatchEvent)
+    window.dispatchEvent(new CustomEvent("cassquery:viewchange"));
+}
 function updateTools() {
   const enabled = interactive();
   for (const id of ["explode", "xraybtn", "selshow"])
@@ -99,6 +103,7 @@ function updateTools() {
   document.getElementById("next").disabled = !enabled || currentStep < 0 || currentStep >= manifest.steps.length - 1;
   document.getElementById("buildbtn").disabled = !manifest || rebuildPending;
   document.getElementById("resetview").disabled = !model;
+  notifyWorkbench();
 }
 function clearSelection() {
   selected = null;
@@ -460,6 +465,29 @@ function fitModel() {
   frameCamera(b.center, b.radius,
     dir.lengthSq() ? dir : new THREE.Vector3(0.95, -1.35, 0.62));
 }
+function setCameraView(name) {
+  if (!model) return false;
+  const directions = { front: [0, -1, 0], side: [1, 0, 0], top: [0.000001, -0.000001, 1], iso: [0.95, -1.35, 0.62] };
+  if (!Object.hasOwn(directions, name)) return false;
+  ++cameraRequest;
+  const b = viewBounds(); frameCamera(b.center, b.radius, new THREE.Vector3(...directions[name]));
+  return true;
+}
+function selectPart(name) {
+  if (!interactive() || !activeVariant()[1].parts.has(name)) return false;
+  selected = name; document.getElementById("selname").textContent = name;
+  document.getElementById("selection").style.display = "flex";
+  updateTools(); return true;
+}
+async function refreshProjects(name = current) {
+  const intent = ++selectionIntent, request = ++projectsRequest;
+  const value = validateProjects(await api("/api/projects"));
+  if (request === projectsRequest) { projects = value; renderProjects(); }
+  if (intent !== selectionIntent || !name || !projects.some((p) => p.name === name)) return false;
+  const loaded = await loadProject(name, intent);
+  notifyWorkbench();
+  return loaded !== false && intent === selectionIntent && current === name && !!manifest;
+}
 async function reloadManifest(name = current) {
   const project = projectRequest, request = ++manifestRequest;
   const value = validateManifest(await api(`/api/manifest?project=${encodeURIComponent(name)}`), name);
@@ -473,8 +501,11 @@ async function reloadManifest(name = current) {
   updateStepText();
   return true;
 }
-async function loadProject(name) {
-  if (name === current && manifest) return;
+async function loadProject(name, intent = ++selectionIntent) {
+  if (intent !== selectionIntent) return false;
+  if (name === current && manifest) return true;
+  if (window.__cq?.beforeProjectChange && !await window.__cq.beforeProjectChange(name)) return false;
+  if (intent !== selectionIntent) return false;
   const request = ++projectRequest;
   ++manifestRequest; ++variantRequest;
   ++payloadRequests.preview; ++payloadRequests.certified;
@@ -629,6 +660,7 @@ function reflectStatus(st) {
     const err = (st.history || []).filter((h) => h.event === "error").pop();
     document.getElementById("diag").textContent = "Build error: " + (st.detail || err?.detail || "unknown error");
   } else document.getElementById("buildline").textContent = wsDown ? "disconnected — reconnecting" : "";
+  notifyWorkbench();
 }
 
 function setBadge(tier, text) {
@@ -636,6 +668,7 @@ function setBadge(tier, text) {
   el.textContent = text;
   el.className = "badge" + (tier === "preview" ? " preview" : tier === "certified" ? " ok" : "");
   document.getElementById("buildline").textContent = wsDown ? "disconnected — reconnecting" : "";
+  notifyWorkbench();
 }
 function setStale(text) {
   const line = document.getElementById("buildline"), spin = document.createElement("span");
@@ -703,6 +736,7 @@ function showOnly(name) {
   if (!v) return;
   for (const [n, p] of v.parts)
     for (const m of p.meshes) m.visible = !name || n === name;
+  updateTools();
 }
 document.getElementById("selisolate").addEventListener("click", () => selected && showOnly(selected));
 document.getElementById("selhide").addEventListener("click", () => {
@@ -710,6 +744,7 @@ document.getElementById("selhide").addEventListener("click", () => {
   const [, v] = activeVariant();
   if (!v || !v.parts.get(selected)) return;
   for (const m of v.parts.get(selected).meshes) m.visible = false;
+  updateTools();
 });
 document.getElementById("selshow").addEventListener("click", () => showOnly(null));
 
@@ -729,7 +764,12 @@ document.getElementById("prev").addEventListener("click", () => goStep(currentSt
 document.getElementById("next").addEventListener("click", () => goStep(currentStep + 1, true));
 document.getElementById("buildbtn").addEventListener("click", async (e) => {
   if (!manifest || e.currentTarget.disabled) return;
-  const btn = e.currentTarget, project = projectRequest;
+  if (window.__cq?.beforeBuild && !await window.__cq.beforeBuild()) return;
+  await rebuildProject();
+});
+async function rebuildProject() {
+  if (!manifest || rebuildPending) return;
+  const btn = document.getElementById("buildbtn"), project = projectRequest;
   rebuildPending = true;
   btn.disabled = true;
   setStale("rebuild queued");
@@ -744,7 +784,7 @@ document.getElementById("buildbtn").addEventListener("click", async (e) => {
   } finally {
     if (project === projectRequest) { rebuildPending = false; updateTools(); }
   }
-});
+}
 document.getElementById("resetview").addEventListener("click", () => {
   if (!model || !model.bounds) return;
   const b = viewBounds(explodeTarget);
@@ -755,7 +795,7 @@ document.getElementById("resetview").addEventListener("click", () => {
   tweenCamera(pos, center);
 });
 window.addEventListener("keydown", (e) => {
-  if (e.target.closest("input, textarea, select, [contenteditable]")) return;
+  if (e.target.closest("input, textarea, select, [contenteditable], #editor-pane")) return;
   if (e.key === "ArrowRight") goStep(currentStep + 1, true);
   else if (e.key === "ArrowLeft") goStep(currentStep - 1, true);
 });
@@ -807,6 +847,14 @@ async function runCommand(m) {
 }
 async function handleMessage(m) {
   if (!m || typeof m !== "object" || typeof m.type !== "string") throw new Error("invalid worker message");
+  if (m.type === "projects") {
+    const snapshot = validateProjects(m.projects);
+    ++projectsRequest;
+    projects = snapshot;
+    renderProjects();
+    notifyWorkbench();
+    return;
+  }
   if (m.type === "hello") {
     ++projectsRequest; ++workerEpoch;
     ++payloadRequests.preview; ++payloadRequests.certified;
@@ -936,7 +984,21 @@ function tick(now) {
   renderer.render(scene, camera);
 }
 
-window.__cq = { camera, controls, scene, get model() { return model; }, goStep };
+window.__cq = {
+  camera, controls, scene, get model() { return model; }, goStep,
+  get project() { return current; }, get manifest() { return manifest; },
+  get projects() { return projects; }, get selected() { return selected; },
+  get status() { return projects.find((p) => p.name === current); },
+  get rebuilding() { return rebuildPending; },
+  selectPart, refreshProjects, selectProject: loadProject, rebuild: rebuildProject,
+  fit: () => model && fitModel(), setCameraView,
+  configureView({ reducedMotion } = {}) {
+    const next = reducedMotion === "on" || matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (next !== reduced) { stopControlMotion(); reduced = next; controls.enableDamping = !next; }
+    scene.background = new THREE.Color(getComputedStyle(document.documentElement).getPropertyValue("--panel").trim());
+  },
+};
+if (typeof CustomEvent !== "undefined" && window.dispatchEvent) window.dispatchEvent(new CustomEvent("cassquery:ready"));
 
 // ---------- boot ----------
 resize();

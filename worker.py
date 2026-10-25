@@ -18,6 +18,8 @@ from http import HTTPStatus
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+import workbench
+
 try:
     import numpy as np
 except ImportError:
@@ -60,6 +62,19 @@ VIEWER_DIR = os.path.join(HERE, "viewer")
 DATA_DIR = _data_dir()
 PAYLOAD_DIR = os.path.join(DATA_DIR, "payloads")
 SHOT_DIR = os.path.join(DATA_DIR, "evidence", "shots")
+
+
+def redact_sensitive(value):
+    token = os.environ.get("CASSQUERY_WORKBENCH_TOKEN", "")
+    if not token:
+        return value
+    if isinstance(value, str):
+        return value.replace(token, "[redacted]")
+    if isinstance(value, dict):
+        return {redact_sensitive(key): redact_sensitive(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_sensitive(item) for item in value]
+    return value
 
 
 def _atomic_write(path, data, before_replace=None):
@@ -309,6 +324,37 @@ def _scale_shape(shape, k):
     return cq.Shape.cast(BRepBuilderAPI_Transform(shape.wrapped, tr, True).Shape())
 
 
+def _brep_bounds(shape):
+    # CadQuery's default BoundingBox may use attached triangulation and inherit
+    # its deflection padding. Nominal truth/inspector bounds must use the BREP.
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+    import cadquery as cq
+    box = Bnd_Box()
+    BRepBndLib.AddOptimal_s(shape.wrapped, box, False, False)
+    return cq.BoundBox(box)
+
+
+def _workbench_shapes(parts, transforms):
+    unknown = set(transforms) - set(parts)
+    if unknown:
+        raise ValueError(f"workbench transforms identify unknown parts: {', '.join(sorted(unknown))}")
+    result = {}
+    for name, shape in parts.items():
+        values = transforms.get(name, {})
+        scale = values.get("scale", 1)
+        if scale != 1:
+            shape = _scale_shape(shape, scale)
+        for axis, angle in zip(((1, 0, 0), (0, 1, 0), (0, 0, 1)), values.get("rotation", [0, 0, 0])):
+            if angle:
+                shape = shape.rotate((0, 0, 0), axis, angle)
+        translation = values.get("translation", [0, 0, 0])
+        if any(translation):
+            shape = shape.translate(tuple(translation))
+        result[name] = shape
+    return result
+
+
 # ---------- projects ----------
 def _component(value, label):
     # Components become filenames and URL segments, never paths or query strings.
@@ -417,6 +463,7 @@ def _read_manifest(root, expected_name=None):
                 raise ValueError("step camera must be an object")
             for key in ("position", "target"):
                 _vector(camera.get(key), "step camera " + key)
+    workbench.validate_transforms(m)
     return m
 
 
@@ -438,13 +485,17 @@ class Project:
         self.hashes = {}
         self.gates = None
         self.truth = None
+        self.certified = None  # Only a passed certified publication updates this BREP record.
+        self.workbench_conflict = workbench.load_conflict(self.root)
+        if self.workbench_conflict:
+            self.state = "conflict"
         self.history = []
         self.last_change = 0.0
         self._mod_counter = 0
 
     def log(self, event, detail=""):
         with self.lock:
-            self.history.append({"t": time.time(), "event": event, "detail": detail})
+            self.history.append({"t": time.time(), "event": redact_sensitive(event), "detail": redact_sensitive(detail)})
             self.history = self.history[-20:]
 
     def load_module(self, filename):
@@ -507,24 +558,25 @@ class Project:
                 raise ValueError("source must contain valid positive-volume solids")
             return {"area": area, "closed": True}
 
+        transforms = manifest.get("workbench", {}).get("transforms", {})
+        neutral_parts = _workbench_shapes(result["parts"], transforms)
         truth = {}
         for n in names:
-            shp = result["parts"][n]
+            shp = neutral_parts[n]
             solids = shp.Solids()
             if not solids or not shp.isValid():
                 raise ValueError(f"part {n} has no valid solids")
-            bb = shp.BoundingBox()
+            bb = _brep_bounds(shp)
             facts = [_solid_facts(s) for s in solids]
+            solid_bounds = [_brep_bounds(s) for s in solids]
             truth[n] = {"volume": shp.Volume(), "solids": len(solids),
                         "center": [shp.Center().x, shp.Center().y, shp.Center().z],
-                        "bbox_min_dim_per_solid": [
-                            min(s.BoundingBox().xlen, s.BoundingBox().ylen,
-                                s.BoundingBox().zlen) for s in solids],
+                        "bbox_min_dim_per_solid": [min(b.xlen, b.ylen, b.zlen) for b in solid_bounds],
                         "solid_areas": [f["area"] for f in facts],
                         "solid_closed": [f["closed"] for f in facts],
                         "bbox": [bb.xmin, bb.ymin, bb.zmin, bb.xmax, bb.ymax, bb.zmax]}
         # variants: neutral + poses
-        variants_src = {"neutral": result["parts"]}
+        variants_src = {"neutral": neutral_parts}
         if manifest.get("poses"):
             poses = self.load_module(manifest["poses"])
             if not isinstance(poses.POSES, dict):
@@ -536,7 +588,7 @@ class Project:
                 vparts = fn(result)
                 if not isinstance(vparts, dict) or set(vparts) != set(names):
                     raise ValueError(f"pose {pname} must return all named parts")
-                variants_src[pname] = vparts
+                variants_src[pname] = _workbench_shapes(vparts, transforms)
 
         tess = manifest.get("tessellation", {})
         tol, ang = tess.get("coarse" if tier == "preview" else "fine",
@@ -544,19 +596,23 @@ class Project:
         weld_eps = float(manifest.get("weld_epsilon", 0.0))
         closure_methods = []
         variants_out, gate_checks, diag = {}, [], []
+        shape_variants, variant_truth = {}, {}
         variant_tris = {}
         truth_extent = None
         for vi, (vname, vparts) in enumerate(variants_src.items()):
             parts_out = []
+            shape_variants[vname], variant_truth[vname] = {}, {}
             mesh_extent = [1e18, 1e18, 1e18, -1e18, -1e18, -1e18]
             for n in names:
                 shp = vparts[n]
                 if scale != 1.0:
                     shp = _scale_shape(shp, scale)
+                shape_variants[vname][n] = shp
                 mat = manifest.get("materials", {}).get(n, {})
                 fin = FINISH.get((mat.get("material"), mat.get("finish")), FINISH_DEFAULT)
                 solids_out, part_tris = [], 0
                 part_mesh_vol = 0.0
+                part_area = 0.0
                 solids = shp.Solids()
                 if not solids or not shp.isValid():
                     raise ValueError(f"pose {vname}/{n} has no valid solids")
@@ -564,7 +620,7 @@ class Project:
                     # relative deflection cap: a solid is never tessellated
                     # coarser than 5% of its smallest dimension (small parts
                     # keep fine absolute detail under coarse project settings)
-                    sb = solid.BoundingBox()
+                    sb = _brep_bounds(solid)
                     stol = min(tol, 0.05 * min(sb.xlen, sb.ylen, sb.zlen))
                     # small chunky solids (beads) are all curvature: their
                     # volume error is set by the angular tolerance alone
@@ -581,6 +637,7 @@ class Project:
                         if missing:
                             diag.append(f"{vname}/{n}/solid{si}: {missing} face(s) without triangulation")
                         facts = _solid_facts(solid)
+                        part_area += facts["area"]
                         ok, method, det = _closure_check(
                             verts, tris, weld_eps,
                             brep_area=facts["area"], brep_closed=facts["closed"])
@@ -613,6 +670,12 @@ class Project:
                             mesh_extent[k] = min(mesh_extent[k], lo[k])
                             mesh_extent[3 + k] = max(mesh_extent[3 + k], hi[k])
                 if tier == "certified":
+                    bb = _brep_bounds(shp)
+                    center = shp.Center()
+                    variant_truth[vname][n] = {"volume": shp.Volume(), "area": part_area, "solids": len(solids),
+                                              "center": [center.x, center.y, center.z],
+                                              "bbox": [bb.xmin, bb.ymin, bb.zmin, bb.xmax, bb.ymax, bb.zmax],
+                                              "dimensions": [bb.xlen, bb.ylen, bb.zlen], "units": "mm"}
                     ref = truth[n]["volume"]
                     dv = abs(part_mesh_vol - ref) / ref * 100 if ref else 0.0
                     if dv > 1.0:
@@ -680,7 +743,8 @@ class Project:
 
         return h, {"seconds": round(time.time() - t0, 2), "tris": worst_tris,
                    "bytes": worst_bytes, "gates": gates, "index": index,
-                   "variant_files": variant_files, "truth": truth, "sources": sources, "manifest": manifest}
+                   "variant_files": variant_files, "truth": truth, "sources": sources, "manifest": manifest,
+                   "shape_variants": shape_variants, "variant_truth": variant_truth}
 
     def publish(self, tier, summary):
         # Caller holds lock through publication, state update and announcement.
@@ -707,18 +771,145 @@ class Project:
                       before_replace=check_commit)
         if not failed:
             self.truth = summary["truth"]
+            if tier == "certified" and "shape_variants" in summary:
+                source_fingerprint = hashlib.sha256(json.dumps(
+                    {"manifest": summary["manifest"], "sources": summary["sources"]},
+                    sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+                self.certified = {"project": self.name, "root": self.root, "hash": index["hash"],
+                                  "built_at": index["built_at"], "gen": index["gen"], "units": "mm",
+                                  "mesh_unit_scale": float(summary["manifest"].get("unit_scale", 1)),
+                                  "manifest": copy.deepcopy(summary["manifest"]), "sources": summary["sources"].copy(),
+                                  "source_fingerprint": source_fingerprint, "truth": copy.deepcopy(summary["truth"]),
+                                  "variants": {v: parts.copy() for v, parts in summary["shape_variants"].items()},
+                                  "variant_truth": copy.deepcopy(summary["variant_truth"]),
+                                  "gates": copy.deepcopy(summary["gates"]),
+                                  "source_files": [{"path": os.path.relpath(path, self.root).replace(os.sep, "/"),
+                                                    "bytes": facts[2], "sha256": facts[-1]}
+                                                   for path, facts in sorted(summary["sources"].items())]}
 
     def status(self):
         with self.lock:
-            return {"name": self.name, "root": self.root, "state": self.state,
-                    "live": self.manifest.get("live", False),
-                    "on_demand": self.manifest.get("on_demand", False),
-                    "hashes": self.hashes.copy(), "gates_pass": (self.gates or {}).get("pass"),
-                    "history": copy.deepcopy(self.history[-8:])}
+            return redact_sensitive({"name": self.name, "root": self.root, "state": self.state,
+                                     "live": self.manifest.get("live", False),
+                                     "on_demand": self.manifest.get("on_demand", False),
+                                     "hashes": self.hashes.copy(), "gates_pass": (self.gates or {}).get("pass"),
+                                     "history": copy.deepcopy(self.history[-8:])})
 
 
 PROJECTS = {}
+PROJECTS_LOCK = threading.RLock()
+GEOMETRY_LOCK = threading.RLock()  # OCP units/settings and all project geometry share one lane.
 LOAD_ERRORS = []
+
+
+def project_values():
+    with PROJECTS_LOCK:
+        return tuple(PROJECTS.values())
+
+
+def get_project(name):
+    with PROJECTS_LOCK:
+        return PROJECTS.get(name)
+
+
+def check_project_name(name, root):
+    with PROJECTS_LOCK:
+        for project in PROJECTS.values():
+            if project.name.casefold() == name.casefold() and project.root != os.path.realpath(root):
+                raise workbench.WorkbenchError(409, "PROJECT_NAME_CONFLICT", "A different registered project has this name")
+
+
+def register_project(root):
+    project = Project(root)
+    with PROJECTS_LOCK:
+        for existing in PROJECTS.values():
+            if existing.root == project.root:
+                if existing.name != project.name:
+                    raise workbench.WorkbenchError(409, "PROJECT_RENAMED", "Renaming a running project requires restart")
+                return existing
+        check_project_name(project.name, project.root)
+        PROJECTS[project.name] = project
+    with project.lock:
+        project.preview_dirty = bool(project.manifest.get("live")) and not project.workbench_conflict
+        project.certified_due = not bool(project.workbench_conflict)
+    broadcast({"type": "projects", "projects": [p.status() for p in project_values()]})
+    return project
+
+
+def resource_read_only(path):
+    resolved = os.path.realpath(path)
+    roots = [os.path.join(HERE, "testpart")]
+    if getattr(sys, "frozen", False):
+        roots.append(HERE)
+    for base in (HERE, os.path.abspath(sys.executable)):
+        parent = base
+        while parent != os.path.dirname(parent):
+            if parent.lower().endswith(".app"):
+                roots.append(parent)
+                break
+            parent = os.path.dirname(parent)
+    return any(_inside(root, resolved) for root in roots)
+
+
+@contextmanager
+def geometry_operation(timeout=30):
+    if not GEOMETRY_LOCK.acquire(timeout=timeout):
+        raise workbench.WorkbenchError(409, "GEOMETRY_BUSY", "Another geometry operation is still running")
+    try:
+        yield
+    finally:
+        GEOMETRY_LOCK.release()
+
+
+def certificate_current(project):
+    with project.lock:
+        record = project.certified
+        if (record is None or project.workbench_conflict or project.state != "certified" or project.preview_dirty or project.certified_due
+                or project.manifest_error or project.gen != record["gen"]):
+            return False
+        try:
+            return (_read_manifest(project.root, expected_name=project.name) == record["manifest"]
+                    and snapshot([project.root]) == record["sources"])
+        except (OSError, ValueError, StaleBuild):
+            return False
+
+
+@contextmanager
+def certified_record(name):
+    project = get_project(name)
+    if project is None:
+        raise workbench.WorkbenchError(404, "PROJECT_NOT_FOUND", "Project is not registered")
+    with geometry_operation():
+        with project.lock:
+            if not certificate_current(project):
+                raise workbench.WorkbenchError(409, "STALE_CERTIFICATE", "Export requires current certified source; rebuild first")
+            captured = project.certified
+            record = {**captured, "manifest": copy.deepcopy(captured["manifest"]), "truth": copy.deepcopy(captured["truth"]),
+                      "sources": captured["sources"].copy(), "gates": copy.deepcopy(captured["gates"]),
+                      "variants": {variant: parts.copy() for variant, parts in captured["variants"].items()}}
+        def assert_current():
+            with project.lock:
+                if project.certified is not captured or not certificate_current(project):
+                    raise workbench.WorkbenchError(409, "STALE_CERTIFICATE", "Source changed during export; rebuild first")
+        record["assert_current"] = assert_current
+        yield record
+
+
+def changed_project(project, path, auto_build=None, force=False):
+    with project.lock:
+        if auto_build is not None:
+            project.workbench_auto_build = auto_build
+            if not auto_build:
+                project.preview_dirty = project.certified_due = False
+    _apply_changes([path])
+    with project.lock:
+        if force or getattr(project, "workbench_auto_build", True):
+            if project.manifest.get("live"):
+                project.preview_dirty = True
+            else:
+                project.certified_due = True
+
+
 WS_CLIENTS = set()
 WS_LOOP = None
 SHOTS_PENDING = {}
@@ -763,7 +954,7 @@ def broadcast(msg):
     loop = WS_LOOP
     if loop is None or loop.is_closed() or not loop.is_running():
         return
-    raw = json.dumps(msg, allow_nan=False)
+    raw = json.dumps(redact_sensitive(msg), allow_nan=False)
     async def send_all():
         for ws in list(WS_CLIENTS):
             try:
@@ -778,6 +969,7 @@ def broadcast(msg):
 
 
 def set_state(p, state, detail=""):
+    state, detail = redact_sensitive(state), redact_sensitive(detail)
     with p.lock:
         p.state = state
         p.log(state, detail)
@@ -786,7 +978,20 @@ def set_state(p, state, detail=""):
 
 
 def run_build(p, tier):
+    with p.lock:
+        if p.workbench_conflict:
+            set_state(p, "conflict", "Resolve the retained source conflict before building")
+            return False
     set_state(p, "building-" + tier)
+    with GEOMETRY_LOCK:
+        with p.lock:
+            if p.workbench_conflict:
+                set_state(p, "conflict", "Resolve the retained source conflict before building")
+                return False
+        return _run_build(p, tier)
+
+
+def _run_build(p, tier):
     try:
         with _project_imports(p.root):
             h, summary = p.build(tier)
@@ -809,16 +1014,21 @@ def run_build(p, tier):
             return True
     except StaleBuild as e:
         with p.lock:
-            if p.manifest.get("live"):
-                p.preview_dirty = True
+            if p.workbench_conflict:
+                p.preview_dirty = p.certified_due = False
+                set_state(p, "conflict", "Resolve the retained source conflict before building")
             else:
-                p.certified_due = True
-            set_state(p, "stale", str(e))
+                if getattr(p, "workbench_auto_build", True):
+                    if p.manifest.get("live"):
+                        p.preview_dirty = True
+                    else:
+                        p.certified_due = True
+                set_state(p, "stale", str(e))
         return False
     except BaseException:
         # Project entry code may raise SystemExit/KeyboardInterrupt; neither may
         # silently terminate the sole build thread. Ctrl-C in main still exits.
-        tb = traceback.format_exc()
+        tb = redact_sensitive(traceback.format_exc())
         last = tb.strip().splitlines()[-1] if tb.strip() else "build failed"
         own = [f for f in traceback.extract_tb(sys.exc_info()[2]) if _inside(p.root, f.filename)]
         detail = (f"{os.path.basename(own[-1].filename)}:{own[-1].lineno}: {last}"
@@ -833,6 +1043,9 @@ def run_build(p, tier):
 def _build_pending(p):
     worked = False
     with p.lock:
+        if p.workbench_conflict:
+            p.preview_dirty = p.certified_due = False
+            return False
         preview, gen = p.preview_dirty, p.gen
         p.preview_dirty = False
     if preview:
@@ -855,7 +1068,7 @@ def _build_pending(p):
 def build_thread():
     while True:
         worked = False
-        for p in PROJECTS.values():
+        for p in project_values():
             worked = _build_pending(p) or worked
         if not worked:
             time.sleep(0.3)
@@ -881,6 +1094,8 @@ def snapshot(roots):
             dirnames[:] = [d for d in dirnames if d not in
                            (".git", ".venv", "venv", "node_modules", "__pycache__")]
             for f in filenames:
+                if f.startswith(".cq-workbench-"):
+                    continue  # Owned sibling save staging is not a project input.
                 fp = os.path.join(dirpath, f)
                 if any(_inside(output, fp) for output in outputs):
                     continue  # An in-tree alias of a worker output is still output.
@@ -905,13 +1120,22 @@ def snapshot(roots):
 
 
 def _apply_changes(changed):
-    for p in PROJECTS.values():
+    for p in project_values():
         mine = [fp for fp in changed if _input_inside(p.root, fp)]
         if not mine:
             continue
         with p.lock:
+            # A polling watcher may recognize an edit only after an explicit
+            # rebuild already certified those exact inputs. Do not invalidate
+            # that current certificate for the watcher's obsolete baseline.
+            if certificate_current(p):
+                continue
             p.gen += 1
             p.last_change = time.time()
+            if p.workbench_conflict:
+                p.preview_dirty = p.certified_due = False
+                set_state(p, "conflict", "Resolve the retained source conflict before building")
+                continue
             if os.path.join(p.root, "viewer.json") in mine:
                 try:
                     p.manifest = _read_manifest(p.root, expected_name=p.name)
@@ -925,7 +1149,7 @@ def _apply_changes(changed):
                                "tier": "certified", "error": p.manifest_error,
                                "detail": p.manifest_error})
                     continue
-            if p.manifest.get("live") and not p.manifest_error:
+            if p.manifest.get("live") and not p.manifest_error and getattr(p, "workbench_auto_build", True):
                 p.preview_dirty = True
             set_state(p, "stale", f"changed: {os.path.basename(mine[0])}")
 
@@ -936,14 +1160,15 @@ def watcher(roots, prev=None):
     while True:
         time.sleep(0.5)
         try:
-            cur = snapshot(roots)
+            dynamic_roots = list(dict.fromkeys([*roots, *(p.root for p in project_values())]))
+            cur = snapshot(dynamic_roots)
             changed = [fp for fp in set(cur) | set(prev) if cur.get(fp) != prev.get(fp)]
             _apply_changes(changed)
             prev = cur
         except (OSError, StaleBuild) as e:
             # An unreadable/changing input must not silently kill the watch thread.
             print(f"CassQuery watcher: {e}", file=sys.stderr)
-            for p in PROJECTS.values():
+            for p in project_values():
                 set_state(p, "error", f"watcher: {e}")
 
 
@@ -952,7 +1177,7 @@ async def ws_handler(ws):
     WS_CLIENTS.add(ws)
     try:
         await ws.send(json.dumps({"type": "hello",
-                                  "projects": [p.status() for p in PROJECTS.values()]}))
+                                  "projects": [p.status() for p in project_values()]}))
         async for _ in ws:
             pass
     finally:
@@ -1043,7 +1268,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, code, body, ctype="application/json"):
         if isinstance(body, (dict, list)):
-            body = json.dumps(body, allow_nan=False).encode()
+            body = json.dumps(redact_sensitive(body), allow_nan=False).encode()
         elif isinstance(body, str):
             body = body.encode()
         self.send_response(code)
@@ -1079,7 +1304,7 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(name, str):
             self._send(400, {"error": "project must be a string"})
             return None
-        p = PROJECTS.get(name)
+        p = get_project(name)
         if not p:
             self._send(404, {"error": f"unknown project {name}"})
         return p
@@ -1101,7 +1326,7 @@ class Handler(BaseHTTPRequestHandler):
         u = urlsplit(self.path)
         q = parse_qs(u.query)
         if u.path == "/api/projects":
-            return self._send(200, [p.status() for p in PROJECTS.values()])
+            return self._send(200, [p.status() for p in project_values()])
         if u.path == "/api/status":
             name = (q.get("project") or [None])[0]
             if name:
@@ -1110,7 +1335,7 @@ class Handler(BaseHTTPRequestHandler):
             # api_version marks this shape: v1 returned a bare list here;
             # the object (with load_errors) is version 2.
             return self._send(200, {"api_version": 2,
-                                    "projects": [p.status() for p in PROJECTS.values()],
+                                    "projects": [p.status() for p in project_values()],
                                     "load_errors": LOAD_ERRORS})
         if u.path == "/api/manifest":
             p = self._project((q.get("project") or [""])[0])
@@ -1156,12 +1381,38 @@ class Handler(BaseHTTPRequestHandler):
         if not self._guard():
             return
         u = urlsplit(self.path)
+        is_workbench = u.path == "/api/workbench"
+        if is_workbench:
+            try:
+                workbench.authorize(self.headers)
+            except workbench.WorkbenchError as error:
+                self.close_connection = True
+                return self._send(error.status, {"error": str(error), "code": error.code})
         try:
             body = self._body()
         except (ValueError, OverflowError, TimeoutError) as e:
             self.close_connection = True
             code = 413 if isinstance(e, OverflowError) else 408 if isinstance(e, TimeoutError) else 400
-            return self._send(code, {"error": str(e)})
+            response = {"error": str(e)}
+            if is_workbench:
+                response["code"] = "INVALID_REQUEST"
+            return self._send(code, response)
+        if is_workbench:
+            try:
+                result = workbench.Workbench(sys.modules[__name__]).dispatch(body)
+            except workbench.WorkbenchError as error:
+                return self._send(error.status, {"error": str(error), "code": error.code, **error.details})
+            except (ValueError, TypeError, UnicodeError) as error:
+                return self._send(400, {"error": str(error), "code": "INVALID_REQUEST"})
+            except FileNotFoundError:
+                return self._send(404, {"error": "Selected file or directory does not exist", "code": "FILE_NOT_FOUND"})
+            except PermissionError:
+                return self._send(403, {"error": "Selected path is read-only", "code": "READ_ONLY"})
+            except ImportError:
+                return self._send(501, {"error": "CAD I/O is unavailable in this worker", "code": "CAD_IO_UNAVAILABLE"})
+            except OSError as error:
+                return self._send(400, {"error": str(error), "code": "FILESYSTEM_ERROR"})
+            return self._send(200, result)
         if u.path == "/api/rebuild":
             p = self._project(body.get("project", ""))
             if not p:
@@ -1170,6 +1421,8 @@ class Handler(BaseHTTPRequestHandler):
             if tier not in ("preview", "certified", "both"):
                 return self._send(400, {"error": "tier must be preview, certified or both"})
             with p.lock:
+                if p.workbench_conflict:
+                    return self._send(409, {"error": "Resolve the retained source conflict before rebuilding", "code": "UNRESOLVED_CONFLICT"})
                 if tier in ("preview", "both"):
                     p.preview_dirty = True
                 if tier in ("certified", "both"):

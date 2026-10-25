@@ -20,7 +20,9 @@ REQUIRED_STEPS = (
     'Frozen real-CAD build, watcher and failure retention',
     'Assemble native app without publishing', 'Render the actual bundled application',
     'Package checked app', 'Verify and launch the final ZIP',
-    'Verify and launch the final DMG', 'Candidate identity and hashes',
+    'Verify and launch the final DMG', 'Verify GitHub update channel transport',
+    'Native workbench editor and file dialogs', 'Native update installation and rollback',
+    'Candidate identity and hashes',
     'Keep candidate and checked/not-checked evidence',
 )
 GATES = {
@@ -29,6 +31,9 @@ GATES = {
     'renderer': 'evidence/mac-{arch}/renderer.json',
     'zip': 'evidence/zip-{arch}/package.json',
     'dmg': 'evidence/dmg-{arch}/package.json',
+    'updatecheck': 'evidence/updatecheck-{arch}.json',
+    'workbench': 'evidence/workbench-{arch}/workbench-qualification.json',
+    'update': 'evidence/update-{arch}/update.json',
 }
 
 
@@ -186,13 +191,31 @@ def validate_graphics(report, expected_arch):
         require(isinstance(renderer, str) and re.search('SwiftShader', renderer, re.IGNORECASE), 'requested software rendering lacks observed SwiftShader context')
 
 
-NATIVE_SOURCE_PATHS = ('shell/main.js', 'shell/renderer_config.cjs', 'shell/runtime.cjs', 'shell/smoke.cjs')
+def source_manifest(package):
+    """The single package-owned executable source declaration; no implicit fallback."""
+    sources = package.get('cassquerySources')
+    require(isinstance(sources, dict) and set(sources) == {'shell', 'python'}, 'missing executable source manifest')
+    for group, pattern in (('shell', r'shell/[a-z][a-z0-9_]*\.(?:cjs|js|mjs)'),
+                           ('python', r'[a-z][a-z0-9_]*\.py')):
+        paths = sources[group]
+        require(isinstance(paths, list) and 0 < len(paths) <= 32
+                and all(isinstance(path, str) and re.fullmatch(pattern, path) for path in paths)
+                and len(set(paths)) == len(paths), 'invalid executable source manifest paths')
+    require(sources['shell'] == sorted(sources['shell']) and package.get('main') in sources['shell'],
+            'shell source manifest is unordered or misses the application entry')
+    require(sources['python'][0] == 'worker.py', 'Python source manifest must begin with the frozen worker entry')
+    return sources
+
+
+_SOURCE_MANIFEST = source_manifest(read_json(Path(__file__).resolve().parents[1] / 'package.json'))
+NATIVE_SOURCE_PATHS = tuple(_SOURCE_MANIFEST['shell'])
+PYTHON_SOURCE_PATHS = tuple(_SOURCE_MANIFEST['python'])
 
 
 def validate_native_source(value):
     require(isinstance(value, dict) and isinstance(value.get('files'), list), 'missing executed native source identity')
     files = value['files']
-    require(len(files) == 4 and all(isinstance(item, dict) and set(item) == {'bytes', 'path', 'sha256'}
+    require(len(files) == len(NATIVE_SOURCE_PATHS) and all(isinstance(item, dict) and set(item) == {'bytes', 'path', 'sha256'}
             and type(item.get('bytes')) is int and 0 < item['bytes'] <= 1024 * 1024
             and isinstance(item.get('path'), str) and re.fullmatch(r'[0-9a-f]{64}', item.get('sha256', '')) for item in files)
             and tuple(item['path'] for item in files) == NATIVE_SOURCE_PATHS, 'invalid executed native source records')
@@ -349,6 +372,19 @@ def validate_runtime(proof, pid, challenge, *, executable, started, finished):
     require(all(started[k] <= proof[k] <= finished[k] for k in ('monotonic_ms', 'wall_time_ms')), 'stale frozen worker runtime checkpoint')
 
 
+def validate_python_modules(proof):
+    """Runtime imports must come from the compiled PYZ, not raw/development source."""
+    expected = {PurePosixPath(path).stem for path in PYTHON_SOURCE_PATHS if path != 'worker.py'}
+    modules = proof.get('modules')
+    root = proof.get('resource_root')
+    require(isinstance(modules, dict) and set(modules) == expected
+            and isinstance(root, str) and PurePosixPath(root).is_absolute(), 'missing frozen helper module execution')
+    for name, module in modules.items():
+        require(isinstance(module, dict) and module.get('loader') == 'PyiFrozenLoader'
+                and module.get('path') == str(PurePosixPath(root) / (name + '.py')),
+                'helper module did not execute from the frozen PYZ/resource root')
+
+
 def verify_record(root, report_path, record):
     require(isinstance(record, dict) and isinstance(record.get('path'), str), 'missing linked evidence record')
     prefix = PurePosixPath(report_path).parent
@@ -462,6 +498,7 @@ def verify_native_report(root, report_path, report, *, expected_sha, expected_ar
     require(proof == report.get('worker_runtime'), 'native runtime file contradicts inline evidence')
     validate_runtime(proof, report['worker_pid'], report['challenge'], executable=report['worker_executable'],
                      started=launch['started'], finished=launch['finished'])
+    validate_python_modules(proof)
     _, before = linked_json(root, report_path, report.get('bundle_before'), records)
     _, after = linked_json(root, report_path, report.get('bundle_after'), records)
     require(before == after and isinstance(before.get('records'), list) and before['records'], 'native bundle inventory changed or missing')
@@ -478,8 +515,10 @@ def verify_native_report(root, report_path, report, *, expected_sha, expected_ar
     for macho in machos:
         require(expected_arch in macho.get('architectures', []) and macho.get('sha256') == by_path.get(macho.get('path'), {}).get('sha256'), 'native Mach-O identity contradicts bundle inventory')
     sources = bundle.get('source_files', [])
-    expected_sources = {name for name in source_records if name.startswith(('viewer/', 'testpart/'))
-                        or name in ('worker.py', 'shell/main.js', 'shell/runtime.cjs', 'shell/smoke.cjs', 'shell/renderer_config.cjs')}
+    expected_sources = {name for name in source_records if name.startswith(('viewer/', 'testpart/'))}
+    expected_sources.update(PYTHON_SOURCE_PATHS)
+    expected_sources.update(NATIVE_SOURCE_PATHS)
+    require(expected_sources.issubset(source_records), 'original source snapshot misses an executable module')
     require(isinstance(sources, list) and expected_sources, 'missing native/source parity evidence')
     found = set()
     for item in sources:
@@ -529,6 +568,99 @@ def verify_dmg_mount(root, report_path, report, records):
     info = evidence['info_evidence']
     require(info.get('DeviceNode') == device and point(info.get('MountPoint')) == owned, 'DMG mount info device/path differs from owned mount')
     require(info.get('WritableVolume') is False, 'DMG mounted volume is not verifiably read-only')
+
+
+def verify_feature_report(root, report_path, report, manifest, records, name):
+    """Replay trusted producer contracts without running CAD or app code in promotion."""
+    require(report.get('source_fingerprint') == manifest['source_fingerprint']
+            and report.get('after_fingerprint') == manifest['source_fingerprint'], 'native feature source changed during proof')
+    if name == 'workbench':
+        require(report.get('qualifies_workbench') is True, 'editor subset/blocked native dialogs cannot qualify the workbench')
+        filename, function = 'workbench_native_smoke.py', 'validate_qualification'
+    else:
+        require(report.get('kind') == 'native-update-fixture' and report.get('native_execution') is True
+                and report.get('fixture_only') is True, 'missing native install/rollback mechanism proof')
+        filename, function = 'update_smoke.py', 'validate_report'
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('qualification_' + name, Path(__file__).with_name(filename))
+    producer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(producer)
+    directory = relative_file(root, report_path).parent
+    try:
+        if name == 'workbench':
+            producer.validate_qualification(report, directory, expected_sha=manifest['source_sha'],
+                                             expected_arch=manifest['architecture'], verify_geometry=False)
+        else:
+            producer.validate_report(report, directory, expected_sha=manifest['source_sha'],
+                                     expected_arch=manifest['architecture'], expected_version=manifest['version'])
+    except RuntimeError as error:
+        raise ValueError(str(error)) from error
+
+
+def verify_update_check(root, report_path, report, manifest, records):
+    """A clean real network gate is not a native archive download/install assertion."""
+    require(report.get('kind') == 'update-network-contract' and report.get('network_contract_pass') is True
+            and report.get('CI_qualification') is True and report.get('default_fetch') is True
+            and report.get('source_clean') is True and report.get('source_unchanged') is True,
+            'mocked/dirty/incomplete update network contract')
+    require(report.get('authenticated') is False and report.get('install_attempted') is False
+            and report.get('native_GUI_proof') is False and report.get('fixture_current_version') == '0.0.0'
+            and report.get('error') is None, 'update network scope/error contradicts the actual gate')
+    require(report.get('source_fingerprint') == manifest['source_fingerprint']
+            and report.get('after_fingerprint') == manifest['source_fingerprint'], 'update network source changed')
+    for key in ('source_before', 'source_after'):
+        _, source = linked_json(root, report_path, report.get(key), records)
+        identity = {'source_sha': source.get('source_sha'), 'files': source.get('files')}
+        fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        require(source.get('clean') is True and source.get('source_sha') == manifest['source_sha']
+                and fingerprint == source.get('fingerprint') == manifest['source_fingerprint'], 'update network snapshot is unbound')
+    source_files = {item['path']: item for item in source['files']}
+    expected_names = {'shell/updater.cjs', 'shell/update_install.cjs', 'tools/update_check_smoke.cjs'}
+    hashes = report.get('source_hashes')
+    require(isinstance(hashes, dict) and set(hashes) == expected_names and hashes == report.get('after_source_hashes')
+            and all(hashes[path] == source_files.get(path, {}).get('sha256') for path in expected_names),
+            'network client/helper source hashes changed')
+    runtime = report.get('runtime', {})
+    require(runtime.get('platform') == 'darwin' and runtime.get('architecture') == manifest['architecture']
+            and isinstance(runtime.get('node'), str) and runtime['node'], 'wrong update network runtime identity')
+    metadata_path, metadata = linked_json(root, report_path, report.get('metadata'), records)
+    require(type(report.get('metadata_bytes')) is int and 0 < report['metadata_bytes'] <= 256 * 1024
+            and report['metadata_bytes'] == records[metadata_path]['bytes']
+            and report.get('metadata_sha256') == records[metadata_path]['sha256'], 'update API raw response bytes were substituted')
+    require(metadata.get('draft') is False and metadata.get('prerelease') is False
+            and metadata.get('tag_name') == report.get('published_release'), 'update network used an unpublished release')
+    require(report.get('release_url') == metadata.get('html_url'), 'update channel release URL changed')
+    require(finite_number(report.get('started_ms')) and finite_number(report.get('finished_ms'))
+            and report['finished_ms'] >= report['started_ms'], 'missing update network request bounds')
+    statuses = report.get('statuses', [])
+    require(isinstance(statuses, list) and 2 <= len(statuses) <= 8 and all(isinstance(status, dict)
+            and type(status.get('status')) is int and status['status'] in (200, 301, 302, 303, 307, 308)
+            and isinstance(status.get('endpoint'), str) and status['endpoint'].startswith('https://')
+            and '?' not in status['endpoint']
+            and status.get('accept') in ('application/vnd.github+json', 'application/octet-stream')
+            for status in statuses) and statuses[0]['status'] == 200 and statuses[-1]['status'] == 200,
+            'update network did not execute successful bounded request/redirect phases')
+    version = report.get('published_release', '')
+    require(isinstance(version, str) and re.fullmatch(r'v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)', version), 'noncanonical update channel release')
+    native = report.get('native_archive', {})
+    expected = f"CassQuery-{version[1:]}-mac-{manifest['architecture']}.zip"
+    require(native.get('name') == expected and native.get('arch') == manifest['architecture']
+            and native.get('downloaded') is False and type(native.get('bytes')) is int and native['bytes'] > 0
+            and re.fullmatch(r'[0-9a-f]{64}', native.get('sha256', '')), 'update network selected wrong native archive')
+    assets = metadata.get('assets', [])
+    require(isinstance(assets, list) and all(isinstance(asset, dict) for asset in assets), 'missing published update assets')
+    for filename, size, sha in ((expected, native['bytes'], native['sha256']),
+                               ('SHA256SUMS.txt', report['checksums']['bytes'], report['checksums']['sha256'])):
+        selected = [asset for asset in assets if asset.get('name') == filename]
+        require(len(selected) == 1 and selected[0].get('size') == size
+                and selected[0].get('digest') == 'sha256:' + sha, 'network assets contradict authenticated API identity')
+    path = verify_record(root, report_path, report.get('checksums'))
+    manifest_record(root, records, path)
+    data = relative_file(root, path).read_bytes()
+    require(len(data) <= 64 * 1024, 'update checksum document exceeds bound')
+    lines = data.decode('utf-8').splitlines()
+    matches = [line for line in lines if line.endswith('  ' + expected)]
+    require(matches == [native['sha256'] + '  ' + expected], 'update checksum document/archive digest disagree')
 
 
 def verify_candidate(root, manifest=None, *, expected_sha, expected_run_id, expected_arch,
@@ -649,6 +781,10 @@ def verify_candidate(root, manifest=None, *, expected_sha, expected_run_id, expe
             if name == 'dmg':
                 verify_dmg_mount(root, required_path, report, records)
                 require(report.get('detach_completed') is True, 'DMG still mounted or detach skipped')
+        if name == 'updatecheck':
+            verify_update_check(root, required_path, report, manifest, records)
+        if name in ('workbench', 'update'):
+            verify_feature_report(root, required_path, report, manifest, records, name)
         images_identity(root, required_path, report.get('images', []), records, image_cache)
         require(type(report.get('run_attempt', 1)) is int and report.get('run_attempt', 1) == attempt, f'{name} attempt mismatch')
         if name == 'preflight':
@@ -668,6 +804,9 @@ def verify_candidate(root, manifest=None, *, expected_sha, expected_run_id, expe
             actual = report.get(field)
             if field == 'architecture':
                 actual = 'x64' if actual == 'x86_64' else actual
+            if name == 'updatecheck' and field == 'version':
+                # This gate queries the published channel, not a build at its fixture 0.0.0 version.
+                continue
             require(actual == expected, f'{name} {field} mismatch')
     require(any(record['path'] == 'evidence/sbom.json' for record in files), 'missing supply-chain inventory')
     sbom = read_json(relative_file(root, 'evidence/sbom.json'))
@@ -730,6 +869,7 @@ def verify_candidate(root, manifest=None, *, expected_sha, expected_run_id, expe
 
 INTEGRATION_STEPS = ('Record integration context', 'Source integration dependencies',
                      'Real CAD browser loop and mutation witness', 'Validate independent report bytes',
+                     'Real workbench editor and CAD roundtrip', 'Validate workbench report bytes',
                      'Keep integration evidence')
 
 
@@ -802,6 +942,14 @@ def stage_candidate(root, output, arch):
         require(report.is_file(), f'missing gate report: {report}')
         if report.parent == root / 'evidence':
             paths.add(template.format(arch=arch))
+            if template == GATES['updatecheck']:
+                network = read_json(report)
+                for key in ('source_before', 'source_after', 'metadata', 'checksums'):
+                    record = network.get(key, {})
+                    name = record.get('path')
+                    require(isinstance(name, str) and name == PurePosixPath(name).name
+                            and '/' not in name and '\\' not in name, 'invalid update network sidecar path')
+                    paths.add('evidence/' + name)
         else:
             paths.update(str(file.relative_to(root).as_posix()) for file in report.parent.rglob('*') if file.is_file())
     preflight_report = read_json(root / GATES['preflight'])

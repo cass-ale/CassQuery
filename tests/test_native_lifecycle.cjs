@@ -48,27 +48,28 @@ test('capture timeouts/failures release only owned debugger attachment',async()=
 async function mainFixture({closeMode='pending',failSmoke=false,lateError=false,shutdownError=false,assurance=true}={}){
  const directory=fs.mkdtempSync(path.join(os.tmpdir(),'cq-lifecycle-unit-'));
  const app=new EventEmitter(),windows=[];let context,doneResolve;const done=new Promise(r=>{doneResolve=r;});
- Object.assign(app,{commandLine:{appendSwitch(){}},isPackaged:true,getVersion:()=> '0.1.0',getPath:()=>directory,requestSingleInstanceLock:()=>true,whenReady:()=>new Promise(()=>{}),getGPUInfo:async()=>({auxAttributes:{glRenderer:'synthetic'}}),exit:()=>doneResolve()});
+ Object.assign(app,{commandLine:{appendSwitch(){}},isPackaged:true,getVersion:()=> '0.2.0',getPath:()=>directory,getAppPath:()=>path.join(__dirname,'..'),requestSingleInstanceLock:()=>true,whenReady:()=>new Promise(()=>{}),getGPUInfo:async()=>({auxAttributes:{glRenderer:'synthetic'}}),exit:()=>doneResolve()});
  app.quit=()=>{if(lateError)windows[0].webContents.emit('console-message',{level:'error',message:'old page diagnostic'});app.emit('before-quit',{preventDefault(){}});if(vm.runInContext('shutdownComplete',context))doneResolve();};
  class Win extends EventEmitter{
-  constructor(options){super();this.dead=false;this.options=options;this.contentSize=[0,0];windows.push(this);this.webContents=new EventEmitter();Object.assign(this.webContents,{setWindowOpenHandler(){},session:{setPermissionRequestHandler(){}},executeJavaScript:async source=>source==='[innerWidth,innerHeight]'?this.contentSize.slice():source==='__cq.model.hash'?'a'.repeat(16):source.includes('readRendererContext')?{context:'webgl2',is_context_lost:false}:true});}
+  constructor(options){super();this.dead=false;this.options=options;this.contentSize=[0,0];windows.push(this);this.webContents=new EventEmitter();this.webContents.mainFrame={url:'http://127.0.0.1:3939/'};Object.assign(this.webContents,{getURL:()=>this.webContents.mainFrame.url,send(){},setWindowOpenHandler(){},session:{setPermissionRequestHandler(){}},executeJavaScript:async source=>source==='[innerWidth,innerHeight]'?this.contentSize.slice():source==='__cq.model.hash'?'a'.repeat(16):source.includes('readRendererContext')?{context:'webgl2',is_context_lost:false}:true});}
   // Explicit Mac work-area clamp model (1024x684 minus28px title bar), not native proof.
   setContentSize(width,height){this.contentSize=this.options.enableLargerThanScreen?[width,height]:[Math.min(width,1024),Math.min(height,656)];}
   getContentSize(){return this.contentSize.slice();}
-  isDestroyed(){return this.dead;}getBounds(){return{x:0,y:0,width:1320,height:880};}show(){}focus(){}loadURL(){return Promise.resolve();}
+  isDestroyed(){return this.dead;}getBounds(){return{x:0,y:0,width:1320,height:880};}show(){}focus(){}setEnabled(){}loadURL(){return Promise.resolve();}
   close(){if(closeMode==='veto')return;const closed=()=>{this.dead=true;this.emit('closed');};if(closeMode==='pending')setTimeout(closed,5);else closed();}
   destroy(){throw Error('destroy forbidden');}
  }
  const worker=Object.assign(new EventEmitter(),{pid:100,exitCode:null,signalCode:null});
  const req=name=>{
-  if(name==='electron')return{app,BrowserWindow:Win,Menu:{},nativeTheme:{},screen:{getDisplayMatching:()=>({bounds:{width:1920,height:1080},workArea:{width:1920,height:1080},scaleFactor:1})}};
+  if(name==='electron')return{app,BrowserWindow:Win,Menu:{},nativeTheme:{},ipcMain:{handle(){}},dialog:{showMessageBox:async()=>({response:2}),showErrorBox(){},showOpenDialog:async()=>({canceled:true,filePaths:[]}),showSaveDialog:async()=>({canceled:true})},shell:{showItemInFolder(){}},screen:{getDisplayMatching:()=>({bounds:{width:1920,height:1080},workArea:{width:1920,height:1080},scaleFactor:1})}};
+  if(name==='./desktop.cjs')return require('../shell/desktop.cjs');
   if(name==='./renderer_config.cjs')return graphics;
   if(name==='./runtime.cjs')return{stopWorker:async()=>{worker.exitCode=0;if(shutdownError)throw Error('shutdown sentinel');}};
   if(name==='./smoke.cjs')return{...api,closeWindow:win=>api.closeWindow(win,closeMode==='veto'?30:1000),smoke:async(_w,_d,{evidence})=>{if(failSmoke)throw Error('primary smoke sentinel');evidence.pass=true;return evidence;}};
   if(name==='node:child_process')return{spawn:()=>{const secondary=Object.assign(new EventEmitter(),{pid:101,kill(){}});setImmediate(()=>{app.emit('second-instance');secondary.emit('exit',0);});return secondary;}};
   return require(name);
  };
- context=vm.createContext({require:req,console:{error(){}},AbortController,setTimeout,clearTimeout,process:{env:assurance?{CASSQUERY_SMOKE_DIR:directory}:{},platform:process.platform,arch:process.arch,versions:process.versions,pid:99,resourcesPath:'/synthetic',execPath:'/synthetic/app',hrtime:process.hrtime},__dirname:path.join(__dirname,'../shell')});
+ context=vm.createContext({require:req,console:{error(){}},AbortController,setTimeout,clearTimeout,setImmediate,process:{env:assurance?{CASSQUERY_SMOKE_DIR:directory}:{},platform:process.platform,arch:process.arch,versions:process.versions,argv:[],on(){},pid:99,resourcesPath:'/synthetic',execPath:'/synthetic/app',hrtime:process.hrtime},__dirname:path.join(__dirname,'../shell')});
  vm.runInContext(fs.readFileSync(path.join(__dirname,'../shell/main.js'),'utf8')+'\nglobalThis.audit={runNativeSmoke,openWindow,getWindow:()=>window,setWorker:w=>{worker=w;workerPort=3939;smokeStarted=true;tried.python="/synthetic/worker/cassquery-worker";}};',context);
  try{context.audit.setWorker(worker);await context.audit.openWindow();if(!assurance)return{report:null,windows};await context.audit.runNativeSmoke(context.audit.getWindow());await done;const report=JSON.parse(fs.readFileSync(path.join(directory,'renderer-raw.json'),'utf8'));return{report,windows};}
  finally{fs.rmSync(directory,{recursive:true,force:true});}

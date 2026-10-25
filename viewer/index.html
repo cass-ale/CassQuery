@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="description" content="CassQuery — a precision workspace for parametric design, with live previews and gate-checked certified models.">
+<meta name="description" content="CassQuery — an offline Python and CAD workbench with certified geometry.">
 <link rel="icon" href="./brand.svg" type="image/svg+xml">
 <title>CassQuery</title>
 <link rel="stylesheet" href="./style.css">
@@ -12,44 +12,112 @@
 <header>
   <div class="identity"><img src="./brand.svg" width="40" height="40" alt=""><h1>CassQuery</h1></div>
   <nav class="projects" id="projects" aria-label="Projects"></nav>
-  <div class="state">
-    <span id="buildline" aria-live="polite"></span>
-    <span class="badge" id="tierbadge" role="status">no model</span>
-  </div>
+  <div class="state"><span id="buildline" aria-live="polite"></span><span class="badge" id="tierbadge" role="status">no model</span></div>
 </header>
-<main>
-  <div id="stage">
-    <div id="stage-msg" role="status"><strong>Loading</strong>Fetching projects from the worker.</div>
-    <div id="selection"><span class="name" id="selname"></span>
-      <button id="selisolate" type="button">Isolate</button>
-      <button id="selhide" type="button">Hide</button>
-      <button id="selshow" type="button">Show all</button>
-    </div>
+<nav class="workbench-toolbar" aria-label="Workspace actions">
+  <div class="action-group">
+    <button id="openfile" type="button" disabled>Open file</button>
+    <button id="openfolder" type="button" disabled>Open folder</button>
+    <button id="newproject" type="button" disabled>New</button>
+    <button id="importbtn" type="button" disabled>Import STEP</button>
   </div>
-  <aside aria-label="Model controls">
-    <p class="caption" id="caption"></p>
-    <nav class="steps" id="steps" aria-label="Steps"></nav>
-    <div class="navrow">
-      <button id="prev" type="button">Previous</button>
-      <button id="next" type="button">Next</button>
+  <div class="action-group">
+    <button id="savefile" type="button" disabled>Save</button>
+    <button id="saveas" type="button" disabled>Save a copy</button>
+    <button id="exportbtn" type="button" disabled>Export</button>
+  </div>
+  <div class="action-group workspace-view" role="group" aria-label="Workspace panes">
+    <button id="code-tab" type="button" aria-pressed="false">Code</button>
+    <button id="model-tab" type="button" aria-pressed="true">Model</button>
+    <button id="pane-toggle" type="button" aria-pressed="false">Split</button>
+  </div>
+  <div class="action-group"><button id="settingsbtn" type="button">Settings</button><button id="helpbtn" type="button" aria-label="Keyboard shortcuts">Keys</button></div>
+</nav>
+<div id="workbench-error" role="alert" hidden></div>
+<div id="recovery-banner" class="notice" hidden><span id="recovery-message"></span><button id="recovery-restore" type="button">Restore drafts</button><button id="recovery-discard" type="button">Discard recovery</button></div>
+<main id="workspace" class="workspace" data-pane="model">
+  <section id="editor-pane" class="editor-pane" aria-label="Source workspace" hidden>
+    <div class="source-heading"><h2>Source</h2><span id="document-status" role="status">Desktop app required</span><button id="findbtn" type="button">Find</button></div>
+    <div class="source-layout">
+      <nav id="files" class="files" aria-label="Project files"></nav>
+      <div class="document-pane">
+        <nav id="file-tabs" class="file-tabs" aria-label="Open source files"></nav>
+        <div id="conflict-banner" class="notice" role="alert" hidden><span id="conflict-message">File changed outside CassQuery. Your draft is intact.</span><button id="conflict-keep" type="button">Keep draft</button><button id="conflict-reload" type="button">Reload file</button><button id="conflict-copy" type="button">Save a copy</button><button id="conflict-resolve" type="button">Resolve revisions</button></div>
+        <form id="find-bar" class="find-bar" hidden>
+          <label for="find-query">Find</label><input id="find-query" type="search" maxlength="256" autocomplete="off">
+          <label class="check"><input id="find-case" type="checkbox">Case</label>
+          <button id="find-prev" type="button" aria-label="Previous match">Previous</button><button id="find-next" type="submit" aria-label="Next match">Next</button><button id="find-close" type="button" aria-label="Close find">Close</button><span id="find-status" role="status"></span>
+        </form>
+        <div class="editor-area">
+          <div id="line-numbers" class="line-numbers" aria-hidden="true"></div>
+          <textarea id="source-editor" aria-label="Source editor" spellcheck="false" autocomplete="off" autocapitalize="off" autocorrect="off" wrap="off" readonly></textarea>
+          <div id="editor-mirror" class="editor-mirror" aria-hidden="true"></div>
+          <div id="editor-empty" class="editor-empty">Open a project in the desktop app to edit its source.</div>
+        </div>
+        <footer class="editor-footer"><span id="cursor-position">Ln 1, Col 1</span><span id="editor-file-info"></span><button id="undo-btn" type="button" disabled>Undo</button><button id="redo-btn" type="button" disabled>Redo</button></footer>
+        <details id="parameter-panel" class="parameter-panel"><summary>Source parameters</summary><div id="parameters"></div></details>
+      </div>
     </div>
-    <div class="tools">
-      <label for="explode">Explode <span id="explodeval">0%</span></label>
-      <input type="range" id="explode" min="0" max="100" value="0">
-      <button id="xraybtn" type="button" aria-pressed="false">X-ray</button>
-      <button id="buildbtn" type="button">Rebuild certified</button>
-      <button id="resetview" type="button">Reset view</button>
-      <pre id="diag" role="alert"></pre>
+  </section>
+  <div id="pane-divider" class="pane-divider" role="separator" aria-label="Resize code and model panes" aria-orientation="vertical" aria-valuemin="25" aria-valuemax="65" aria-valuenow="44" tabindex="0" hidden></div>
+  <section class="model-pane" aria-label="CAD viewport and inspector">
+    <div id="stage">
+      <div id="stage-msg" role="status"><strong>Loading</strong>Fetching projects from the worker.</div>
+      <div id="selection"><span class="name" id="selname"></span><button id="selisolate" type="button">Isolate</button><button id="selhide" type="button">Hide</button><button id="selshow" type="button">Show all</button></div>
+      <nav class="camera-tools" aria-label="Camera views"><button id="camera-fit" type="button">Fit</button><button id="camera-front" type="button">Front −Y</button><button id="camera-side" type="button">Side +X</button><button id="camera-top" type="button">Top +Z</button></nav>
     </div>
-    <ul class="chips" id="chips"></ul>
-  </aside>
+    <aside aria-label="Model controls">
+      <p class="caption" id="caption"></p>
+      <nav class="steps" id="steps" aria-label="Steps"></nav>
+      <div class="navrow"><button id="prev" type="button">Previous</button><button id="next" type="button">Next</button></div>
+      <div class="tools">
+        <label for="explode">Explode <span id="explodeval">0%</span></label><input type="range" id="explode" min="0" max="100" value="0">
+        <button id="xraybtn" type="button" aria-pressed="false">X-ray</button><button id="buildbtn" type="button">Rebuild certified</button><button id="resetview" type="button">Reset view</button>
+        <pre id="diag" role="alert"></pre>
+      </div>
+      <nav id="part-tree" aria-label="Model parts"></nav>
+      <details id="part-inspector"><summary>Parts and geometry</summary><dl id="part-facts"></dl>
+        <form id="transform-form">
+          <fieldset><legend>World origin: scale → Rx → Ry → Rz → translation</legend>
+            <div class="triple"><label>X mm<input id="translation-x" type="number" step="0.1" value="0"></label><label>Y mm<input id="translation-y" type="number" step="0.1" value="0"></label><label>Z mm<input id="translation-z" type="number" step="0.1" value="0"></label></div>
+            <div class="triple"><label>Rx °<input id="rotation-x" type="number" step="1" value="0"></label><label>Ry °<input id="rotation-y" type="number" step="1" value="0"></label><label>Rz °<input id="rotation-z" type="number" step="1" value="0"></label></div>
+            <label for="uniform-scale">Uniform scale</label><input id="uniform-scale" type="number" min="0.000001" step="any" value="1">
+            <div class="navrow"><button id="transform-apply" type="submit" disabled>Apply to source</button><button id="transform-reset" type="button" disabled>Reset</button></div>
+            <div class="navrow"><button id="transform-undo" type="button" disabled>Undo transform</button><button id="transform-redo" type="button" disabled>Redo transform</button></div>
+          </fieldset>
+        </form>
+      </details>
+      <ul class="chips" id="chips"></ul>
+    </aside>
+  </section>
 </main>
+<section id="error-history" class="error-history" aria-label="Build errors" hidden><div class="source-heading"><h2>Errors</h2><button id="errors-clear" type="button">Clear history</button></div><ol id="error-items"></ol></section>
+<footer class="workspace-status"><span id="workbench-status" role="status">Viewer only — desktop source editing unavailable</span><span id="source-provenance"></span><button id="update-notice" type="button" hidden>Update</button></footer>
+<dialog id="draft-guard" aria-labelledby="guard-title"><form method="dialog"><h2 id="guard-title">Unsaved source</h2><p id="guard-message">Save your drafts before changing projects?</p><div class="dialog-actions"><button id="guard-cancel" value="cancel">Cancel</button><button id="guard-discard" value="discard">Discard drafts</button><button id="guard-save" value="save">Save all</button></div></form></dialog>
+<dialog id="settings-dialog" aria-labelledby="settings-title"><div class="source-heading"><h2 id="settings-title">Settings</h2><button id="settings-close" type="button">Close</button></div>
+  <div class="settings-grid">
+    <label for="theme-select">Theme</label><select id="theme-select"><option value="system">System</option></select>
+    <label for="editor-font">Editor font</label><select id="editor-font"><option value="system-mono">System mono</option><option value="menlo">Menlo</option><option value="sf-mono">SF Mono</option><option value="consolas">Consolas</option><option value="monospace">Monospace</option></select>
+    <label for="editor-font-size">Editor size</label><input id="editor-font-size" type="number" min="12" max="24" value="14">
+    <label for="tab-size">Indent spaces</label><select id="tab-size"><option value="2">2</option><option value="4" selected>4</option></select>
+    <label class="check"><input id="line-wrap" type="checkbox">Wrap source lines</label><label class="check"><input id="editor-visible" type="checkbox">Show editor</label>
+    <label class="check"><input id="auto-build" type="checkbox">Build after save</label>
+    <label for="reduced-motion">Motion</label><select id="reduced-motion"><option value="system">System</option><option value="on">Reduced</option></select>
+    <label for="update-check-mode">Update checks</label><select id="update-check-mode"><option value="enabled">Automatic check</option><option value="manual">Manual only</option></select>
+    <label class="check"><input id="update-auto-download" type="checkbox">Download verified updates automatically</label>
+  </div><div class="dialog-actions"><button id="update-check-btn" type="button" disabled>Check updates</button><button id="update-download-btn" type="button" disabled>Download update</button><button id="update-reveal-btn" type="button" disabled>Reveal verified download</button><button id="update-open-btn" type="button" disabled>Install and restart</button></div><p id="update-status" role="status"></p>
+</dialog>
+<dialog id="export-dialog" aria-labelledby="export-title"><form id="export-form"><div class="source-heading"><h2 id="export-title">Export certified source geometry</h2><button id="export-close" type="button">Close</button></div>
+  <label for="export-format">Format</label><select id="export-format"><option value="step">STEP</option><option value="stl">STL</option><option value="brep">BREP</option><option value="py">Python source</option><option value="zip">Project ZIP</option></select>
+  <label for="export-variant">Certified variant</label><select id="export-variant"></select><label class="check"><input id="export-selected" type="checkbox">Selected part only</label><div class="dialog-actions"><button id="export-confirm" type="submit">Choose destination</button></div></form>
+</dialog>
+<dialog id="conflict-dialog" aria-labelledby="conflict-title"><form id="conflict-form"><h2 id="conflict-title">Choose a source revision</h2><label for="conflict-choice">Revision to keep</label><select id="conflict-choice"></select><textarea id="conflict-preview" aria-label="Selected revision preview" readonly spellcheck="false"></textarea><div class="dialog-actions"><button id="conflict-cancel" type="button">Cancel</button><button id="conflict-confirm" type="submit">Confirm with desktop</button></div></form></dialog>
+<dialog id="project-dialog" aria-labelledby="project-dialog-title"><form id="project-form"><h2 id="project-dialog-title">New project</h2><label for="project-name">Project name</label><input id="project-name" type="text" maxlength="80" value="Untitled" required><div class="dialog-actions"><button id="project-cancel" type="button">Cancel</button><button id="project-create" type="submit">Choose folder</button></div></form></dialog>
+<dialog id="keyboard-dialog" aria-labelledby="keys-title"><div class="source-heading"><h2 id="keys-title">Keyboard shortcuts</h2><button id="keys-close" type="button">Close</button></div><dl class="key-list"><dt>⌘/Ctrl O · Shift O</dt><dd>Open file · folder</dd><dt>⌘/Ctrl N</dt><dd>New project</dd><dt>⌘/Ctrl S · Shift S</dt><dd>Save all · save a copy</dd><dt>⌘/Ctrl B · E</dt><dd>Save and build · export</dd><dt>⌘/Ctrl F · Z · Shift Z</dt><dd>Find · undo · redo</dd><dt>⌘/Ctrl ,</dt><dd>Settings</dd><dt>F · 1 · 2 · 3 outside text</dt><dd>Fit · front −Y · side +X · top +Z</dd><dt>Tab · Shift Tab</dt><dd>Indent · unindent source</dd><dt>Escape</dt><dd>Close dialog or find</dd></dl></dialog>
 <script type="importmap">
-{ "imports": {
-  "three": "./vendor/three.module.js",
-  "three/addons/": "./vendor/addons/"
-} }
+{ "imports": { "three": "./vendor/three.module.js", "three/addons/": "./vendor/addons/" } }
 </script>
 <script type="module" src="./app.js"></script>
+<script type="module" src="./workbench.js"></script>
 </body>
 </html>

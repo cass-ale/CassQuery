@@ -38,7 +38,15 @@ def run_preflight(root, output, timeout=90, stage_timeout=None):
     env['PATH'] = os.pathsep.join((str(Path(sys.executable).parent), str(Path(env.get('CASSQUERY_NODE') or shutil.which('node')).parent), env['PATH']))
     command = [sys.executable, str(root / 'tools/preflight.py')]
     if stage_timeout is not None:
-        command = [sys.executable, '-c', f'import sys;sys.path.insert(0,{str(root / "tools")!r});import preflight;preflight.STAGE_TIMEOUT={stage_timeout};preflight.main()']
+        # Target the Python stage only: syntax checks legitimately exceed a tiny
+        # shared budget as the application grows; this is not a syntax-timeout test.
+        command = [sys.executable, '-c',
+                   f'import sys;sys.path.insert(0,{str(root / "tools")!r});import preflight;'
+                   f'original=preflight.subprocess.run;'
+                   f'preflight.subprocess.run=lambda args,**kwargs: '
+                   f'original(args,**dict(kwargs,timeout={stage_timeout} if '
+                   f'any(str(arg).endswith("python_test_stage.py") for arg in args) '
+                   f'else kwargs.get("timeout")));preflight.main()']
     return subprocess.run([*command, '--root', str(root), '--output', str(output)], cwd=root, env=env,
                           capture_output=True, text=True, timeout=timeout, check=False)
 

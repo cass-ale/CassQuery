@@ -5,6 +5,61 @@ approval. The owner authorized source pushes and subsequently authorized a tagge
 **v0.1.0** release after the repaired candidate passes. That authorization does not
 approve a failed build or allow the agent to bypass the protected human gate.
 
+## Released v0.1.0 and current work
+
+[v0.1.0](https://github.com/cass-ale/CassQuery/releases/tag/v0.1.0) was published
+from `33c2d35f817ced4a3e85a54ed6ce148ce7030d62`. Native candidate
+[40152969599](https://github.com/cass-ale/CassQuery/actions/runs/40152969599)
+and integration [40152969663](https://github.com/cass-ale/CassQuery/actions/runs/40152969663)
+passed on the same source. Publication
+[40162195548](https://github.com/cass-ale/CassQuery/actions/runs/40162195548)
+passed after the configured human approval. Downloaded ARM64/Intel candidates,
+all 390 declared files per architecture, final package bytes and 630 new native
+frames were independently verified. All four public ZIP/DMG assets were then
+re-downloaded and matched to their qualified SHA-256s.
+
+The qualified distribution is ad-hoc/non-hardened, not notarized. It does not
+claim macOS 14 device execution, quarantined Finder launch, hardware-Metal
+qualification, Developer ID identity or Gatekeeper acceptance. Local sandbox
+restrictions below remain real; native/package proof came from separate CI,
+not a local permission bypass. Hallmark lint remains unavailable.
+
+v0.2.0 implementation is in progress under [WORKBENCH.md](WORKBENCH.md) and
+[WORKBENCH_PRODUCT.md](WORKBENCH_PRODUCT.md). New editor/import-export/update
+behavior must earn new exact-source production and native evidence; v0.1's
+successful release does not qualify changed v0.2 source.
+
+## Current v0.2 source evidence
+
+The current implementation's source workflow was exercised on a coherent
+uncommitted development copy. Same-source legacy integration passed four
+scenarios/22 checks including its broken-boundary witness. The workbench passed
+three scenarios/11 checks: capability/opening, typed source save and geometry
+change, external conflict, syntax retention, inert draft restoration, persistent
+BREP transform, selected STEP export/import, eight themes, settings and shortcuts.
+Reports and inspected frames remain outside git. This source browser run uses
+production worker, filesystem and broker code with a simulated native chooser;
+it is not native OS-dialog or update-install proof.
+
+Focused source and independent reviews repaired actual save/overwrite races,
+recovery metadata/queue and late-edit loss, stale watcher reconciliation,
+mesh-contaminated BREP bounds, scale-input validation and project-selection races.
+A new frozen Python worker passes actual eight-gate/save/failure retention and
+new workbench API/STEP roundtrip tests. Its compiled helper code matches sources;
+two fresh application-state starts pass the unchanged 30-second budget. UI changed
+after that build, so its embedded viewer is not current final-app evidence.
+
+Final stable-source preflight and exact-source native ARM64/Intel CI are pending.
+Native file-dialog actions, default-client GitHub transport, custom install/rollback,
+final ZIP/DMG bytes and new frames must pass before a v0.2.0 tag. No native permission
+failure is waived, and no old v0.1/development evidence is relabelled as final v0.2.
+
+## Earlier component ledger
+
+The remaining historical entries record the tests and failures at their stated
+source revisions. Statements that a replacement run or publication had not yet
+executed belong to those earlier snapshots, not the published v0.1 result above.
+
 ## Implemented
 
 - Native macOS Electron bundle with its own Python/CadQuery/OCP worker, explicit

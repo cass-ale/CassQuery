@@ -26,12 +26,13 @@ SHA = "a" * 40
 TAG_SHA = "b" * 40
 LOCKED_INPUTS = {name: (ROOT / name).read_bytes() for name in
                  ("package.json", "requirements-build.txt", "package-lock.json", "packaging/requirements-macos.lock", "packaging/wheel-manifest.json")}
-NATIVE_SOURCE_NAMES = ('worker.py', 'shell/main.js', 'shell/runtime.cjs', 'shell/smoke.cjs', 'shell/renderer_config.cjs',
-    'viewer/app.js', 'viewer/brand.svg', 'viewer/index.html', 'viewer/style.css', 'viewer/vendor/LICENSE.three',
-    'viewer/vendor/three.core.js', 'viewer/vendor/three.module.js', 'viewer/vendor/addons/controls/OrbitControls.js',
-    'viewer/vendor/addons/environments/RoomEnvironment.js', 'viewer/vendor/addons/utils/BufferGeometryUtils.js',
-    'testpart/part_entry.py', 'testpart/viewer.json', 'assets/icons/cassquery.icns')
+NATIVE_SOURCE_NAMES = (*evidence.PYTHON_SOURCE_PATHS, *evidence.NATIVE_SOURCE_PATHS,
+    *sorted(file.relative_to(ROOT).as_posix() for folder in ('viewer', 'testpart')
+            for file in (ROOT / folder).rglob('*') if file.is_file() and '__pycache__' not in file.parts),
+    'assets/icons/cassquery.icns')
 SOURCE_INPUTS = {**LOCKED_INPUTS, **{name: (ROOT / name).read_bytes() for name in NATIVE_SOURCE_NAMES},
+                 **{name: (ROOT / name).read_bytes() for name in ('tools/update_check_smoke.cjs', 'tools/workbench_native_smoke.py',
+                                                               'tools/native_workbench_probe.cjs', 'tools/update_smoke.py')},
                  **{file.relative_to(ROOT).as_posix(): file.read_bytes() for file in (ROOT / 'tests').glob('test_*.py')},
                  **{file.relative_to(ROOT).as_posix(): file.read_bytes() for file in (ROOT / 'tests').glob('*.cjs')}}
 SOURCE_FILES = [{"path": name, "bytes": len(data), "executable": False, "sha256": hashlib.sha256(data).hexdigest()}
@@ -193,7 +194,10 @@ def candidate_bytes(arch, mutate=None, extra=None):
         raw = raw_renderer(directory, False)
         runtime_path = directory + '/worker-runtime.json'
         runtime = {'schema': 1, 'pid': 11, 'challenge': 'fixture', 'frozen': True, 'executable': raw['worker_executable'],
-                   'resource_root': resources + '/worker/_internal', 'wall_time_ms': 8000, 'monotonic_ms': 8000}
+                   'resource_root': resources + '/worker/_internal', 'wall_time_ms': 8000, 'monotonic_ms': 8000,
+                   'modules': {Path(name).stem: {'path': resources + '/worker/_internal/' + name,
+                                                'loader': 'PyiFrozenLoader'}
+                               for name in evidence.PYTHON_SOURCE_PATHS if name != 'worker.py'}}
         put(runtime_path, runtime)
         put(directory + '/bundle-before.json', inventory)
         put(directory + '/bundle-after.json', inventory)
@@ -299,6 +303,65 @@ def candidate_bytes(arch, mutate=None, extra=None):
     put("evidence/source-before.json", {"schema": 1, "clean": True, "source_sha": SHA,
                                          "fingerprint": FINGERPRINT, "files": SOURCE_FILES})
     files["evidence/runner-context.txt"] = b"bounded native CI protocol fixture\n"
+    # New gates are explicit PROTOCOL models built by their actual producer-contract tests.
+    # They never run in native drivers and are not native/HTTP execution evidence.
+    before_source = {'schema': 1, 'clean': True, 'source_sha': SHA, 'fingerprint': FINGERPRINT, 'files': SOURCE_FILES}
+    from test_workbench_contract import native_qualification_model
+    from test_workbench_evidence import update_protocol_fixture
+    with tempfile.TemporaryDirectory(prefix='cq-new-gates-PROTOCOL-') as temporary:
+        model_root = Path(temporary)
+        workbench = model_root / 'workbench'; workbench.mkdir()
+        qualification = native_qualification_model(workbench)
+        editor_file = workbench / 'workbench-native.json'
+        editor = json.loads(editor_file.read_bytes()); editor['architecture'] = arch
+        editor_file.write_bytes(json.dumps(editor, sort_keys=True).encode())
+        qualification.update(source_fingerprint=FINGERPRINT, after_fingerprint=FINGERPRINT,
+                             architecture=arch, version=VERSION)
+        source_file = workbench / 'source-before.json'
+        source_file.write_bytes(json.dumps(before_source, sort_keys=True).encode())
+        qualification['source_snapshot'] = record('source-before.json', source_file.read_bytes())
+        qualification['editor_component'] = record('workbench-native.json', editor_file.read_bytes())
+        (workbench / 'workbench-qualification.json').write_bytes(json.dumps(qualification, sort_keys=True).encode())
+        update_directory = model_root / 'update'
+        update_protocol_fixture(update_directory, before_source, arch=arch, version=VERSION)
+        for gate, directory in (('workbench', workbench), ('update', update_directory)):
+            for file in directory.rglob('*'):
+                if file.is_file():
+                    files[f'evidence/{gate}-{arch}/' + file.relative_to(directory).as_posix()] = file.read_bytes()
+    network_prefix = f'evidence/updatecheck-{arch}'
+    network_before = put(network_prefix + '-source-before.json', before_source)
+    network_after = put(network_prefix + '-source-after.json', before_source)
+    archive_name = f'CassQuery-0.1.0-mac-{arch}.zip'
+    archive_sha = hashlib.sha256(('PROTOCOL-network-only-' + arch).encode()).hexdigest()
+    sums_data = (archive_sha + '  ' + archive_name + '\n').encode()
+    files[network_prefix + '-SHA256SUMS.txt'] = sums_data
+    checksum_record = linked(network_prefix + '-SHA256SUMS.txt', 'evidence')
+    metadata = {'tag_name': 'v0.1.0', 'draft': False, 'prerelease': False,
+                'html_url': 'https://github.com/cass-ale/CassQuery/releases/tag/v0.1.0',
+                'assets': [{'name': archive_name, 'size': 100, 'digest': 'sha256:' + archive_sha},
+                           {'name': 'SHA256SUMS.txt', 'size': len(sums_data), 'digest': 'sha256:' + checksum_record['sha256']}]}
+    metadata_record = put(network_prefix + '-release.json', metadata)
+    network_hashes = {name: hashlib.sha256(SOURCE_INPUTS[name]).hexdigest() for name in
+                     ('shell/updater.cjs', 'shell/update_install.cjs', 'tools/update_check_smoke.cjs')}
+    put(network_prefix + '.json', {'schema': 1, 'kind': 'update-network-contract', 'pass': True,
+        'source_sha': SHA, 'source_fingerprint': FINGERPRINT, 'after_fingerprint': FINGERPRINT,
+        'source_before': {**network_before, 'path': Path(network_before['path']).name},
+        'source_after': {**network_after, 'path': Path(network_after['path']).name},
+        'architecture': arch, 'fixture_current_version': '0.0.0', 'network_contract_pass': True,
+        'CI_qualification': True, 'source_clean': True, 'source_unchanged': True,
+        'default_fetch': True, 'authenticated': False, 'install_attempted': False, 'native_GUI_proof': False,
+        'source_hashes': network_hashes, 'after_source_hashes': network_hashes,
+        'runtime': {'node': 'v22.23.4', 'platform': 'darwin', 'architecture': arch},
+        'published_release': 'v0.1.0', 'release_url': metadata['html_url'],
+        'metadata': {**metadata_record, 'path': Path(metadata_record['path']).name},
+        'metadata_bytes': metadata_record['bytes'], 'metadata_sha256': metadata_record['sha256'],
+        'checksums': checksum_record, 'native_archive': {'name': archive_name, 'arch': arch,
+                                                     'bytes': 100, 'sha256': archive_sha, 'downloaded': False},
+        'statuses': [{'endpoint': 'https://api.github.com/repos/cass-ale/CassQuery/releases/latest', 'status': 200,
+                      'accept': 'application/vnd.github+json'},
+                     {'endpoint': 'https://release-assets.githubusercontent.com/SHA256SUMS.txt', 'status': 200,
+                      'accept': 'application/octet-stream'}],
+        'started_ms': 1000, 'finished_ms': 2000, 'error': None})
     records = [record(name, data) for name, data in sorted(files.items())]
     by_name = {x["path"]: x for x in records}
     manifest = {"schema": 1, "repository": m.REPOSITORY, "source_sha": SHA,
@@ -725,8 +788,9 @@ class PromotionTests(unittest.TestCase):
             manifest["files"] = [item if x["path"] == name else x for x in manifest["files"]]
             manifest["gates"]["preflight"] = item
         self.api.rewrite_candidate("x64", mismatch)
-        with self.assertRaisesRegex(ValueError, "fingerprints"):
+        with self.assertRaisesRegex(ValueError, 'fingerprints|source changed'):
             self.prepare()
+        self.assertFalse(self.writes())
 
     def test_tag_dispatch_keeps_candidate_main_push_only(self):
         plan = self.prepare()

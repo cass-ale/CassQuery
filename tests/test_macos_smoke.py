@@ -188,10 +188,12 @@ class SmokeEvidenceTests(unittest.TestCase):
         executable = self.resources / 'worker/cassquery-worker'
         proof = {'schema': 1, 'pid': 54321, 'challenge': 'current-run', 'frozen': True,
                  'executable': str(executable), 'resource_root': str(executable.parent / '_internal'),
+                 'modules': {Path(name).stem: {'path': str(executable.parent / '_internal' / name), 'loader': 'PyiFrozenLoader'}
+                             for name in module.PYTHON_SOURCE_PATHS if name != 'worker.py'},
                  'wall_time_ms': 2000, 'monotonic_ms': 2000}
         module.validate_worker_proof(proof, 54321, 'current-run', self.started, self.finished, frozen=True, executable=executable)
         for change in ({'frozen': False}, {'pid': 1}, {'challenge': 'old'}, {'monotonic_ms': 0},
-                       {'resource_root': '/external'}, {'executable': '/usr/bin/python3'}):
+                       {'resource_root': '/external'}, {'executable': '/usr/bin/python3'}, {'modules': {}}):
             with self.subTest(change=change), self.assertRaises(RuntimeError):
                 module.validate_worker_proof({**proof, **change}, 54321, 'current-run', self.started, self.finished, frozen=True, executable=executable)
 

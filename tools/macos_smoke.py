@@ -16,11 +16,12 @@ import tempfile
 import time
 import uuid
 
-from release_evidence import (NATIVE_CHECKS as CHECKS, validate_native_matrix,
-                              validate_native_renderer)
+from release_evidence import (NATIVE_CHECKS as CHECKS, NATIVE_SOURCE_PATHS, PYTHON_SOURCE_PATHS,
+                              source_manifest, validate_native_matrix, validate_native_renderer,
+                              validate_python_modules)
 
 ROOT = Path(__file__).resolve().parents[1]
-SHELL_FILES = ('shell/main.js', 'shell/renderer_config.cjs', 'shell/runtime.cjs', 'shell/smoke.cjs')
+SHELL_FILES = NATIVE_SOURCE_PATHS
 MACHO_MAGIC = {bytes.fromhex(s) for s in ('feedface', 'cefaedfe', 'feedfacf', 'cffaedfe',
                                         'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca')}
 
@@ -181,12 +182,17 @@ def verify_bundle(app, arch, version):
             for copy in (resources / 'source' / relative, resources / 'worker/_internal' / relative):
                 require(copy.is_file() and sha256(copy) == sha256(file), f'Packaged source/resource mismatch: {copy}')
             source.append(file_evidence(file))
-    worker_source = resources / 'source/worker.py'
-    require(sha256(worker_source) == sha256(ROOT / 'worker.py'), 'Packaged worker source mismatch')
-    source.append(file_evidence(ROOT / 'worker.py'))
+    for name in PYTHON_SOURCE_PATHS:
+        original = ROOT / name
+        for copy in (resources / 'source' / name, resources / 'worker/_internal/source' / name):
+            require(copy.is_file() and sha256(copy) == sha256(original), f'Packaged Python source mismatch: {name}')
+        source.append(file_evidence(original))
     packed_names = ['package.json', *SHELL_FILES]
     packed = asar_contents(resources / 'app.asar', packed_names)
-    require(json.loads(packed['package.json'])['version'] == version, 'Packed package version differs')
+    package = json.loads((ROOT / 'package.json').read_text())
+    packed_package = json.loads(packed['package.json'])
+    require(packed_package['version'] == version and packed_package.get('main') == package['main'], 'Packed package version/entry differs')
+    require(source_manifest(packed_package) == source_manifest(package), 'Packed executable source manifest differs')
     for name in packed_names[1:]:
         require(packed[name] == (ROOT / name).read_bytes(), f'Packed shell source mismatch: {name}')
         source.append(file_evidence(ROOT / name))
@@ -288,9 +294,11 @@ def instrument_project(project, proof):
     # Trusted public fixture executes this in the actual worker process. Unlike
     # an expected-frozen CLI flag, sys.frozen/_MEIPASS here are runtime evidence.
     entry = project / 'part_entry.py'
-    code = "\nimport sys as _cq_sys, os as _cq_os, json as _cq_json, time as _cq_time\n"
+    code = "\nimport sys as _cq_sys, os as _cq_os, json as _cq_json, time as _cq_time, importlib as _cq_importlib\n"
+    modules = [Path(name).stem for name in PYTHON_SOURCE_PATHS if name != 'worker.py']
+    code += f"_cq_modules = {{name: _cq_importlib.import_module(name) for name in {modules!r}}}\n"
     code += f"with open({str(proof)!r}, 'w') as _cq_proof:\n"
-    code += "    _cq_json.dump({'schema':1, 'pid':_cq_os.getpid(), 'challenge':_cq_os.environ.get('CASSQUERY_SMOKE_CHALLENGE'), 'frozen':getattr(_cq_sys,'frozen',False), 'executable':_cq_sys.executable, 'resource_root':getattr(_cq_sys,'_MEIPASS',None), 'wall_time_ms':_cq_time.time()*1000, 'monotonic_ms':_cq_time.monotonic()*1000}, _cq_proof)\n"
+    code += "    _cq_json.dump({'schema':1, 'pid':_cq_os.getpid(), 'challenge':_cq_os.environ.get('CASSQUERY_SMOKE_CHALLENGE'), 'frozen':getattr(_cq_sys,'frozen',False), 'executable':_cq_sys.executable, 'resource_root':getattr(_cq_sys,'_MEIPASS',None), 'modules':{name:{'path':module.__file__, 'loader':type(module.__loader__).__name__} for name,module in _cq_modules.items()}, 'wall_time_ms':_cq_time.time()*1000, 'monotonic_ms':_cq_time.monotonic()*1000}, _cq_proof)\n"
     entry.write_text(entry.read_text() + code)
 
 
@@ -301,6 +309,10 @@ def validate_worker_proof(proof, pid, challenge, started, finished, *, frozen, e
             and type(proof.get('wall_time_ms')) in (int, float) and started['wall_time_ms'] <= proof['wall_time_ms'] <= finished['wall_time_ms'], 'Stale worker runtime time')
     if frozen:
         require(Path(proof.get('resource_root', '')).resolve() == (Path(executable).parent / '_internal').resolve(), 'Wrong frozen resource root')
+        try:
+            validate_python_modules(proof)
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
 
 
 def wait_dead(pid):
@@ -428,6 +440,7 @@ def run_smoke(app, output, arch, signed=False):
             report['worker_runtime_evidence'] = file_evidence(proof)
             report['images'] = bundled['images'] + custom['images']
             report['checked'] += ['warm native launch with reused isolated state', 'actual worker PID/challenge/sys.frozen runtime checkpoint',
+                                  'compiled workbench/CADIO PYZ module loader and resource-root imports',
                                   'real secondary process single-instance exclusion', 'native window close/production activate reopen with same warm worker',
                                   'production input controls', 'dark/light 450/700/1000/1320 rendered geometry/layout matrix', 'save/gate retention', 'owned worker shutdown']
         after = inventory(app)

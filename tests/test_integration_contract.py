@@ -156,7 +156,9 @@ class IntegrationReportContractTests(unittest.TestCase):
                            "checks": [{"id": check, "pass": True, "evidence": evidence[check]}
                                       for check in checks]} for name, checks in EXPECTED.items()],
             "mutation": evidence["mutation-witness"],
-            "source": {"worker_sha256": "a" * 64, "viewer_sha256": "d" * 64, "chromium_sandbox": True},
+            "source": {"worker_sha256": "a" * 64, "viewer_sha256": "d" * 64, "chromium_sandbox": True,
+                       "python_sources": [{"path": name, "bytes": 100, "sha256": "a" * 64}
+                                          for name in ("worker.py", "workbench.py", "cad_io.py")]},
             "screenshots": [{"file": shot, "description": "Parser fixture, not browser evidence",
                              "sha256": hashlib.sha256(png).hexdigest(), "width": 1320, "height": 900} for shot in shots],
         }
@@ -166,6 +168,23 @@ class IntegrationReportContractTests(unittest.TestCase):
         file.write_text(json.dumps(report))
         return subprocess.run([self.node, str(SUITE), "--validate-report", str(file)],
                               capture_output=True, text=True, timeout=10, check=False)
+
+    def test_python_source_closure_is_complete_unique_and_typed(self):
+        mutations = [
+            lambda r: r["source"].pop("python_sources"),
+            lambda r: r["source"]["python_sources"].pop(),
+            lambda r: r["source"]["python_sources"].append(dict(r["source"]["python_sources"][0])),
+            lambda r: r["source"]["python_sources"][0].update(sha256="b" * 64),
+            lambda r: r["source"]["python_sources"][1].update(path="../workbench.py"),
+            lambda r: r["source"]["python_sources"][1].update(bytes=0),
+            lambda r: r["source"]["python_sources"][1].update(bytes="100"),
+            lambda r: r["source"]["python_sources"][1].update(sha256="invalid"),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                report = copy.deepcopy(self.report)
+                mutate(report)
+                self.assertNotEqual(self.validate(report).returncode, 0)
 
     def test_declared_product_invariants_do_not_drift(self):
         result = subprocess.run(

@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 import shutil
 import tempfile
@@ -14,18 +15,23 @@ class ReleaseContractTests(unittest.TestCase):
     def test_current_contract(self):
         self.assertTrue(module.check()['pass'])
 
+    def copy_inputs(self, root):
+        sources = json.loads((ROOT / 'package.json').read_text())['cassquerySources']
+        for filename in ('package.json', 'package-lock.json',
+                         'packaging/electron-builder.json', 'packaging/python-runtime.json',
+                         'packaging/wheel-manifest.json', 'packaging/requirements-macos.lock', 'packaging/worker.spec',
+                         'requirements-build.txt', '.github/workflows/macos-candidate.yml', '.github/workflows/integration.yml',
+                         'viewer/vendor/three.core.js', 'assets/icons/cassquery.icns',
+                         *sources['shell'], *sources['python']):
+            target = root / filename
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(ROOT / filename, target)
+        self.assertTrue(module.check(root)['pass'])  # Mutations must not pass due to missing prerequisites.
+
     def mutation(self, old, new):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for filename in ('package.json', 'package-lock.json',
-                             'packaging/electron-builder.json', 'packaging/python-runtime.json',
-                             'packaging/wheel-manifest.json', 'packaging/requirements-macos.lock',
-                             'requirements-build.txt',
-                             '.github/workflows/macos-candidate.yml',
-                             'viewer/vendor/three.core.js', 'assets/icons/cassquery.icns'):
-                target = root / filename
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(ROOT / filename, target)
+            self.copy_inputs(root)
             workflow = root / '.github/workflows/macos-candidate.yml'
             source = workflow.read_text()
             self.assertIn(old, source)

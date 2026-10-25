@@ -446,6 +446,94 @@ class CADTests(WorkbenchCase):
         self.assertEqual((self.payloads / "BOX-certified.json").read_bytes(), index)
         self.error("STALE_CERTIFICATE", lambda: worker.certified_record("BOX").__enter__())
 
+    def test_paused_restore_manual_build_ignores_duplicate_known_save_poll(self):
+        before = self.project.certified
+        self.action("save", path="entry.py", text="def build(:\n", expected_sha256=self.revision(), auto_build=False)
+        self.project.preview_dirty = self.project.certified_due = True
+        worker._build_pending(self.project)
+        self.assertEqual(self.project.state, "error")
+        restored = self.source + "# restored valid source\n"
+        self.action("save", path="entry.py", text=restored, expected_sha256=self.revision(), auto_build=False)
+        captured_sources = worker.snapshot([self.project.root])
+        generation = self.project.gen
+        build = self.project.build
+        observations = []
+        def duplicate_notification(tier):
+            result = build(tier)
+            if tier == "certified":
+                self.assertEqual(result[1]["sources"], captured_sources)
+                worker._apply_changes([str(self.project_root / "entry.py")])
+                observations.append(self.project.gen)
+                self.assertEqual(worker.snapshot([self.project.root]), captured_sources)
+            return result
+        self.events.clear()
+        self.project.preview_dirty = self.project.certified_due = True
+        with mock.patch.object(self.project, "build", side_effect=duplicate_notification):
+            self.assertTrue(worker._build_pending(self.project))
+        self.assertEqual(observations, [generation])
+        self.assertEqual(self.project.state, "certified")
+        self.assertEqual(self.project.gen, generation)
+        self.assertFalse(self.project.preview_dirty or self.project.certified_due)
+        self.assertFalse(self.project.workbench_auto_build)
+        self.assertEqual(self.project.certified["hash"], before["hash"])
+        self.assertNotEqual(self.project.certified["source_fingerprint"], before["source_fingerprint"])
+        self.assertGreater(self.project.certified["built_at"], before["built_at"])
+        self.assertTrue(any(e.get("type") == "announce" and e.get("tier") == "certified" for e in self.events))
+        with worker.certified_record("BOX") as current:
+            current["assert_current"]()
+
+    def _midbuild_change_rejects_old_certificate(self, manifest_change, metadata_change=False):
+        before_index = (self.payloads / "BOX-certified.json").read_bytes()
+        self.action("save", path="entry.py", text=self.source + "# prepared\n", expected_sha256=self.revision(), auto_build=False)
+        generation = self.project.gen
+        build = self.project.build
+        observations = []
+        def changed_notification(tier):
+            result = build(tier)
+            if tier == "certified":
+                if manifest_change:
+                    path = self.project_root / "viewer.json"
+                    manifest = json.loads(path.read_text())
+                    manifest["chips"] = ["actual new manifest"]
+                    path.write_text(json.dumps(manifest))
+                elif metadata_change:
+                    path = self.project_root / "entry.py"
+                    before = path.read_bytes()
+                    info = path.stat()
+                    os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+                    self.assertEqual(path.read_bytes(), before)
+                else:
+                    path = self.project_root / "entry.py"
+                    path.write_text(self.source.replace("WIDTH=2.0", "WIDTH=4.0"))
+                self.assertNotEqual(worker.snapshot([self.project.root]), result[1]["sources"])
+                worker._apply_changes([str(path)])
+                observations.append(self.project.gen)
+            return result
+        self.events.clear()
+        self.project.preview_dirty = self.project.certified_due = True
+        with mock.patch.object(self.project, "build", side_effect=changed_notification):
+            worker._build_pending(self.project)
+        self.assertEqual(observations, [generation + 1])
+        self.assertEqual(self.project.state, "stale")
+        self.assertEqual((self.payloads / "BOX-certified.json").read_bytes(), before_index)
+        self.assertFalse(any(e.get("type") == "announce" and e.get("tier") == "certified" for e in self.events))
+        self.assertFalse(self.project.preview_dirty or self.project.certified_due)
+        self.error("STALE_CERTIFICATE", lambda: worker.certified_record("BOX").__enter__())
+        # A fresh explicit build is allowed; paused autoBuild is never enabled by this repair.
+        self.project.certified_due = True
+        self.assertTrue(worker._build_pending(self.project))
+        self.assertEqual(self.project.state, "certified")
+        self.assertFalse(self.project.workbench_auto_build)
+
+    def test_paused_manual_build_still_rejects_actual_midbuild_source_change(self):
+        self._midbuild_change_rejects_old_certificate(False)
+
+    def test_paused_manual_build_still_rejects_actual_midbuild_manifest_change(self):
+        self._midbuild_change_rejects_old_certificate(True)
+
+    def test_paused_manual_build_still_rejects_actual_midbuild_metadata_change(self):
+        self._midbuild_change_rejects_old_certificate(False, metadata_change=True)
+
     def test_late_watcher_keeps_already_certified_manual_inputs_current(self):
         manifest = json.loads((self.project_root / "viewer.json").read_text())
         manifest["live"] = False

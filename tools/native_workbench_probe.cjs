@@ -271,8 +271,16 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
   const origin = 'http://127.0.0.1:' + workerPort;
   const traffic = recordWorkbenchTraffic(workerPort), frames = [], debuggerAPI = win.webContents.debugger;
   report.worker_requests = traffic.trace;
-  let ownsDebugger = false;
+  let ownsDebugger = false;report.renderer_requests=[];
+  const rendererRequests=new Map();
   const observeFrame = (_event, method, params) => {
+    if(method==='Network.requestWillBeSent'&&report.renderer_requests.length<200){
+      const url=new URL(params.request.url);
+      if(url.origin===origin&&url.pathname==='/api/rebuild'){
+        const row={path:url.pathname,method:params.request.method,status:null,at_ms:Date.now()};
+        rendererRequests.set(params.requestId,row);report.renderer_requests.push(row);
+      }
+    }else if(method==='Network.responseReceived'&&rendererRequests.has(params.requestId))rendererRequests.get(params.requestId).status=params.response.status;
     if (method === 'Network.webSocketFrameReceived' && frames.length < 1000) {
       try { frames.push(JSON.parse(params.response.payloadData)); } catch { /* Non-JSON frames are not certified announcements. */ }
     }
@@ -285,13 +293,69 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
   const modifier = process.platform === 'darwin' ? 'meta' : 'control';
   const shortcut = (code) => key(code, [modifier]);
   async function text(selector, value) {
-    assert.ok(value.length <= 16384, 'Probe text exceeds public-fixture input bound');
-    await click(win, selector); shortcut('A');
-    for (const character of value) {
-      if (character === '\n') key('Enter');
-      else win.webContents.sendInputEvent({ type: 'char', keyCode: character });
+    assert.ok(Buffer.byteLength(value) <= 16384, 'Probe text exceeds public-fixture input bound');
+    report.text_diagnostics ||= [];
+    const sequence = report.text_diagnostics.length + 1, name = `text-input-${sequence}.json`;
+    const audit = { schema:1, method:'native focused IME text insertion with keyboard selection', selector,
+      expected_length:value.length, expected_sha256:hash(Buffer.from(value)), phases:[], sent_events:[], pass:false };
+    const persist = () => {
+      const bytes=Buffer.from(JSON.stringify(audit,null,2)+'\n'); fs.writeFileSync(path.join(directory,name),bytes);
+      report.text_diagnostics[sequence-1]={path:name,bytes:bytes.length,sha256:hash(bytes),pass:audit.pass};
+    };
+    async function snapshot(phase) {
+      const observed=await js(`(() => {
+        const e=document.querySelector(${JSON.stringify(selector)}),doc=window.__workbench?.active;
+        const recorder=window.__cqNativeInputAudit;if(recorder)recorder.phase=${JSON.stringify(phase)};
+        return {phase:${JSON.stringify(phase)},active_element:document.activeElement?.id||document.activeElement?.tagName,
+          disabled:!!e?.disabled,read_only:!!e?.readOnly,type:e?.type,selection_start:e?.selectionStart,selection_end:e?.selectionEnd,
+          value_length:e?.value?.length,value:e?.value?.slice(0,16384),
+          document:doc?{path:doc.path,base_sha256:doc.baseSha,revision:doc.revision,dirty:doc.dirty}:null,
+          events:recorder?.events||[],dropped_events:recorder?.dropped||0};
+      })()`);
+      const encoded=Buffer.from(observed.value||''),bounded=encoded.subarray(0,16384);
+      observed.value_truncated=encoded.length>bounded.length||observed.value_length>(observed.value||'').length;
+      observed.value=bounded.toString('utf8');observed.value_sha256=observed.value_truncated?null:hash(encoded);
+      observed.bounded_value_sha256=hash(bounded);audit.phases.push(observed);persist();return observed;
     }
-    await waitFor(win, `document.querySelector(${JSON.stringify(selector)}).value === ${JSON.stringify(value)}`, 15000);
+    await js(`(() => {
+      if(window.__cqNativeInputAudit)throw new Error('Input observer already owned');
+      const recorder={phase:'before click',events:[],dropped:0};
+      recorder.listener=e=>{if(recorder.events.length>=2000){recorder.dropped++;return;}
+        recorder.events.push({type:e.type,phase:recorder.phase,key:e.key,input_type:e.inputType,data:e.data?.slice(0,64),
+          target:e.target?.id||e.target?.tagName,active:document.activeElement?.id,selection_start:e.target?.selectionStart,
+          selection_end:e.target?.selectionEnd,value_length:e.target?.value?.length,value_prefix:e.target?.value?.slice(0,96),trusted:e.isTrusted});};
+      for(const type of ['focusin','keydown','keyup','beforeinput','input','select'])document.addEventListener(type,recorder.listener,true);
+      window.__cqNativeInputAudit=recorder;
+    })()`);
+    try {
+      const initial=await snapshot('before click');win.focus();await click(win,selector);
+      await waitFor(win,`(() => {const e=document.querySelector(${JSON.stringify(selector)});return document.activeElement===e&&!e.readOnly&&!e.disabled;})()`,5000);
+      await snapshot('after focused writable click');shortcut('A');
+      await waitFor(win,`(() => {const e=document.querySelector(${JSON.stringify(selector)}),r=window.__cqNativeInputAudit;
+        if(document.activeElement!==e||e.readOnly||e.disabled)return false;
+        if(e.selectionStart!==null)return e.selectionStart===0&&e.selectionEnd===e.value.length;
+        // Number inputs do not expose DOM selection ranges. Observe the real select-all key acknowledgement and exact replacement below.
+        return e.type==='number'&&r.events.some(event=>event.type==='keyup'&&event.target===e.id&&event.key?.toLowerCase()==='a');})()`,5000);
+      const selected=await snapshot('after observed select-all');audit.selection_range_supported=selected.selection_start!==null;
+      await js("window.__cqNativeInputAudit.phase='native IME commit'");
+      audit.sent_events.push({type:'native IME insertText',bytes:Buffer.byteLength(value)});
+      await bounded(()=>win.webContents.insertText(value),10000,'Native IME text insertion');
+      await waitFor(win,`(() => {const e=document.querySelector(${JSON.stringify(selector)}),r=window.__cqNativeInputAudit,events=r.events.filter(event=>event.phase==='native IME commit'&&event.target===e.id);
+        return e.value===${JSON.stringify(value)}&&events.some(event=>event.type==='beforeinput'&&event.trusted)&&events.some(event=>event.type==='input'&&event.trusted);})()`,15000);
+      if(selector==='#source-editor')await waitFor(win,`(() => {const d=window.__workbench?.active;return d?.text===${JSON.stringify(value)}&&
+        (${initial.value_sha256===hash(Buffer.from(value))?'true':`d.revision>${initial.document?.revision??-1}`});})()`,5000);
+      await snapshot('exact native input/document acknowledged');audit.pass=true;persist();
+    } catch(error) {
+      try {const failed=await snapshot('failure');console.error('PUBLIC_NATIVE_INPUT_DIAGNOSTIC',JSON.stringify({path:name,selector,expected_length:value.length,
+        actual_length:failed.value_length,actual_sha256:failed.value_sha256,active_element:failed.active_element,read_only:failed.read_only,
+        selection:[failed.selection_start,failed.selection_end],value_prefix:failed.value.slice(0,256)}));}
+      catch(diagnosticError){audit.diagnostic_error=diagnosticError.message;persist();}
+      try{await image(`text-failure-${sequence}`);}catch(captureError){audit.capture_error=captureError.message;persist();}
+      throw error;
+    } finally {
+      try{await js(`(() => {const r=window.__cqNativeInputAudit;if(r){for(const type of ['focusin','keydown','keyup','beforeinput','input','select'])document.removeEventListener(type,r.listener,true);delete window.__cqNativeInputAudit;}})()`);}
+      catch(cleanupError){audit.observer_cleanup_error=cleanupError.message;persist();}
+    }
   }
   async function until(label, predicate) {
     while (Date.now() < end - 10000) { const value = await predicate(); if (value) return value; await delay(100); }
@@ -331,11 +395,36 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
   }
   function check(id, evidence) { if (id !== 'preload-ipc') validateEvidence(id, evidence); report.checks.push({ id, pass: true, evidence }); }
   async function saved(expectedText) {
-    const start = traffic.trace.length; shortcut('S');
-    return until('actual save HTTP response', () => {
-      const response = traffic.trace.slice(start).find((r) => r.action === 'save' && r.status);
-      return response && (response.status !== 200 || fs.readFileSync(path.join(projectRoot, 'part_entry.py'), 'utf8') === expectedText) ? response : false;
-    });
+    const before=await js(`({busy:window.__workbench?.busy,dirty:window.__workbench?.dirty,base_sha256:window.__workbench?.active?.baseSha,status:document.getElementById('workbench-status').textContent})`);
+    const start=traffic.trace.length;shortcut('S');
+    const response=await until('actual save HTTP response',()=>traffic.trace.slice(start).find(r=>r.action==='save'&&r.status&&r.response));
+    if(response.status===200){
+      const disk=fs.readFileSync(path.join(projectRoot,'part_entry.py'));
+      assert.equal(disk.toString('utf8'),expectedText);assert.equal(hash(disk),response.response.sha256);
+      await waitFor(win,`(() => {const w=window.__workbench,d=w?.active;return w?.busy===0&&!w.dirty&&d?.baseSha===${JSON.stringify(response.response.sha256)}&&d.text===${JSON.stringify(expectedText)}&& !['Saving source','Working'].includes(document.getElementById('workbench-status').textContent);})()`,15000);
+    }else await waitFor(win,'window.__workbench?.busy===0 && window.__workbench.active?.conflicted && !document.getElementById("conflict-banner").hidden',15000);
+    report.save_acknowledgements ||= [];
+    report.save_acknowledgements.push({status:response.status,sha256:response.response.sha256||null,before,
+      ui:await js(`({busy:window.__workbench?.busy,dirty:window.__workbench?.dirty,base_sha256:window.__workbench?.active?.baseSha,status:document.getElementById('workbench-status').textContent})`)});
+    return response;
+  }
+  async function journalBuild(phase) {
+    report.build_diagnostics ||= [];
+    const ui=await js(`({busy:window.__workbench?.busy,dirty:window.__workbench?.dirty,base_sha256:window.__workbench?.active?.baseSha,
+      status:document.getElementById('workbench-status').textContent,diagnostic:document.getElementById('diag').textContent,
+      model:{hash:window.__cq?.model?.hash,tier:window.__cq?.model?.tier,built_at:window.__cq?.model?.index.built_at}})`);
+    report.build_diagnostics.push({phase,at_ms:Date.now(),ui,renderer_requests:[...report.renderer_requests]});
+    fs.writeFileSync(path.join(directory,'build-diagnostics.json'),JSON.stringify(report.build_diagnostics,null,2)+'\n');
+  }
+  async function buildKey() {
+    await waitFor(win,'window.__workbench?.busy===0',15000);
+    const start=report.renderer_requests.length;shortcut('B');
+    try {
+      await journalBuild('actual native B sent');
+      const response=await until('actual keyboard rebuild HTTP response',()=>report.renderer_requests.slice(start).find(r=>r.path==='/api/rebuild'&&r.method==='POST'&&r.status));
+      assert.equal(response.status,202,'Actual rebuild shortcut did not queue a build');
+      await journalBuild('actual keyboard POST202 acknowledged');
+    }catch(error){try{await journalBuild('keyboard rebuild failure');}catch(diagnosticError){report.build_diagnostic_error=diagnosticError.message;}throw error;}
   }
   try {
     assert.equal(debuggerAPI.isAttached(), false, 'Native workbench observer cannot borrow a debugger');
@@ -372,7 +461,7 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
     const before = await geometry(), indexBefore = await current(), edited = original.replace('.box(40, 30, 6,', '.box(42, 30, 6,');
     await text('#source-editor', edited); const saveResponse = await saved(edited); assert.equal(saveResponse.status, 200);
     // Both commands are real renderer key input; a disabled auto-build setting is not bypassed.
-    shortcut('B'); await until('new certified build time', async () => (await current()).built_at > indexBefore.built_at);
+    await buildKey(); await until('new certified build time', async () => (await current()).built_at > indexBefore.built_at);
     const after = await geometry(), gates = (await request(origin, '/api/gates?project=' + projectName)).json;
     check('edit-save-volume', { before_source: hash(Buffer.from(original)), after_source: hash(fs.readFileSync(entry)), before, after,
       save_status: saveResponse.status, renderer_tier: await js('__cq.model.tier'), gate_ids: gates.checks.map((g) => g.id), gates_pass: gates.pass });
@@ -385,13 +474,13 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
     await image('external-conflict'); await click(win, '#conflict-reload');
     await waitFor(win, `document.getElementById('draft-guard').open`); await click(win, '#draft-guard button[value="discard"]');
     await waitFor(win, `document.getElementById('source-editor').value === ${JSON.stringify(external)}`);
-    shortcut('B'); const retained = await current(), frameStart = frames.length;
-    await text('#source-editor', 'def build(:\n'); assert.equal((await saved('def build(:\n')).status, 200); shortcut('B');
+    await buildKey(); const retained = await current(), frameStart = frames.length;
+    await text('#source-editor', 'def build(:\n'); assert.equal((await saved('def build(:\n')).status, 200); await buildKey();
     await waitFor(win, `document.getElementById('diag').textContent.includes('SyntaxError')`);
     check('syntax-retains-certified', { certified_before: retained.hash, certified_after: await js('__cq.model.hash'),
       certified_announcements: frames.slice(frameStart).filter((m) => m.type === 'announce' && m.project === projectName && m.tier === 'certified').length,
       diagnostic: await js('document.getElementById("diag").textContent'), renderer_tier: await js('__cq.model.tier') });
-    await image('syntax-retained'); await text('#source-editor', external); assert.equal((await saved(external)).status, 200); shortcut('B'); await current();
+    await image('syntax-retained'); await text('#source-editor', external); assert.equal((await saved(external)).status, 200); await buildKey(); await current();
     const themeIds = ['counterform-dark', 'counterform-light', 'graphite', 'midnight', 'forest', 'sand', 'paper', 'high-contrast'];
     const states = [];
     for (let i = 0; i < themeIds.length; i++) {
@@ -428,8 +517,13 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
     await qualifyWorkbench(win, directory, { ownedRoot, projectRoot, challenge, driver, native_source, workerPid, workerPort, click, text, key, js, current, geometry, image, traffic, waitFor });
     const qualified = fs.readFileSync(path.join(directory, 'workbench-qualification.json'));
     report.qualification = { path: 'workbench-qualification.json', bytes: qualified.length, sha256: hash(qualified) };
-  } catch (error) { report.errors.push(error.stack || String(error)); }
-  finally {
+  } catch (error) {
+    report.build_diagnostics ||= [];
+    report.build_diagnostics.push({phase:'failure before cleanup',error:error.stack||String(error),renderer_requests:[...report.renderer_requests]});
+    fs.writeFileSync(path.join(directory,'build-diagnostics.json'),JSON.stringify(report.build_diagnostics,null,2)+'\n');
+    try{await journalBuild('actual failure state');}catch(diagnosticError){report.errors.push('Failure state diagnostic: '+diagnosticError.message);}
+    report.errors.push(error.stack || String(error));
+  } finally {
     win.webContents.removeListener('console-message', consoleError); win.webContents.removeListener('render-process-gone', rendererGone);
     traffic.stop();
     if (ownsDebugger) { debuggerAPI.removeListener('message', observeFrame); debuggerAPI.detach(); }

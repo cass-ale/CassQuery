@@ -484,6 +484,94 @@ class WorkbenchContractTests(unittest.TestCase):
         result = subprocess.run([self.node, str(SUITE), '--skip-native'], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 2)
 
+    def test_actual_native_text_helper_requires_input_acknowledgements(self):
+        # MODELS ONLY: execute the actual helper body, not a copied implementation or native proof.
+        code = r"""
+const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),os=require('node:os'),vm=require('node:vm'),crypto=require('node:crypto');
+const source=fs.readFileSync(process.argv[2],'utf8'),start=source.indexOf('  async function text(selector, value) {'),end=source.indexOf('  async function until(label, predicate)',start);
+assert.ok(start>0&&end>start);const body=source.slice(start,end);
+async function model(mode){
+ const directory=fs.mkdtempSync(path.join(os.tmpdir(),'cq-native-text-MODEL-')),calls=[],report={},events=new Map();
+ const numeric=mode==='number',selector=numeric?'#editor-font-size':'#source-editor',expected=numeric?'22':'A\nΩ—B';
+ const input={id:selector.slice(1),type:numeric?'number':'textarea',value:numeric?'14':'old source',readOnly:mode==='readonly',disabled:false,selectionStart:numeric?null:3,selectionEnd:numeric?null:3};
+ const doc={path:'part_entry.py',baseSha:'a'.repeat(64),revision:2,dirty:false,text:input.value};
+ const document={activeElement:{id:'old-focus'},querySelector:()=>input,addEventListener(type,fn){events.set(type,fn);},removeEventListener(type){events.delete(type);}};
+ const window={__workbench:{active:doc}},context=vm.createContext({window,document,JSON});
+ const emit=(type,more={})=>events.get(type)?.({type,target:input,isTrusted:true,...more});
+ const win={focus(){calls.push('focus');},webContents:{async insertText(value){calls.push('IME');if(mode==='noop')return;
+  if(mode!=='no-events')emit('beforeinput',{data:value,inputType:'insertText'});input.value=value;input.selectionStart=numeric?null:value.length;input.selectionEnd=numeric?null:value.length;
+  if(mode!=='no-document'){doc.text=value;doc.revision++;doc.dirty=true;}if(mode!=='no-events')emit('input',{data:value,inputType:'insertText'});
+ }}};
+ const globals={assert,Buffer,fs,path,report,directory,win,hash:bytes=>crypto.createHash('sha256').update(bytes).digest('hex'),
+  js:async code=>vm.runInContext(code,context),click:async()=>{calls.push('click');if(mode!=='wrong-focus')document.activeElement=input;},
+  shortcut:()=>{calls.push('select-all');if(mode!=='partial-selection'){input.selectionStart=numeric?null:0;input.selectionEnd=numeric?null:input.value.length;}emit('keyup',{key:'a'});},
+  waitFor:async(_win,code)=>{calls.push('ack');if(!vm.runInContext(code,context))throw Error('Model acknowledgement absent');},
+  bounded:async work=>work(),image:async()=>{calls.push('failure-capture');},console:{error(){}}};
+ vm.runInNewContext(body+'globalThis.actualText=text;',globals);
+ try{
+  if(['healthy','number'].includes(mode))await globals.actualText(selector,expected);else await assert.rejects(globals.actualText(selector,expected));
+  if(['wrong-focus','readonly','partial-selection'].includes(mode))assert.ok(!calls.includes('IME'));
+  if(['healthy','number'].includes(mode)){assert.equal(input.value,expected);assert.ok(calls.indexOf('IME')>calls.indexOf('select-all'));}
+  const raw=JSON.parse(fs.readFileSync(path.join(directory,'text-input-1.json')));assert.equal(raw.pass,['healthy','number'].includes(mode));
+  assert.ok(raw.phases.length>0&&raw.phases.every(phase=>Buffer.byteLength(phase.value)<=16384));
+  assert.ok(!window.__cqNativeInputAudit&&events.size===0);
+ }finally{fs.rmSync(directory,{recursive:true,force:true});}
+}
+(async()=>{for(const mode of['healthy','number','wrong-focus','readonly','partial-selection','noop','no-events','no-document'])await model(mode);})().catch(error=>{console.error(error);process.exitCode=1;});
+"""
+        file = self.output / 'native-text-models.cjs'; file.write_text(code)
+        result = subprocess.run([self.node, str(file), str(ROOT / 'tools/native_workbench_probe.cjs')], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_red_native_raw_proof_is_bounded_and_preserved_byte_for_byte(self):
+        import signal
+        import workbench_native_smoke as native
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve(); user = root / 'user'; user.mkdir(); proof = user / 'proof'; proof.mkdir(); output = root / 'output'; output.mkdir()
+            raw = b'{"pass":false,"errors":["actual input failure"]}\n'
+            (proof / 'workbench-editor.json').write_bytes(raw)
+            (proof / 'text-input-1.json').write_bytes(b'{"active":"source-editor","value":"public fixture"}\n')
+            process = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(30)'], start_new_session=True)
+            try:
+                os.killpg(process.pid, signal.SIGTERM); process.wait(timeout=5)
+                records = native.retain_native_proof(proof, output, user)
+                self.assertEqual(len(records), 2)
+                for item in records:
+                    data = (output / item['path']).read_bytes()
+                    self.assertEqual(sha(data), item['sha256']); self.assertEqual(len(data), item['bytes'])
+                shutil.rmtree(user)
+                self.assertEqual((output / 'proof/workbench-editor.json').read_bytes(), raw)
+                self.assertFalse(json.loads(raw)['pass'])
+            finally:
+                if process.poll() is None: os.killpg(process.pid, signal.SIGKILL); process.wait(timeout=5)
+
+    def test_native_raw_proof_rejects_escaped_unbounded_and_changed_bytes(self):
+        import workbench_native_smoke as native
+        from unittest.mock import patch
+        for mode in ('symlink', 'directory', 'oversize', 'aggregate', 'count', 'changed', 'existing-output'):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve(); user = root / 'user'; user.mkdir(); proof = user / 'proof'; proof.mkdir(); output = root / 'output'; output.mkdir()
+                file = proof / 'raw.json'; file.write_bytes(b'{"pass":false}')
+                if mode == 'symlink': (proof / 'external').symlink_to(root / 'foreign')
+                elif mode == 'directory': (proof / 'nested').mkdir()
+                elif mode == 'oversize':
+                    with file.open('wb') as stream: stream.truncate(32 * 1024**2 + 1)
+                elif mode == 'aggregate':
+                    for index in range(5):
+                        with (proof / f'large-{index}').open('wb') as stream: stream.truncate(32 * 1024**2)
+                elif mode == 'count':
+                    for index in range(256): (proof / f'raw-{index}').write_bytes(b'')
+                elif mode == 'existing-output': (output / 'proof').mkdir()
+                if mode == 'changed':
+                    original_write = Path.write_bytes
+                    def replace(target, data):
+                        value = original_write(target, data)
+                        if target.parent == output / 'proof': original_write(file, b'new external bytes')
+                        return value
+                    with patch.object(Path, 'write_bytes', replace), self.assertRaises(RuntimeError): native.retain_native_proof(proof, output, user)
+                else:
+                    with self.subTest(mode=mode), self.assertRaises(RuntimeError): native.retain_native_proof(proof, output, user)
+
     def test_constructor_preload_identity_and_ipc_contract_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve(); outer = native_qualification_model(root)

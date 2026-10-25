@@ -478,6 +478,7 @@ class Project:
         self.manifest_error = None
         self.name = self.manifest["name"]
         self.gen = 0
+        self.acknowledged_inputs = None  # Complete source/manifest revision already notified or captured.
         self.state = "idle"
         self.preview_dirty = False
         self.certified_due = False
@@ -532,6 +533,10 @@ class Project:
             self.manifest_error = None
             gen, manifest = self.gen, copy.deepcopy(self.manifest)
         sources = snapshot([self.root])
+        with self.lock:
+            if self.gen != gen or self.manifest_error or _read_manifest(self.root, expected_name=self.name) != manifest:
+                raise StaleBuild("source changed while capturing build inputs")
+            self.acknowledged_inputs = (sources.copy(), copy.deepcopy(manifest))
         t0 = time.time()
         entry_file, _, fn_name = manifest["entry"].partition(":")
         entry = self.load_module(entry_file)
@@ -1125,9 +1130,18 @@ def _apply_changes(changed):
         if not mine:
             continue
         with p.lock:
-            # A polling watcher may recognize an edit only after an explicit
-            # rebuild already certified those exact inputs. Do not invalidate
-            # that current certificate for the watcher's obsolete baseline.
+            current_sources = snapshot([p.root])
+            try:
+                current_manifest = _read_manifest(p.root, expected_name=p.name)
+            except (OSError, ValueError):
+                current_manifest = None
+            # CAS notification/build capture may precede a polling watcher's
+            # baseline update. Ignore only that exact acknowledged revision,
+            # including while building; genuine new bytes/metadata/manifest
+            # still invalidate generation and cannot publish the old build.
+            if (current_manifest is not None and not p.manifest_error and
+                    p.acknowledged_inputs == (current_sources, current_manifest)):
+                continue
             if certificate_current(p):
                 continue
             p.gen += 1
@@ -1149,6 +1163,7 @@ def _apply_changes(changed):
                                "tier": "certified", "error": p.manifest_error,
                                "detail": p.manifest_error})
                     continue
+            p.acknowledged_inputs = (current_sources, copy.deepcopy(p.manifest))
             if p.manifest.get("live") and not p.manifest_error and getattr(p, "workbench_auto_build", True):
                 p.preview_dirty = True
             set_state(p, "stale", f"changed: {os.path.basename(mine[0])}")

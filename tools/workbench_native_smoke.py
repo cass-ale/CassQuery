@@ -16,6 +16,7 @@ import plistlib
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import time
@@ -450,6 +451,37 @@ def serve_native_actions(process, proof, challenge, user):
     return read_json(main_file)
 
 
+def retain_native_proof(proof, output, owned_root):
+    """Bank bounded flat raw evidence after owned processes exit, even for red runs."""
+    proof, output, owned_root = Path(proof), Path(output), Path(owned_root).resolve()
+    require(not proof.is_symlink() and proof.is_dir() and proof.resolve().is_relative_to(owned_root), 'Raw proof escaped its owned state')
+    anchor = proof.lstat(); canonical = proof.resolve()
+    files = []
+    for entry in proof.iterdir():
+        require(len(files) < 256, 'Raw proof file count exceeds bound')
+        metadata = entry.lstat()
+        require(stat.S_ISREG(metadata.st_mode) and not entry.is_symlink() and metadata.st_size <= 32 * 1024**2,
+                'Raw proof contains unsafe or oversized evidence')
+        files.append((entry, metadata))
+    require(sum(metadata.st_size for _, metadata in files) <= 128 * 1024**2, 'Raw proof bytes exceed bound')
+    destination = output / 'proof'; require(not destination.exists(), 'Raw proof output must be fresh')
+    destination.mkdir()
+    records = []
+    for file, before in sorted(files, key=lambda item: item[0].name):
+        with file.open('rb') as stream: data = stream.read(32 * 1024**2 + 1)
+        require(len(data) == before.st_size, 'Raw proof changed before copy')
+        target = destination / file.name; target.write_bytes(data)
+        after = file.lstat()
+        require((after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) ==
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                and not file.is_symlink() and target.read_bytes() == data, 'Raw proof changed during copy')
+        current = proof.lstat()
+        require(not proof.is_symlink() and proof.resolve() == canonical and
+                (current.st_dev, current.st_ino) == (anchor.st_dev, anchor.st_ino), 'Raw proof state root changed')
+        records.append({'path': 'proof/' + file.name, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest()})
+    return records
+
+
 def run(app, output, arch):
     require(platform.system() == 'Darwin' and os.environ.get('GITHUB_ACTIONS') == 'true', 'Native workbench launch/input is CI-only; do not touch the live installed app')
     app, output, arch = Path(app).resolve(), Path(output).resolve(), architecture(arch)
@@ -471,7 +503,7 @@ def run(app, output, arch):
                    'native_dialog_selection': {'status': 'blocked'}, 'error': 'Native full paths not completed'}
     write_report(output / 'workbench-qualification.json', full_report)
     temporary = Path(tempfile.mkdtemp(prefix='cassquery-workbench-native-')).resolve()
-    process = None
+    process = None; proof = None; user = None; main = None
     try:
         _, before = verify_bundle(app, arch, package['version'])
         copied = temporary / 'copy/CassQuery.app'; copied.parent.mkdir()
@@ -508,12 +540,8 @@ def run(app, output, arch):
                 report['production_quit_checked'] = True
             else:
                 report['production_quit_checked'] = False
-            shutil.copytree(proof, output / 'proof')
-            report['native_main'] = {**file_evidence(output / 'proof/native-workbench-main.json'), 'path': 'proof/native-workbench-main.json'}
             report['pass'] = True
-            validate_editor(report, output, expected_sha=source['source_sha'], expected_arch=arch)
-            full_report.update(native_qualification={**file_evidence(output / 'proof/workbench-qualification.json'), 'path': 'proof/workbench-qualification.json'},
-                               native_main=report['native_main'], app_pid=process.pid, worker_pid=main['worker_pid'], challenge=challenge,
+            full_report.update(app_pid=process.pid, worker_pid=main['worker_pid'], challenge=challenge,
                                driver=report['driver'], native_dialog_selection=native_full.get('native_dialog_selection', {'status': 'blocked'}))
             full_report['pass'] = native_full.get('pass') is True and native_full.get('qualifies_workbench') is True
             full_report['qualifies_workbench'] = full_report['pass']
@@ -537,10 +565,31 @@ def run(app, output, arch):
                     if type(pid) is not int: continue
                     try: os.kill(pid, 0); alive = True
                     except ProcessLookupError: pass
+                try: os.killpg(process.pid, 0); alive = True
+                except ProcessLookupError: pass
                 if not alive: break
                 time.sleep(0.1)
             else:
                 cleanup_errors.append('Owned app/worker still running after cleanup')
+        if not cleanup_errors and proof is not None:
+            try:
+                report['raw_proof_files'] = retain_native_proof(proof, output, user)
+                driver_bytes = driver.read_bytes()
+                require(len(driver_bytes) == report['driver']['bytes'] and hashlib.sha256(driver_bytes).hexdigest() == report['driver']['sha256'],
+                        'Driver source changed before evidence retention')
+                (output / 'native-driver.cjs').write_bytes(driver_bytes)
+                report['retained_driver'] = {**file_evidence(output / 'native-driver.cjs'), 'path': 'native-driver.cjs'}
+                after = source_snapshot(ROOT); require(after['fingerprint'] == source['fingerprint'], 'Source changed during native proof')
+                report['after_fingerprint'] = after['fingerprint']
+                main_file = output / 'proof/native-workbench-main.json'
+                if main_file.is_file(): report['native_main'] = {**file_evidence(main_file), 'path': 'proof/native-workbench-main.json'}
+                full_file = output / 'proof/workbench-qualification.json'
+                if full_file.is_file():
+                    full_report['native_qualification'] = {**file_evidence(full_file), 'path': 'proof/workbench-qualification.json'}
+                if report['pass']: validate_editor(report, output, expected_sha=source['source_sha'], expected_arch=arch)
+            except Exception as error:
+                report['pass'] = False
+                cleanup_errors.append(f'Raw proof retention failed: {type(error).__name__}: {error}')
         if not cleanup_errors:
             shutil.rmtree(temporary)
         else:

@@ -195,10 +195,17 @@ async function qualifyWorkbench(win, directory, context) {
     await nativeAction('folder', projects, () => click(win, '#project-create'), true); await current('NATIVENEWPLATE');
     const created = path.join(projects, 'NATIVENEWPLATE'); assert.ok(fs.existsSync(path.join(created, 'viewer.json')) && fs.existsSync(path.join(created, 'part_entry.py')));
     check('native-new-project', { root: created, manifest_sha256: hash(fs.readFileSync(path.join(created, 'viewer.json'))) }); await frame('new-project');
-    await select('WORKBENCHPLATE'); const before = await geometry('WORKBENCHPLATE');
+    await select('WORKBENCHPLATE'); const before = await geometry('WORKBENCHPLATE'), beforeTransformIndex = await current('WORKBENCHPLATE');
     await click(win, '#part-tree button[data-part="Base"]');
     for (const [selector, value] of [['#translation-x', '3'], ['#translation-y', '-2'], ['#translation-z', '5'], ['#rotation-z', '90'], ['#uniform-scale', '1.5']]) { await text(selector, value); key('Tab'); }
-    await click(win, '#transform-apply'); await current('WORKBENCHPLATE'); const after = await geometry('WORKBENCHPLATE');
+    const transformTraceStart = traffic.trace.length;
+    await click(win, '#transform-apply');
+    await until('native transform response', () => traffic.trace.slice(transformTraceStart).some(item => item.action === 'transform' && item.project === 'WORKBENCHPLATE' && item.status === 200));
+    await until('new transformed certificate', async () => {
+      const index = await current('WORKBENCHPLATE');
+      return index.hash !== beforeTransformIndex.hash && index.built_at > beforeTransformIndex.built_at;
+    });
+    const after = await geometry('WORKBENCHPLATE');
     assert.ok(Math.abs(after.volume / before.volume - 3.375) < 1e-5);
     check('native-transform', { before, after, persisted: JSON.parse(fs.readFileSync(path.join(projectRoot, 'viewer.json'))).workbench.transforms.Base }); await frame('transform');
     const exported = path.join(exportsDir, 'native-export.step');

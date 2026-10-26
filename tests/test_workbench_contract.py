@@ -636,6 +636,15 @@ for(const field of ['model_hash','model_gen','model_built_at','theme','panel','s
             with self.subTest(kind=kind): self.assertNotEqual(self.validate(value).returncode, 0)
             if kind == 'missing-image': (self.output / shot['raster_attempts'][0]['image']['path']).write_bytes(parser_png())
 
+    def test_native_transform_wait_rejects_the_previous_certificate(self):
+        source = (ROOT / 'tools/native_workbench_probe.cjs').read_text()
+        condition = 'index.hash !== beforeTransformIndex.hash && index.built_at > beforeTransformIndex.built_at'
+        self.assertIn(condition, source)
+        self.assertIn("traffic.trace.slice(transformTraceStart).some(item => item.action === 'transform'", source)
+        code = "const assert=require('node:assert/strict');const beforeTransformIndex={hash:'old',built_at:10};const fresh=index=>" + condition + ";assert.equal(fresh({hash:'old',built_at:11}),false);assert.equal(fresh({hash:'new',built_at:10}),false);assert.equal(fresh({hash:'new',built_at:11}),true);"
+        result = subprocess.run([self.node, '-e', code], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_native_project_form_uses_actual_submit_control(self):
         source = (ROOT / 'tools/native_workbench_probe.cjs').read_text()
         full = source[source.index('async function qualifyWorkbench('):source.index('async function probe(')]
@@ -672,7 +681,7 @@ for(const field of ['model_hash','model_gen','model_built_at','theme','panel','s
                 self.assertIn('if not enabled of denyButton then error', script)
                 self.assertIn('click denyButton', script)
                 self.assertNotIn('click button "Allow"', script)
-                self.assertEqual(run.call_args.kwargs['timeout'], 5)
+                self.assertEqual(run.call_args.kwargs['timeout'], 20)
         with patch.dict(native.os.environ, allowed, clear=True), patch.object(native.platform, 'system', return_value='Darwin'), \
                 patch.object(native.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, '', 'Permission denied')):
             with self.assertRaisesRegex(RuntimeError, 'Permission denied'): native.deny_ci_python_local_network()

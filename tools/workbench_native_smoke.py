@@ -376,7 +376,7 @@ def deny_ci_python_local_network():
   end repeat
   return "denied"
 end tell'''
-    result = subprocess.run(['/usr/bin/osascript', '-e', script], capture_output=True, text=True, timeout=5)
+    result = subprocess.run(['/usr/bin/osascript', '-e', script], capture_output=True, text=True, timeout=20)
     require(result.returncode == 0, 'CI Python local-network denial failed: ' + result.stderr.strip()[:1000])
     status = result.stdout.strip()
     require(status in ('not-present', 'denied'), 'Unexpected CI local-network consent receipt')
@@ -457,6 +457,7 @@ def native_dialog_attempts(pid, port, output, public_projects, proof, challenge)
 def serve_native_actions(process, proof, challenge, user):
     """Respond only to the fixed driver's owned UI requests; no selector substitution."""
     completed = set()
+    local_network_consent = None
     deadline = time.monotonic() + 480
     main_file = proof / 'native-workbench-main.json'
     while time.monotonic() < deadline and not main_file.is_file():
@@ -491,7 +492,9 @@ def serve_native_actions(process, proof, challenge, user):
                 require(ledger['calls'][index].get('method') == 'showOpenDialog' and ledger['calls'][index].get('action_id') == identity
                         and ('openDirectory' if kind == 'folder' else 'openFile') in ledger['calls'][index].get('properties', []),
                         'Unrelated native panel before trusted selection')
-            response['local_network_consent'] = deny_ci_python_local_network()
+            if local_network_consent is None or local_network_consent.get('status') != 'denied':
+                local_network_consent = deny_ci_python_local_network()
+            response['local_network_consent'] = local_network_consent
             image = screenshot(proof / f'native-os-{identity}.png'); image['path'] = Path(image['path']).name; response['image'] = image
             commands = ''
             if kind == 'cancel':

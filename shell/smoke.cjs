@@ -472,7 +472,7 @@ async function dragCamera(win, button) {
   assert.ok(button === 'left' || button === 'right', 'Unsupported native camera button');
   const gestureBudget=20000,phaseBudget=2000,deadline=performance.now()+gestureBudget;
   const remaining=()=>{const left=deadline-performance.now();if(left<=0)throw new Error('Native gesture exceeded its deadline');return Math.min(phaseBudget,left);};
-  const trace = {button,method:'RAF-paced native whole gesture',status:'pending',budget_ms:gestureBudget,intermediate_ack_required:false,moves_sent:0,sent:[],frames:[],observations:[]};
+  const trace = {button,method:'main-process paced native whole gesture',status:'pending',budget_ms:gestureBudget,intermediate_ack_required:false,moves_sent:0,sent:[],frames:[],observations:[]};
   const point = await evaluate(win, `(() => { const canvas=document.querySelector('#stage canvas'),r=canvas.getBoundingClientRect();
     window.__cqSmokePointer = null;window.__cqSmokeDown=null;window.__cqSmokeUp=null;window.__cqSmokePointerEvents=[];window.__cqSmokePointerDropped=0;
     window.__cqSmokeMove=e=>{window.__cqSmokePointer={x:e.clientX,y:e.clientY,buttons:e.buttons};};
@@ -508,9 +508,10 @@ async function dragCamera(win, button) {
     await waitFor(win,`window.__cqSmokeDown?.trusted===true&&window.__cqSmokeDown?.x===${point.x}&&window.__cqSmokeDown?.y===${point.y}&&window.__cqSmokeDown?.button===${number}&&window.__cqSmokeDown?.buttons===${mask}&&document.hasFocus()&&document.querySelector('#stage canvas').hasPointerCapture(window.__cqSmokeDown.pointer_id)`,remaining());
     await observe('pointerdown acknowledged');
     for(let step=1;step<=10;step++){
-      const frame=await evaluate(win,`(async()=>{const stamp=await new Promise(requestAnimationFrame),c=document.querySelector('#stage canvas'),r=c.getBoundingClientRect();return{stamp,rect:[r.left,r.top,r.right,r.bottom],viewport:[innerWidth,innerHeight],scroll:[scrollX,scrollY],focused:document.hasFocus(),dropped:window.__cqSmokePointerDropped};})()`,remaining());
-      assert.ok(frame.focused&&frame.dropped===0&&JSON.stringify(frame.rect)===JSON.stringify(point.rect)&&JSON.stringify(frame.viewport)===JSON.stringify(point.viewport)&&JSON.stringify(frame.scroll)===JSON.stringify(point.scroll),'Native camera layout changed during gesture');
-      last={x:point.x+step*8,y:point.y+step*3};send({type:'mouseMove',button,...last,modifiers});trace.moves_sent++;trace.frames.push(frame);
+      // A renderer RAF can itself wait on pending continuous input; native release must not depend on it.
+      await delay(Math.min(16,remaining()));remaining();
+      last={x:point.x+step*8,y:point.y+step*3};send({type:'mouseMove',button,...last,modifiers});trace.moves_sent++;
+      trace.frames.push({stamp:performance.now(),pacing:'main-process timer; not a renderer frame acknowledgement'});
     }
     remaining();released=true;send({type:'mouseUp',button,clickCount:1,...last});
     await waitFor(win,`(() => {const c=document.querySelector('#stage canvas'),d=window.__cqSmokeDown,events=window.__cqSmokePointerEvents;

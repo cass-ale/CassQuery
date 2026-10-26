@@ -9,9 +9,9 @@ const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
 test('native camera gesture carries coherent state and acknowledges its endpoint after normal coalescing',async()=>{
  const originalSource=fs.readFileSync(path.join(__dirname,'../shell/smoke.cjs'),'utf8');
- const modes=['left','right','superseded','no-down','no-capture','lost-move','untrusted','no-release','covered','cleanup-error','delayed-right','late-down','release-deferred','coalesced-final','foreign-id','wrong-move-mask','missing-final','move-after-up','cancelled','journal-dropped','layout-change','gesture-deadline'];
+ const modes=['left','right','superseded','no-down','no-capture','lost-move','untrusted','no-release','covered','cleanup-error','delayed-right','late-down','release-deferred','coalesced-final','foreign-id','wrong-move-mask','missing-final','move-after-up','cancelled','journal-dropped','layout-change','gesture-deadline','no-renderer-frame'];
  for(const mode of modes){
-  const healthy=['left','right','superseded','delayed-right','release-deferred','coalesced-final'].includes(mode);
+  const healthy=['left','right','superseded','delayed-right','release-deferred','coalesced-final','no-renderer-frame'].includes(mode);
   let source=originalSource.replace('phaseBudget=2000',healthy?'phaseBudget=1000':'phaseBudget=20');
   assert.notEqual(source,originalSource,'Native pointer timeout test seam must replace the production budget');
   if(mode==='gesture-deadline')source=source.replace('gestureBudget=20000','gestureBudget=20');
@@ -20,7 +20,7 @@ test('native camera gesture carries coherent state and acknowledges its endpoint
    addEventListener:(t,f)=>canvasListeners.set(t,f),removeEventListener:t=>canvasListeners.delete(t)};
   const document={querySelector:()=>canvas,elementFromPoint:()=>mode==='covered'?{}:canvas,hasFocus:()=>true,
    addEventListener:(t,f)=>docListeners.set(t,f),removeEventListener:t=>docListeners.delete(t)};
-  const renderer=vm.createContext({document,window:{},performance,innerWidth:400,innerHeight:300,scrollX:0,scrollY:0,requestAnimationFrame:callback=>{frames++;if(mode==='gesture-deadline'){const end=performance.now()+35;while(performance.now()<end){}}callback(performance.now());}});
+  const renderer=vm.createContext({document,window:{},performance,innerWidth:400,innerHeight:300,scrollX:0,scrollY:0,requestAnimationFrame:callback=>{frames++;if(mode==='gesture-deadline'){const end=performance.now()+35;while(performance.now()<end){}}if(mode==='no-renderer-frame')return;callback(performance.now());}});
   const emit=(type,input,buttons,coalesced=[])=>{const e={type,target:canvas,clientX:input.x,clientY:input.y,buttons,button:type==='pointermove'?-1:input.button==='right'?2:0,pointerId:mode==='foreign-id'&&type==='pointermove'?2:1,isTrusted:mode!=='untrusted',timeStamp:++stamp,movementX:8,movementY:3,getCoalescedEvents:()=>coalesced};docListeners.get(type)?.(e);canvasListeners.get(type)?.(e);};
   const win={focus(){},isFocused:()=>true,isDestroyed:()=>false,webContents:{executeJavaScript:async code=>{
    if(['delayed-right','late-down'].includes(mode)&&code.includes('window.__cqSmokeDown?.trusted')){const end=performance.now()+35;while(performance.now()<end){}}
@@ -29,6 +29,7 @@ test('native camera gesture carries coherent state and acknowledges its endpoint
     sent.push(input);const mask=input.modifiers?.includes('rightButtonDown')?2:input.modifiers?.includes('leftButtonDown')?1:0;
     if(input.type==='mouseDown'){assert.equal(mask,input.button==='right'?2:1);if(mode==='no-down')return;captured=mode!=='no-capture';emit('pointerdown',input,mask);if(captured)emit('gotpointercapture',input,mask);}
     if(input.type==='mouseMove'){
+     if(mask)frames++;
      assert.equal(input.button,mode==='left'?'left':'right');
      if(mask&&['release-deferred','coalesced-final','move-after-up'].includes(mode)){pending={input,mask};return;}
      if(mask&&(mode==='lost-move'||mode==='missing-final'&&frames===10))return;

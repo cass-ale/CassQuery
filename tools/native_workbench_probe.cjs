@@ -192,7 +192,7 @@ async function qualifyWorkbench(win, directory, context) {
     await nativeAction('folder', folder, () => click(win, '#openfolder')); await current('NATIVEDIALOGFOLDER');
     check('native-open-folder', { root: folder, actual_registered_project: 'NATIVEDIALOGFOLDER' }); await frame('open-folder');
     await click(win, '#newproject'); await text('#project-name', 'NATIVENEWPLATE');
-    await nativeAction('folder', projects, () => { key('Enter'); }, true); await current('NATIVENEWPLATE');
+    await nativeAction('folder', projects, () => click(win, '#project-create'), true); await current('NATIVENEWPLATE');
     const created = path.join(projects, 'NATIVENEWPLATE'); assert.ok(fs.existsSync(path.join(created, 'viewer.json')) && fs.existsSync(path.join(created, 'part_entry.py')));
     check('native-new-project', { root: created, manifest_sha256: hash(fs.readFileSync(path.join(created, 'viewer.json'))) }); await frame('new-project');
     await select('WORKBENCHPLATE'); const before = await geometry('WORKBENCHPLATE');
@@ -208,7 +208,7 @@ async function qualifyWorkbench(win, directory, context) {
     fs.copyFileSync(exported, path.join(directory, 'native-export.step'));
     check('native-export-step', { path: 'native-export.step', bytes: fs.statSync(exported).size, sha256: exportHash, geometry: after }); await frame('export');
     await click(win, '#importbtn'); await text('#project-name', 'NATIVEROUNDTRIP');
-    await nativeAction('open', exported, () => { key('Enter'); }, false);
+    await nativeAction('open', exported, () => click(win, '#project-create'), false);
     await nativeAction('folder', projects, async () => {}, true); await current('NATIVEROUNDTRIP');
     const importedParts = (await request('http://127.0.0.1:' + workerPort, '/api/parts?project=NATIVEROUNDTRIP')).json.parts;
     assert.equal(importedParts.length, 1); const imported = { volume: importedParts[0].volume, solids: importedParts[0].solids, min: importedParts[0].bbox.slice(0, 3), max: importedParts[0].bbox.slice(3) };

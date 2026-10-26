@@ -636,6 +636,12 @@ for(const field of ['model_hash','model_gen','model_built_at','theme','panel','s
             with self.subTest(kind=kind): self.assertNotEqual(self.validate(value).returncode, 0)
             if kind == 'missing-image': (self.output / shot['raster_attempts'][0]['image']['path']).write_bytes(parser_png())
 
+    def test_native_project_form_uses_actual_submit_control(self):
+        source = (ROOT / 'tools/native_workbench_probe.cjs').read_text()
+        full = source[source.index('async function qualifyWorkbench('):source.index('async function probe(')]
+        self.assertEqual(full.count("() => click(win, '#project-create')"), 2)
+        self.assertNotIn("key('Enter')", full)
+
     def test_python_network_denial_is_explicit_github_ci_only(self):
         # Modelled process receipts; actual prompt interaction must pass native CI.
         from unittest.mock import patch

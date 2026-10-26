@@ -351,7 +351,8 @@ async function nativeReady(win) {
     const record={schema:1,source_sha:process.env.GITHUB_SHA||null,app_pid:process.pid,worker_pid:ownedWorker.pid,challenge:process.env.CASSQUERY_WORKBENCH_SMOKE_CHALLENGE,
       driver:{path:driver,bytes:bytes.length,sha256:expected},resources_path:process.resourcesPath,worker_origin:`http://127.0.0.1:${port}`,project_root:process.env.CASSQUERY_PROJECTS,
       window_id:win.id,web_contents_id:win.webContents.id,native_source:shellSourceProof(),preload_identity:configuredPreloadIdentity(win),result};
-    fs.mkdirSync(directory,{recursive:true});fs.writeFileSync(path.join(directory,'native-workbench-main.json'),JSON.stringify(record,null,2));
+    fs.mkdirSync(directory,{recursive:true});const reportFile=path.join(directory,'native-workbench-main.json');
+    fs.writeFileSync(reportFile+'.tmp',JSON.stringify(record,null,2));fs.renameSync(reportFile+'.tmp',reportFile);
   }
   while(pendingNativePaths.length && window===win && !win.isDestroyed())await desktop.openNative(pendingNativePaths.shift());
 }

@@ -63,16 +63,18 @@ function checkStatus(port, timeoutMs = 1500, signal) {
 async function stopWorker(child, graceMs = 1000) {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   await new Promise((resolve, reject) => {
-    let force, watchdog;
-    const done = () => { clearTimeout(force); clearTimeout(watchdog); resolve(); };
+    let force, watchdog, finished = false;
+    const cleanup = () => { clearTimeout(force); clearTimeout(watchdog); child.removeListener('exit', done); };
+    const done = () => { if (finished) return; finished = true; cleanup(); resolve(); };
     child.once('exit', done);
-    child.kill();
-    force = setTimeout(() => child.kill('SIGKILL'), graceMs);
+    // Cold frozen workers can be in filesystem I/O; still require actual exit after the unchanged force point.
+    force = setTimeout(() => { if (!finished) child.kill('SIGKILL'); }, graceMs);
     watchdog = setTimeout(() => {
-      child.removeListener('exit', done);
-      clearTimeout(force);
-      reject(new Error(`Worker ${child.pid} did not exit after SIGKILL`));
-    }, graceMs + 3000);
+      if (child.exitCode !== null || child.signalCode !== null) { done(); return; }
+      finished = true; cleanup();
+      reject(new Error(`Worker ${child.pid} did not exit after SIGKILL (exit=${child.exitCode}, signal=${child.signalCode}, killed=${child.killed})`));
+    }, graceMs + 10000);
+    child.kill();
   });
 }
 

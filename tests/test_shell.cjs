@@ -82,6 +82,25 @@ test('shutdown reaps a worker that ignores SIGTERM', async () => {
   assert.equal(child.signalCode, 'SIGKILL');
 });
 
+test('worker exit acknowledgement is finite and timers cannot outlive synchronous exit',async()=>{
+ const source=fs.readFileSync(path.join(__dirname,'../shell/runtime.cjs'),'utf8');
+ const {EventEmitter}=require('node:events'),vm=require('node:vm');
+ for(const mode of ['synchronous','late-after-kill','never-exits']){
+  let clock=0,next=0;const timers=new Map(),signals=[];
+  const child=Object.assign(new EventEmitter(),{pid:123,exitCode:null,signalCode:null,killed:false});
+  const finish=()=>{child.signalCode='SIGKILL';child.emit('exit',null,'SIGKILL');};
+  child.kill=signal=>{signals.push(signal||'SIGTERM');child.killed=true;if(mode==='synchronous')finish();return true;};
+  const setTimer=(fn,ms)=>{const id=++next;timers.set(id,{fn,at:clock+ms});return id;};
+  const context=vm.createContext({require,module:{exports:{}},setTimeout:setTimer,clearTimeout:id=>timers.delete(id)});
+  vm.runInContext(source,context);const pending=context.module.exports.stopWorker(child,1000);
+  if(mode==='synchronous'){await pending;assert.equal(timers.size,0);assert.deepEqual(signals,['SIGTERM']);continue;}
+  if(mode==='late-after-kill')setTimer(finish,5500);
+  const outcome=pending.then(()=>true,()=>false);
+  while(timers.size){const [id,timer]=[...timers].sort((a,b)=>a[1].at-b[1].at)[0];timers.delete(id);clock=timer.at;timer.fn();await Promise.resolve();}
+  assert.equal(await outcome,mode==='late-after-kill');assert.deepEqual(signals,['SIGTERM','SIGKILL']);assert.equal(child.listenerCount('exit'),0);assert.ok(clock<=11000);
+ }
+});
+
 test('cancellation during startup leaves no worker alive', async () => {
   const data = fs.mkdtempSync(path.join(os.tmpdir(), 'cq-cancel-'));
   const script = path.join(data, 'stall.cjs');

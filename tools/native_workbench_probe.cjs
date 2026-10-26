@@ -107,8 +107,8 @@ function validateEditorReport(report, directory) {
 function observeNativeDialogs(directory, win, challenge) {
   const { dialog } = require('electron'), originals = new Map();
   const record = { schema: 1, app_pid: process.pid, challenge, method: 'observed actual Electron dialogs; no provider substitution', calls: [] };
-  const file = path.join(directory, 'native-dialogs.json');
-  const write = () => fs.writeFileSync(file, JSON.stringify(record, null, 2) + '\n'); write();
+  const file = path.join(directory, 'native-dialogs.json'), temporary = file + '.tmp';
+  const write = () => { fs.writeFileSync(temporary, JSON.stringify(record, null, 2) + '\n'); fs.renameSync(temporary, file); }; write();
   for (const method of ['showOpenDialog', 'showSaveDialog', 'showMessageBox']) {
     const original = dialog[method]; originals.set(method, original);
     dialog[method] = async function (...args) {
@@ -152,7 +152,8 @@ async function qualifyWorkbench(win, directory, context) {
     const pending = ledgerBefore.calls.findLastIndex((call) => call.method === expectedMethod && !call.result);
     const observerIndex = pending >= 0 ? pending : ledgerBefore.calls.length;
     const instruction = { schema: 1, id, app_pid: process.pid, challenge, kind, target: target || null, trust, observer_index: observerIndex };
-    fs.writeFileSync(path.join(directory, 'native-action.json'), JSON.stringify(instruction) + '\n');
+    const actionFile = path.join(directory, 'native-action.json');
+    fs.writeFileSync(actionFile + '.tmp', JSON.stringify(instruction) + '\n'); fs.renameSync(actionFile + '.tmp', actionFile);
     await trigger();
     const input = await until('standard OS input ' + id, () => {
       const file = path.join(directory, 'native-action-result.json');

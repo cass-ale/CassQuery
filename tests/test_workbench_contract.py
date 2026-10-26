@@ -636,6 +636,20 @@ for(const field of ['model_hash','model_gen','model_built_at','theme','panel','s
             with self.subTest(kind=kind): self.assertNotEqual(self.validate(value).returncode, 0)
             if kind == 'missing-image': (self.output / shot['raster_attempts'][0]['image']['path']).write_bytes(parser_png())
 
+    def test_native_dialog_ledger_is_published_atomically(self):
+        code = r'''
+const fs=require('node:fs'),path=require('node:path'),os=require('node:os'),vm=require('node:vm'),assert=require('node:assert/strict');
+const root=fs.mkdtempSync(path.join(os.tmpdir(),'cq-ledger-')),file=path.join(root,'native-dialogs.json');
+const source=fs.readFileSync(process.argv[1],'utf8');let concurrentReads=0;
+const observed=Object.create(fs);observed.writeFileSync=(target,data)=>{if(fs.existsSync(file)){JSON.parse(fs.readFileSync(file));concurrentReads++;assert.notEqual(target,file);}return fs.writeFileSync(target,data);};
+const win={once(){}},dialog={showOpenDialog:async()=>({canceled:false,filePaths:['/public/part.py']}),showSaveDialog:async()=>({canceled:true}),showMessageBox:async()=>({response:0})};
+const body=source.slice(source.indexOf('function observeNativeDialogs('),source.indexOf('const FULL_CHECKS'));
+const context=vm.createContext({fs:observed,path,process,require:name=>name==='electron'?{dialog}:require(name)});vm.runInContext(body+';globalThis.observe=observeNativeDialogs;',context);
+(async()=>{try{context.observe(root,win,'owned');fs.writeFileSync(path.join(root,'native-action.json'),JSON.stringify({id:1}));await dialog.showOpenDialog(win,{});const value=JSON.parse(fs.readFileSync(file));assert.equal(value.calls[0].result.filePaths[0],'/public/part.py');assert.ok(value.calls[0].completed_at>=value.calls[0].started_at);assert.equal(concurrentReads,2);assert.equal(fs.existsSync(file+'.tmp'),false);}finally{fs.rmSync(root,{recursive:true,force:true});}})().catch(error=>{console.error(error);process.exitCode=1;});
+'''
+        result = subprocess.run([self.node, '-e', code, str(ROOT / 'tools/native_workbench_probe.cjs')], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_native_transform_wait_rejects_the_previous_certificate(self):
         source = (ROOT / 'tools/native_workbench_probe.cjs').read_text()
         condition = 'index.hash !== beforeTransformIndex.hash && index.built_at > beforeTransformIndex.built_at'

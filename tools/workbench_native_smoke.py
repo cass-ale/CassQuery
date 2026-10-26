@@ -529,22 +529,24 @@ def serve_native_actions(process, proof, challenge, user):
                 target_path = Path(target)
                 require(target_path.suffix in ('.step', '.stp', '.stl', '.brep', '.py', '.zip'), 'Unsupported native Save suffix')
                 native_name = target_path.stem  # NSSavePanel owns the selected file-type extension.
-                os_input(process.pid, '    keystroke "g" using {command down, shift down}\n    delay 0.4\n    keystroke ' + json.dumps(str(target_path.parent)) +
-                         '\n    key code 36\n    delay 0.5', deadline=action_deadline)
                 os_input(process.pid, '    set saveDeadline to (current date) + ' + str(max(0, action_deadline-time.monotonic())) + '\n'
-                         '    set clickedSave to false\n    repeat while (current date) < saveDeadline\n'
-                         '      if exists window 1 then\n        if exists sheet 1 of window 1 then\n'
-                         '          if exists button "Save" of sheet 1 of window 1 then\n'
-                         '            if enabled of button "Save" of sheet 1 of window 1 then\n'
-                         '              set focused of text field 1 of sheet 1 of window 1 to true\n'
-                         '              keystroke "a" using command down\n              keystroke ' + json.dumps(native_name) + '\n'
-                         '              click button "Save" of sheet 1 of window 1\n              set clickedSave to true\n              exit repeat\n            end if\n          end if\n'
-                         '        else if exists button "Save" of window 1 then\n'
-                         '          if enabled of button "Save" of window 1 then\n'
-                         '            set focused of text field 1 of window 1 to true\n'
-                         '            keystroke "a" using command down\n            keystroke ' + json.dumps(native_name) + '\n'
-                         '            click button "Save" of window 1\n            set clickedSave to true\n            exit repeat\n          end if\n        end if\n      end if\n'
-                         '      delay 0.1\n    end repeat\n    if not clickedSave then error "Owned native Save control unavailable" number -1728', deadline=action_deadline)
+                         '    set savePanel to window 1\n    if exists sheet 1 of window 1 then set savePanel to sheet 1 of window 1\n'
+                         '    if not exists button "Save" of savePanel then error "Owned native Save panel missing"\n'
+                         '    keystroke "g" using {command down, shift down}\n'
+                         '    repeat until exists sheet 1 of savePanel\n      if (current date) >= saveDeadline then error "Native Go To panel deadline"\n      delay 0.1\n    end repeat\n'
+                         '    set goPanel to sheet 1 of savePanel\n'
+                         '    if exists combo box 1 of goPanel then\n      set goField to combo box 1 of goPanel\n    else\n      set goField to text field 1 of goPanel\n    end if\n'
+                         '    set focused of goField to true\n    keystroke "a" using command down\n    keystroke ' + json.dumps(str(target_path.parent)) + '\n'
+                         '    repeat until value of goField is ' + json.dumps(str(target_path.parent)) + '\n'
+                         '      if (current date) >= saveDeadline then error "Native directory input acknowledgement deadline"\n      delay 0.1\n    end repeat\n'
+                         '    key code 36\n    repeat while exists goPanel\n'
+                         '      if (current date) >= saveDeadline then error "Native directory selection deadline"\n      delay 0.1\n    end repeat\n'
+                         '    set nameField to text field 1 of savePanel\n    set focused of nameField to true\n'
+                         '    keystroke "a" using command down\n    keystroke ' + json.dumps(native_name) + '\n'
+                         '    repeat until value of nameField is ' + json.dumps(native_name) + '\n'
+                         '      if (current date) >= saveDeadline then error "Native filename input acknowledgement deadline"\n      delay 0.1\n    end repeat\n'
+                         '    if not enabled of button "Save" of savePanel then error "Owned native Save control disabled"\n'
+                         '    click button "Save" of savePanel\n    set clickedSave to true', deadline=action_deadline)
                 while time.monotonic() < action_deadline:
                     latest = read_json(proof / 'native-dialogs.json')
                     require(latest.get('challenge') == challenge and latest.get('app_pid') == process.pid, 'Unrelated native Save observer')

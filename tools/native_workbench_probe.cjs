@@ -140,10 +140,16 @@ async function qualifyWorkbench(win, directory, context) {
     while (Date.now() < deadline - 10000) { const value = await predicate(); if (value) return value; await delay(80); }
     throw new Error('Full native workbench deadline: ' + label);
   }
-  async function select(name) {
+  async function select(name, rebuild = false) {
     await waitFor(win, `Array.from(document.querySelectorAll('#projects button')).some(b=>b.textContent.includes(${JSON.stringify(name)}))`);
     const index = await js(`Array.from(document.querySelectorAll('#projects button')).findIndex(b=>b.textContent.includes(${JSON.stringify(name)}))`);
-    await click(win, `#projects button:nth-child(${index + 1})`); await current(name);
+    await click(win, `#projects button:nth-child(${index + 1})`);
+    if (rebuild) {
+      await waitFor(win, `window.__workbench?.project === ${JSON.stringify(name)} && window.__workbench.active?.project === ${JSON.stringify(name)} && window.__workbench.busy === 0 && !window.__workbench.sourceDirty`);
+      const previous = (await request('http://127.0.0.1:' + workerPort, '/payload/' + name + '-certified.json')).json;
+      await click(win, '#buildbtn');
+      await until('explicit native rebuild after saved source', async () => (await current(name)).built_at > previous.built_at);
+    } else await current(name);
   }
   async function nativeAction(kind, target, trigger, trust = true) {
     const id = ++actionId;
@@ -242,7 +248,7 @@ async function qualifyWorkbench(win, directory, context) {
     await click(win, '#openfolder'); await waitFor(win, `document.getElementById('draft-guard').open`);
     await nativeAction('folder', folder, () => click(win, '#draft-guard button[value="save"]'), true); await current('NATIVEDIALOGFOLDER');
     assert.equal(fs.readFileSync(sourceFile, 'utf8'), draft); check('dirty-save', { actual_source_sha256: hash(fs.readFileSync(sourceFile)), expected_draft_sha256: hash(Buffer.from(draft)) });
-    await select('NATIVEROUNDTRIP'); const discard = draft + '\n# discard only this unsaved draft\n'; await text('#source-editor', discard);
+    await select('NATIVEROUNDTRIP', true); const discard = draft + '\n# discard only this unsaved draft\n'; await text('#source-editor', discard);
     await click(win, '#openfolder'); await waitFor(win, `document.getElementById('draft-guard').open`);
     await nativeAction('folder', folder, () => click(win, '#draft-guard button[value="discard"]'), true); await current('NATIVEDIALOGFOLDER');
     assert.equal(fs.readFileSync(sourceFile, 'utf8'), draft); check('dirty-discard', { source_sha256: hash(fs.readFileSync(sourceFile)), saved_sha256: hash(Buffer.from(draft)) });

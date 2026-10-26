@@ -671,11 +671,13 @@ const context=vm.createContext({fs:observed,path,process,require:name=>name==='e
                 def input(pid, commands, *, deadline=None):
                     self.assertEqual(pid,1234); scripts.append(commands)
                     if 'clickedSave' in commands:
-                        self.assertIn('set focused of text field 1', commands)
+                        self.assertIn('set focused of nameField to true', commands)
+                        self.assertIn('repeat until value of nameField is "export"', commands)
+                        self.assertIn('Native directory input acknowledgement deadline', commands)
                         self.assertIn('keystroke "export"', commands)
                         self.assertNotIn('keystroke "export.step"', commands)
-                        self.assertIn('if enabled of button "Save"', commands)
-                        self.assertNotIn('key code 36', commands)
+                        self.assertIn('if not enabled of button "Save"', commands)
+                        self.assertEqual(commands.count('key code 36'), 1)
                         finished[0]=True
                 def shot(file): file.write_bytes(b'panel');return {'path':str(file),'bytes':5,'sha256':'d'*64,'width':1000,'height':700}
                 with patch.object(native.time,'monotonic',side_effect=lambda:clock[0]), patch.object(native.time,'sleep',side_effect=lambda n:clock.__setitem__(0,clock[0]+n)), patch.object(native,'read_json',side_effect=read), patch.object(native,'os_input',side_effect=input), patch.object(native,'screenshot',side_effect=shot), patch.object(native,'deny_ci_python_local_network',return_value={'status':'not-requested'}):
@@ -699,6 +701,9 @@ const context=vm.createContext({fs:observed,path,process,require:name=>name==='e
         full = source[source.index('async function qualifyWorkbench('):source.index('async function probe(')]
         self.assertEqual(full.count("() => click(win, '#project-create')"), 2)
         self.assertNotIn("key('Enter')", full)
+        self.assertIn("await select('NATIVEROUNDTRIP', true)", full)
+        self.assertIn("await click(win, '#buildbtn')", full)
+        self.assertIn("explicit native rebuild after saved source", full)
 
     def test_python_network_denial_is_explicit_github_ci_only(self):
         # Modelled process receipts; actual prompt interaction must pass native CI.

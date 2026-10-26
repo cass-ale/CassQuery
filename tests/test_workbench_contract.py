@@ -650,6 +650,39 @@ const context=vm.createContext({fs:observed,path,process,require:name=>name==='e
         result = subprocess.run([self.node, '-e', code, str(ROOT / 'tools/native_workbench_probe.cjs')], capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_native_save_requires_real_exact_destination_completion(self):
+        from unittest.mock import patch
+        import workbench_native_smoke as native
+        for mode in ('saved', 'wrong-path', 'canceled', 'foreign-action', 'no-completion'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                proof = Path(directory).resolve(); clock = [0.0]; finished = [False]; scripts = []
+                target = str(proof / 'export.step'); challenge = 'c' * 64
+                (proof / 'native-action.json').write_text(json.dumps({'schema':1,'id':4,'app_pid':1234,'challenge':challenge,'kind':'save','target':target,'trust':False,'observer_index':0}))
+                class Process:
+                    pid = 1234
+                    def poll(self):
+                        if (proof / 'native-action-result.json').exists(): (proof / 'native-workbench-main.json').write_text('{}')
+                        return None
+                def read(file):
+                    if file.name != 'native-dialogs.json': return json.loads(file.read_text())
+                    call = {'method':'showSaveDialog','action_id':99 if mode=='foreign-action' else 4,'result':None}
+                    if finished[0] and mode!='no-completion': call['result']={'canceled':mode=='canceled','filePath':target if mode!='wrong-path' else str(proof / 'wrong.step')}
+                    return {'app_pid':1234,'challenge':challenge,'calls':[call]}
+                def input(pid, commands, *, deadline=None):
+                    self.assertEqual(pid,1234); scripts.append(commands)
+                    if 'clickedSave' in commands:
+                        self.assertIn('set focused of text field 1', commands)
+                        self.assertIn('if enabled of button "Save"', commands)
+                        self.assertNotIn('key code 36', commands)
+                        finished[0]=True
+                def shot(file): file.write_bytes(b'panel');return {'path':str(file),'bytes':5,'sha256':'d'*64,'width':1000,'height':700}
+                with patch.object(native.time,'monotonic',side_effect=lambda:clock[0]), patch.object(native.time,'sleep',side_effect=lambda n:clock.__setitem__(0,clock[0]+n)), patch.object(native,'read_json',side_effect=read), patch.object(native,'os_input',side_effect=input), patch.object(native,'screenshot',side_effect=shot), patch.object(native,'deny_ci_python_local_network',return_value={'status':'not-requested'}):
+                    native.serve_native_actions(Process(),proof,challenge,proof)
+                receipt=json.loads((proof / 'native-action-result.json').read_text())
+                self.assertEqual(receipt['pass'],mode=='saved')
+                if mode=='saved': self.assertEqual(receipt['native_call']['result']['filePath'],target)
+                else: self.assertTrue(receipt['error'])
+
     def test_native_transform_wait_rejects_the_previous_certificate(self):
         source = (ROOT / 'tools/native_workbench_probe.cjs').read_text()
         condition = 'index.hash !== beforeTransformIndex.hash && index.built_at > beforeTransformIndex.built_at'

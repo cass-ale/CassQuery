@@ -488,6 +488,9 @@ def serve_native_actions(process, proof, challenge, user):
                 time.sleep(0.1)
             else:
                 raise RuntimeError('Real native panel did not open inside its deadline')
+            expected_method = 'showSaveDialog' if kind == 'save' else 'showOpenDialog'
+            require(ledger['calls'][index].get('method') == expected_method and ledger['calls'][index].get('action_id') == identity,
+                    'Unrelated native panel before selection')
             if action.get('trust') is True:
                 require(ledger['calls'][index].get('method') == 'showOpenDialog' and ledger['calls'][index].get('action_id') == identity
                         and ('openDirectory' if kind == 'folder' else 'openFile') in ledger['calls'][index].get('properties', []),
@@ -495,6 +498,14 @@ def serve_native_actions(process, proof, challenge, user):
             if local_network_consent is None or local_network_consent.get('status') != 'denied':
                 local_network_consent = deny_ci_python_local_network()
             response['local_network_consent'] = local_network_consent
+            action_deadline = min(deadline, time.monotonic() + 20)
+            button = 'Save' if kind == 'save' else 'Open'
+            os_input(process.pid, '    set panelDeadline to (current date) + ' + str(max(0, action_deadline-time.monotonic())) + '\n'
+                     '    set panelReady to false\n    repeat while (current date) < panelDeadline\n'
+                     '      if exists window 1 then\n        if exists sheet 1 of window 1 then\n'
+                     '          if exists button ' + json.dumps(button) + ' of sheet 1 of window 1 then\n            set panelReady to true\n            exit repeat\n          end if\n'
+                     '        else if exists button ' + json.dumps(button) + ' of window 1 then\n          set panelReady to true\n          exit repeat\n        end if\n      end if\n'
+                     '      delay 0.1\n    end repeat\n    if not panelReady then error "Owned native file panel unavailable" number -1728', deadline=action_deadline)
             image = screenshot(proof / f'native-os-{identity}.png'); image['path'] = Path(image['path']).name; response['image'] = image
             commands = ''
             if kind == 'cancel':
@@ -502,9 +513,34 @@ def serve_native_actions(process, proof, challenge, user):
             elif kind == 'save':
                 target_path = Path(target)
                 os_input(process.pid, '    keystroke "g" using {command down, shift down}\n    delay 0.4\n    keystroke ' + json.dumps(str(target_path.parent)) +
-                         '\n    key code 36\n    delay 0.5\n    keystroke "a" using command down\n    keystroke ' + json.dumps(target_path.name) + '\n    key code 36\n    delay 0.5')
+                         '\n    key code 36\n    delay 0.5', deadline=action_deadline)
+                os_input(process.pid, '    set saveDeadline to (current date) + ' + str(max(0, action_deadline-time.monotonic())) + '\n'
+                         '    set clickedSave to false\n    repeat while (current date) < saveDeadline\n'
+                         '      if exists window 1 then\n        if exists sheet 1 of window 1 then\n'
+                         '          if exists button "Save" of sheet 1 of window 1 then\n'
+                         '            if enabled of button "Save" of sheet 1 of window 1 then\n'
+                         '              set focused of text field 1 of sheet 1 of window 1 to true\n'
+                         '              keystroke "a" using command down\n              keystroke ' + json.dumps(target_path.name) + '\n'
+                         '              click button "Save" of sheet 1 of window 1\n              set clickedSave to true\n              exit repeat\n            end if\n          end if\n'
+                         '        else if exists button "Save" of window 1 then\n'
+                         '          if enabled of button "Save" of window 1 then\n'
+                         '            set focused of text field 1 of window 1 to true\n'
+                         '            keystroke "a" using command down\n            keystroke ' + json.dumps(target_path.name) + '\n'
+                         '            click button "Save" of window 1\n            set clickedSave to true\n            exit repeat\n          end if\n        end if\n      end if\n'
+                         '      delay 0.1\n    end repeat\n    if not clickedSave then error "Owned native Save control unavailable" number -1728', deadline=action_deadline)
+                while time.monotonic() < action_deadline:
+                    latest = read_json(proof / 'native-dialogs.json')
+                    require(latest.get('challenge') == challenge and latest.get('app_pid') == process.pid, 'Unrelated native Save observer')
+                    call = latest['calls'][index]
+                    if call.get('result') is not None:
+                        require(call.get('method') == 'showSaveDialog' and call.get('action_id') == identity
+                                and call['result'].get('canceled') is False and call['result'].get('filePath') == target,
+                                'Actual native Save destination differs from requested target')
+                        response['native_call'] = call
+                        break
+                    time.sleep(0.1)
+                else: raise RuntimeError('Matching native Save completion deadline')
             else:
-                action_deadline = min(deadline, time.monotonic() + 20)
                 commands = '    keystroke "g" using {command down, shift down}\n    delay 0.4\n    keystroke ' + json.dumps(target) + '\n    key code 36\n    delay 0.5'
                 os_input(process.pid, commands, deadline=action_deadline)
                 remaining = max(0, action_deadline - time.monotonic())

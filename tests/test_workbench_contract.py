@@ -672,6 +672,8 @@ const context=vm.createContext({fs:observed,path,process,require:name=>name==='e
                     self.assertEqual(pid,1234); scripts.append(commands)
                     if 'clickedSave' in commands:
                         self.assertIn('set focused of text field 1', commands)
+                        self.assertIn('keystroke "export"', commands)
+                        self.assertNotIn('keystroke "export.step"', commands)
                         self.assertIn('if enabled of button "Save"', commands)
                         self.assertNotIn('key code 36', commands)
                         finished[0]=True

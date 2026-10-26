@@ -198,9 +198,9 @@ async function runNativeSmoke(win) {
       display: { bounds: display.bounds, work_area: display.workArea, scale_factor: display.scaleFactor,
         window_bounds: win.getBounds() } };
     report.graphics.gpu = await bounded(() => app.getGPUInfo('complete'), 10000, 'Native GPU telemetry');
+    await waitFor(win, 'window.__cq?.model?.tier === "certified" && window.__cq.model.gates?.pass');
     const { readRendererContext } = require('./renderer_config.cjs');
     report.graphics.webgl = await evaluate(win, `(${readRendererContext.toString()})()`);
-    await waitFor(win, 'window.__cq?.model?.tier === "certified" && window.__cq.model.gates?.pass');
     const hash = await evaluate(win, '__cq.model.hash');
     const beforeSecond = secondInstances;
     const secondary = spawn(process.execPath, [], { env: process.env, stdio: 'ignore' });

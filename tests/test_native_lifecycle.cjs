@@ -58,6 +58,13 @@ test('native camera gesture carries coherent state and acknowledges its endpoint
  }
 });
 
+test('native graphics sampling follows actual certified renderer readiness',()=>{
+ const source=fs.readFileSync(path.join(__dirname,'../shell/main.js'),'utf8');
+ const ready=source.indexOf("await waitFor(win, 'window.__cq?.model?.tier === \"certified\" && window.__cq.model.gates?.pass')");
+ const graphics=source.indexOf('report.graphics.webgl = await evaluate');
+ assert.ok(ready>=0&&graphics>ready);
+});
+
 test('normal close waits for actual closed; veto/throw/already-dead/false-closed stay red with no destroy bypass',async()=>{
  for(const mode of ['immediate','pending','veto','throw','false-closed','already-dead']){
   const win=new EventEmitter();let dead=mode==='already-dead',destroyCalls=0;

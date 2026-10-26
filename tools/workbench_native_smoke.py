@@ -512,6 +512,8 @@ def serve_native_actions(process, proof, challenge, user):
                 os_input(process.pid, '    key code 53\n    delay 0.3')
             elif kind == 'save':
                 target_path = Path(target)
+                require(target_path.suffix in ('.step', '.stp', '.stl', '.brep', '.py', '.zip'), 'Unsupported native Save suffix')
+                native_name = target_path.stem  # NSSavePanel owns the selected file-type extension.
                 os_input(process.pid, '    keystroke "g" using {command down, shift down}\n    delay 0.4\n    keystroke ' + json.dumps(str(target_path.parent)) +
                          '\n    key code 36\n    delay 0.5', deadline=action_deadline)
                 os_input(process.pid, '    set saveDeadline to (current date) + ' + str(max(0, action_deadline-time.monotonic())) + '\n'
@@ -520,12 +522,12 @@ def serve_native_actions(process, proof, challenge, user):
                          '          if exists button "Save" of sheet 1 of window 1 then\n'
                          '            if enabled of button "Save" of sheet 1 of window 1 then\n'
                          '              set focused of text field 1 of sheet 1 of window 1 to true\n'
-                         '              keystroke "a" using command down\n              keystroke ' + json.dumps(target_path.name) + '\n'
+                         '              keystroke "a" using command down\n              keystroke ' + json.dumps(native_name) + '\n'
                          '              click button "Save" of sheet 1 of window 1\n              set clickedSave to true\n              exit repeat\n            end if\n          end if\n'
                          '        else if exists button "Save" of window 1 then\n'
                          '          if enabled of button "Save" of window 1 then\n'
                          '            set focused of text field 1 of window 1 to true\n'
-                         '            keystroke "a" using command down\n            keystroke ' + json.dumps(target_path.name) + '\n'
+                         '            keystroke "a" using command down\n            keystroke ' + json.dumps(native_name) + '\n'
                          '            click button "Save" of window 1\n            set clickedSave to true\n            exit repeat\n          end if\n        end if\n      end if\n'
                          '      delay 0.1\n    end repeat\n    if not clickedSave then error "Owned native Save control unavailable" number -1728', deadline=action_deadline)
                 while time.monotonic() < action_deadline:

@@ -489,10 +489,25 @@ def serve_native_actions(process, proof, challenge, user):
             else:
                 raise RuntimeError('Real native panel did not open inside its deadline')
             expected_method = 'showSaveDialog' if kind == 'save' else 'showOpenDialog'
-            require(ledger['calls'][index].get('method') == expected_method and ledger['calls'][index].get('action_id') == identity,
+            dialog_identity = action.get('dialog_action_id', identity)
+            require(type(dialog_identity) is int and dialog_identity > 0, 'Invalid native dialog action identity')
+            if dialog_identity != identity:
+                require(kind == 'folder' and dialog_identity == identity - 1 and index > 0
+                        and 'createDirectory' in ledger['calls'][index].get('properties', []), 'Unrelated native follow-up dialog')
+                previous = ledger['calls'][index - 1]
+                previous_result = previous.get('result')
+                require(previous.get('method') == 'showOpenDialog' and previous.get('action_id') == dialog_identity
+                        and previous.get('properties') == ['openFile'] and isinstance(previous_result, dict) and previous_result.get('canceled') is False
+                        and isinstance(previous_result.get('filePaths'), list) and len(previous_result['filePaths']) == 1
+                        and isinstance(previous_result['filePaths'][0], str) and Path(previous_result['filePaths'][0]).resolve().is_relative_to(user)
+                        and Path(previous_result['filePaths'][0]).suffix.lower() in ('.step', '.stp')
+                        and type(previous.get('completed_at')) in (int, float) and type(ledger['calls'][index].get('started_at')) in (int, float)
+                        and previous['completed_at'] <= ledger['calls'][index]['started_at'],
+                        'Native import destination has no completed parent file selection')
+            require(ledger['calls'][index].get('method') == expected_method and ledger['calls'][index].get('action_id') == dialog_identity,
                     'Unrelated native panel before selection')
             if action.get('trust') is True:
-                require(ledger['calls'][index].get('method') == 'showOpenDialog' and ledger['calls'][index].get('action_id') == identity
+                require(ledger['calls'][index].get('method') == 'showOpenDialog' and ledger['calls'][index].get('action_id') == dialog_identity
                         and ('openDirectory' if kind == 'folder' else 'openFile') in ledger['calls'][index].get('properties', []),
                         'Unrelated native panel before trusted selection')
             if local_network_consent is None or local_network_consent.get('status') != 'denied':
@@ -574,7 +589,7 @@ def serve_native_actions(process, proof, challenge, user):
                         if len(calls) <= index:
                             return None
                         call = calls[index]
-                        require(call.get('method') == 'showOpenDialog' and call.get('action_id') == identity, 'Unrelated native chooser result')
+                        require(call.get('method') == 'showOpenDialog' and call.get('action_id') == dialog_identity, 'Unrelated native chooser result')
                         if call.get('result') is None or call.get('completed_at') is None:
                             return None
                         require(type(call['completed_at']) in (int, float) and type(call.get('started_at')) in (int, float)

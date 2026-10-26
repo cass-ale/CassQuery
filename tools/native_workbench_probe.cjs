@@ -151,7 +151,10 @@ async function qualifyWorkbench(win, directory, context) {
     const expectedMethod = kind === 'save' ? 'showSaveDialog' : 'showOpenDialog';
     const pending = ledgerBefore.calls.findLastIndex((call) => call.method === expectedMethod && !call.result);
     const observerIndex = pending >= 0 ? pending : ledgerBefore.calls.length;
-    const instruction = { schema: 1, id, app_pid: process.pid, challenge, kind, target: target || null, trust, observer_index: observerIndex };
+    const dialogActionId = pending >= 0 ? ledgerBefore.calls[pending].action_id : id;
+    if (pending >= 0) assert.ok(kind === 'folder' && dialogActionId === id - 1
+      && ledgerBefore.calls[pending].properties.includes('createDirectory'), 'Unrelated pending native import destination');
+    const instruction = { schema: 1, id, dialog_action_id: dialogActionId, app_pid: process.pid, challenge, kind, target: target || null, trust, observer_index: observerIndex };
     const actionFile = path.join(directory, 'native-action.json');
     fs.writeFileSync(actionFile + '.tmp', JSON.stringify(instruction) + '\n'); fs.renameSync(actionFile + '.tmp', actionFile);
     await trigger();

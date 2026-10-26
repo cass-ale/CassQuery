@@ -740,11 +740,12 @@ const context=vm.createContext({fs:observed,path,process,require:name=>name==='e
         from unittest.mock import patch
         import workbench_native_smoke as native
         challenge = 'a' * 64
-        cases = ('delayed', 'late-button', 'missing-trust', 'wrong-action', 'wrong-path', 'wrong-buttons', 'cancel-response', 'early-trust', 'no-button', 'duplicate-trust', 'foreign-ledger', 'wrong-panel', 'boolean-response')
+        cases = ('delayed', 'late-button', 'missing-trust', 'wrong-action', 'wrong-path', 'wrong-buttons', 'cancel-response', 'early-trust', 'no-button', 'duplicate-trust', 'foreign-ledger', 'wrong-panel', 'boolean-response', 'linked-followup', 'invalid-followup-parent')
         for mode in cases:
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
                 proof = Path(directory).resolve(); target = proof / 'project'; target.mkdir(); clock = [0.0]; selected = [False]; clicked = [False]; scripts = []
                 action = {'schema':1,'id':2,'app_pid':1234,'challenge':challenge,'kind':'folder','target':str(target),'trust':True,'observer_index':0}
+                if mode in ('linked-followup', 'invalid-followup-parent'): action.update(observer_index=1, dialog_action_id=1)
                 (proof / 'native-action.json').write_text(json.dumps(action))
                 class Process:
                     pid = 1234
@@ -756,6 +757,10 @@ const context=vm.createContext({fs:observed,path,process,require:name=>name==='e
                     if selected[0] and clock[0] >= 10.7:
                         chooser.update(result={'canceled':False,'filePaths':[str(target) if mode!='wrong-path' else str(proof / 'foreign')]},completed_at=11700)
                     calls = [chooser]
+                    if mode in ('linked-followup', 'invalid-followup-parent'):
+                        chooser.update(action_id=1, properties=['openDirectory', 'createDirectory'], started_at=10000)
+                        calls.insert(0, {'method':'showOpenDialog','action_id':1,'properties':['openFile'], 'started_at':1000,'completed_at':9000,
+                                         'result':{'canceled':mode=='invalid-followup-parent','filePaths':[str(proof / 'export.step')]}})
                     if selected[0] and clock[0] >= 10.8 and mode!='missing-trust':
                         trust = {'method':'showMessageBox','action_id':99 if mode=='wrong-action' else 2,
                                  'buttons':['Other','Cancel'] if mode=='wrong-buttons' else ['Trust and Open','Cancel'],
@@ -774,7 +779,8 @@ const context=vm.createContext({fs:observed,path,process,require:name=>name==='e
                         self.assertIn('if enabled of button "Open"', commands)
                         self.assertLessEqual(deadline, 20)
                     elif 'clickedTrust' in commands:
-                        self.assertTrue(ledger()['calls'][0].get('completed_at'));self.assertEqual(ledger()['calls'][1]['action_id'],2)
+                        index = action['observer_index']
+                        self.assertTrue(ledger()['calls'][index].get('completed_at'));self.assertEqual(ledger()['calls'][index+1]['action_id'],2)
                         self.assertGreaterEqual(clock[0],10.8);self.assertIn('if exists button "Trust and Open"',commands)
                         self.assertIn('if enabled of button "Trust and Open"',commands)
                         self.assertLessEqual(deadline,20);self.assertIn('repeat while (current date) < trustDeadline',commands)
@@ -787,7 +793,7 @@ const context=vm.createContext({fs:observed,path,process,require:name=>name==='e
                      patch.object(native,'read_json',side_effect=read), patch.object(native,'os_input',side_effect=os_input), patch.object(native,'screenshot',side_effect=screenshot):
                     native.serve_native_actions(Process(),proof,challenge,proof)
                 response = json.loads((proof / 'native-action-result.json').read_text())
-                self.assertEqual(response['pass'],mode in ('delayed','late-button'))
+                self.assertEqual(response['pass'],mode in ('delayed','late-button','linked-followup'))
                 if response['pass']:
                     self.assertEqual(response['trust_call']['result']['response'],0)
                     self.assertEqual(response['native_call']['result']['filePaths'],[str(target)])

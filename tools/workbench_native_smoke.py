@@ -527,7 +527,22 @@ def serve_native_actions(process, proof, challenge, user):
             image = screenshot(proof / f'native-os-{identity}.png'); image['path'] = Path(image['path']).name; response['image'] = image
             commands = ''
             if kind == 'cancel':
-                os_input(process.pid, '    key code 53\n    delay 0.3')
+                os_input(process.pid, '    set cancelPanel to window 1\n    if exists sheet 1 of window 1 then set cancelPanel to sheet 1 of window 1\n'
+                         '    if not exists button "Cancel" of cancelPanel then error "Owned native Cancel control missing"\n'
+                         '    if not enabled of button "Cancel" of cancelPanel then error "Owned native Cancel control disabled"\n'
+                         '    click button "Cancel" of cancelPanel', deadline=action_deadline)
+                while time.monotonic() < action_deadline:
+                    latest = read_json(proof / 'native-dialogs.json')
+                    require(latest.get('challenge') == challenge and latest.get('app_pid') == process.pid, 'Unrelated native Cancel observer')
+                    call = latest['calls'][index]
+                    if call.get('result') is not None:
+                        require(call.get('method') == 'showOpenDialog' and call.get('action_id') == identity
+                                and call['result'].get('canceled') is True and call['result'].get('filePaths') == [],
+                                'Actual native picker did not cancel')
+                        response['native_call'] = call
+                        break
+                    time.sleep(0.1)
+                else: raise RuntimeError('Matching native Cancel completion deadline')
             elif kind == 'save':
                 target_path = Path(target)
                 require(target_path.suffix in ('.step', '.stp', '.stl', '.brep', '.py', '.zip'), 'Unsupported native Save suffix')
@@ -549,8 +564,8 @@ def serve_native_actions(process, proof, challenge, user):
                          '      if (current date) >= saveDeadline then error "Native directory selection deadline"\n      delay 0.1\n    end repeat\n'
                          '    set nameField to text field 1 of savePanel\n    set focused of nameField to true\n'
                          '    keystroke "a" using command down\n    set the clipboard to ' + json.dumps(native_name) + '\n    keystroke "v" using command down\n'
-                         '    repeat until value of nameField is ' + json.dumps(native_name) + '\n'
-                         '      if (current date) >= saveDeadline then error "Native filename input acknowledgement deadline"\n      delay 0.1\n    end repeat\n'
+                         '    repeat until (value of nameField is ' + json.dumps(native_name) + ' or value of nameField is ' + json.dumps(target_path.name) + ')\n'
+                         '      if (current date) >= saveDeadline then error "Native filename input acknowledgement deadline: " & (value of nameField as text)\n      delay 0.1\n    end repeat\n'
                          '    if not enabled of button "Save" of savePanel then error "Owned native Save control disabled"\n'
                          '    click button "Save" of savePanel\n    set clickedSave to true', deadline=action_deadline)
                 while time.monotonic() < action_deadline:

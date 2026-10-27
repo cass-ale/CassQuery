@@ -672,7 +672,7 @@ const context=vm.createContext({fs:observed,path,process,require:name=>name==='e
                     self.assertEqual(pid,1234); scripts.append(commands)
                     if 'clickedSave' in commands:
                         self.assertIn('set focused of nameField to true', commands)
-                        self.assertIn('repeat until value of nameField is "export"', commands)
+                        self.assertIn('repeat until (value of nameField is "export" or value of nameField is "export.step")', commands)
                         self.assertIn('Native directory input acknowledgement deadline', commands)
                         self.assertIn('AXFocusedUIElement', commands)
                         self.assertIn('Native directory text field not focused', commands)
@@ -689,6 +689,29 @@ const context=vm.createContext({fs:observed,path,process,require:name=>name==='e
                 self.assertEqual(receipt['pass'],mode=='saved')
                 if mode=='saved': self.assertEqual(receipt['native_call']['result']['filePath'],target)
                 else: self.assertTrue(receipt['error'])
+
+    def test_native_cancel_click_requires_the_actual_canceled_result(self):
+        from unittest.mock import patch
+        import workbench_native_smoke as native
+        for mode in ('canceled', 'not-canceled', 'paths-returned', 'wrong-action'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                proof=Path(directory).resolve();clock=[0.0];clicked=[False];challenge='e'*64
+                (proof/'native-action.json').write_text(json.dumps({'schema':1,'id':10,'app_pid':1234,'challenge':challenge,'kind':'cancel','trust':False,'observer_index':0}))
+                class Process:
+                    pid=1234
+                    def poll(self):
+                        if(proof/'native-action-result.json').exists():(proof/'native-workbench-main.json').write_text('{}')
+                        return None
+                def read(file):
+                    if file.name!='native-dialogs.json':return json.loads(file.read_text())
+                    return {'app_pid':1234,'challenge':challenge,'calls':[{'method':'showOpenDialog','action_id':9 if mode=='wrong-action' else 10,'result':{'canceled':mode!='not-canceled','filePaths':['/unexpected']if mode=='paths-returned'else[]}if clicked[0]else None}]}
+                def input(pid,commands,*,deadline=None):
+                    if 'click button "Cancel"' in commands:
+                        self.assertIn('if not enabled of button "Cancel"',commands);clicked[0]=True
+                def shot(file):file.write_bytes(b'panel');return{'path':str(file),'bytes':5,'sha256':'a'*64,'width':1000,'height':700}
+                with patch.object(native.time,'monotonic',side_effect=lambda:clock[0]),patch.object(native.time,'sleep',side_effect=lambda n:clock.__setitem__(0,clock[0]+n)),patch.object(native,'read_json',side_effect=read),patch.object(native,'os_input',side_effect=input),patch.object(native,'screenshot',side_effect=shot),patch.object(native,'deny_ci_python_local_network',return_value={'status':'not-requested'}):
+                    native.serve_native_actions(Process(),proof,challenge,proof)
+                self.assertEqual(json.loads((proof/'native-action-result.json').read_text())['pass'],mode=='canceled')
 
     def test_fixture_clipboard_input_cannot_run_outside_github_ci(self):
         from unittest.mock import patch

@@ -105,13 +105,20 @@ test('cancellation during startup leaves no worker alive', async () => {
   const data = fs.mkdtempSync(path.join(os.tmpdir(), 'cq-cancel-'));
   const script = path.join(data, 'stall.cjs');
   const pidFile = path.join(data, 'pid');
-  fs.writeFileSync(script, `require('fs').writeFileSync(${JSON.stringify(pidFile)},String(process.pid)); process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);`);
+  fs.writeFileSync(script, `const fs=require('fs'),target=${JSON.stringify(pidFile)}; process.on('SIGTERM',()=>{}); fs.writeFileSync(target+'.tmp',String(process.pid)); fs.renameSync(target+'.tmp',target); setInterval(()=>{},1000);`);
   const controller = new AbortController();
   try {
     const pending = startWorker({ command: { executable: process.execPath, args: [script] },
       port: 3939, dataDir: data, timeoutMs: 5000, signal: controller.signal });
-    while (!fs.existsSync(pidFile)) await new Promise((resolve) => setTimeout(resolve, 10));
-    const pid = Number(fs.readFileSync(pidFile));
+    const deadline = Date.now() + 4000;
+    while (!fs.existsSync(pidFile)) {
+      assert.ok(Date.now() < deadline, 'Owned cancellation fixture did not publish readiness');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const rawPid = fs.readFileSync(pidFile, 'utf8');
+    assert.match(rawPid, /^[1-9]\d*$/);
+    const pid = Number(rawPid);
+    assert.ok(Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid);
     controller.abort();
     assert.equal((await pending).child, null);
     assert.throws(() => process.kill(pid, 0), /ESRCH/);

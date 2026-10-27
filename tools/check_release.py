@@ -16,6 +16,7 @@ ACTION_PINS = {
 
 REQUIRED_COMMANDS = {
     'Locked dependencies': '''npm ci
+npx --no-install install-electron
 python -m pip install --require-hashes --only-binary=:all: -r packaging/requirements-macos.lock
 python -m pip check''',
     'Source identity snapshot': 'python tools/release_evidence.py snapshot --output evidence/source-before.json',

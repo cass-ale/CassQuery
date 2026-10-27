@@ -227,7 +227,11 @@ async function runNativeSmoke(win) {
       method: 'real secondary process; BrowserWindow.close; production activate handler; same live worker' };
     report.lifecycle = lifecycle;
     Object.assign(report, await smoke(reopened, output, { nativeTheme, errors: rendererErrors, evidence: report }));
-  } catch (error) { report.pass = false; report.error = (error.stack || String(error)).replaceAll(workbenchToken, '[private capability]'); }
+  } catch (error) {
+    report.pass = false; report.error = (error.stack || String(error)).replaceAll(workbenchToken, '[private capability]');
+    if (error.renderer_execution) report.failed_renderer_execution = { ...error.renderer_execution,
+      expression: error.renderer_execution.expression.replaceAll(workbenchToken, '[private capability]') };
+  }
   report.schema = 1;
   report.worker_pid = ownedWorker?.pid;
   report.app_pid = process.pid;

@@ -26,8 +26,15 @@ async function bounded(operation, timeoutMs, label) {
     return result;
   } finally { clearTimeout(timer); }
 }
-const evaluate = (win, expression, timeoutMs = 10000) =>
-  bounded(() => win.webContents.executeJavaScript(expression), timeoutMs, 'Renderer execution');
+const evaluate = async (win, expression, timeoutMs = 10000) => {
+  try { return await bounded(() => win.webContents.executeJavaScript(expression), timeoutMs, 'Renderer execution'); }
+  catch (error) {
+    error.renderer_execution = { expression: String(expression).slice(0, 512), timeout_ms: timeoutMs,
+      window_id: win.id ?? null, web_contents_id: win.webContents.id ?? null,
+      window_destroyed: typeof win.isDestroyed === 'function' ? win.isDestroyed() : null };
+    throw error;
+  }
+};
 
 async function closeWindow(win, timeoutMs = 15000) {
   if (win.isDestroyed()) throw new Error('Lifecycle window already destroyed');

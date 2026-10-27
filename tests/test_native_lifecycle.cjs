@@ -78,6 +78,14 @@ test('native Tab probe acknowledges delayed insertion before Undo and rejects mi
  }
 });
 
+test('failed renderer execution retains bounded exact-operation diagnostics without a retry',async()=>{
+ let calls=0;const win={id:11,isDestroyed:()=>false,webContents:{id:22,executeJavaScript:()=>{calls++;return new Promise(()=>{});}}};
+ await assert.rejects(api.evaluate(win,'documented operation'.repeat(40),20),error=>{
+  assert.match(error.message,/timed out/);assert.equal(error.renderer_execution.timeout_ms,20);assert.equal(error.renderer_execution.expression.length,512);
+  assert.equal(error.renderer_execution.window_id,11);assert.equal(error.renderer_execution.web_contents_id,22);return true;
+ });assert.equal(calls,1);
+});
+
 test('native graphics sampling follows actual certified renderer readiness',()=>{
  const source=fs.readFileSync(path.join(__dirname,'../shell/main.js'),'utf8');
  const ready=source.indexOf("await waitFor(win, 'window.__cq?.model?.tier === \"certified\" && window.__cq.model.gates?.pass')");

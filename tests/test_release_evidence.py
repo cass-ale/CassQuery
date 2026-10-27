@@ -276,6 +276,16 @@ class NativeConformanceTests(unittest.TestCase):
         report['metadata'].update(bytes=(self.root / metadata_name).stat().st_size, sha256=evidence.digest(self.root / metadata_name))
         report['metadata_bytes'] = report['metadata']['bytes']; report['metadata_sha256'] = report['metadata']['sha256']
         self.put(name, report); self.refresh(); self.verify()
+        # Execute the real staging producer and verifier, not only an assembled fixture.
+        snapshot = self.report('evidence/source-before.json')
+        with tempfile.TemporaryDirectory(prefix='cq-public-staged-') as directory, \
+                mock.patch.object(evidence, 'source_snapshot', return_value=snapshot), \
+                mock.patch.dict(evidence.os.environ, GITHUB_RUN_ID=str(self.fixtures.RUN_ID), GITHUB_RUN_ATTEMPT='1', GITHUB_SHA=self.fixtures.SHA):
+            staged = Path(directory) / 'candidate'
+            evidence.stage_candidate(self.root, staged, 'arm64')
+            for item in report['public_sources']:
+                self.assertEqual((staged / 'evidence' / item['path']).read_bytes(),
+                                 (self.root / 'evidence' / item['path']).read_bytes())
         report['api_quota']['headers']['x-ratelimit-remaining'] = '1'
         self.put(name, report); self.refresh()
         with self.assertRaisesRegex(ValueError, 'quota exhaustion'): self.verify()

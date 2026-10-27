@@ -1201,8 +1201,11 @@ def stage_candidate(root, output, arch):
             paths.add(template.format(arch=arch))
             if template == GATES['updatecheck']:
                 network = read_json(report)
-                for key in ('source_before', 'source_after', 'metadata', 'checksums'):
-                    record = network.get(key, {})
+                sidecars = [network.get(key, {}) for key in ('source_before', 'source_after', 'metadata', 'checksums')]
+                public_sources = network.get('public_sources', [])
+                require(isinstance(public_sources, list) and len(public_sources) <= 3, 'invalid public update metadata inventory')
+                sidecars.extend(public_sources)
+                for record in sidecars:
                     name = record.get('path')
                     require(isinstance(name, str) and name == PurePosixPath(name).name
                             and '/' not in name and '\\' not in name, 'invalid update network sidecar path')

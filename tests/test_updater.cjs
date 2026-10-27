@@ -232,12 +232,32 @@ function fakeChild(pid) {
   const child = new EventEmitter(); Object.assign(child, { pid, exitCode: null, signalCode: null, unref() {}, kill(signal) { this.signalCode = signal; this.emit('exit', null, signal); } }); return child;
 }
 test('installer only commits after new-version/PID/nonce readiness', async t => {
-  const f = await installFixture(t), child = fakeChild(100123);
+  const f = await installFixture(t), child = fakeChild(100123); let unreferenced = false;
+  child.unref = () => { assert.equal(JSON.parse(require('node:fs').readFileSync(path.join(f.control, 'result.json'))).pass, true); unreferenced = true; };
   await helper.runInstall(f.file, { inspect: f.inspect, isAlive: () => false, timeout: 500, launch: async app => {
     assert.equal(await fs.readFile(path.join(app, 'value'), 'utf8'), 'new');
     await helper.writeJSON(path.join(f.control, 'ack.json'), { token: f.request.token, pid: child.pid, version: f.request.version, arch: 'arm64', app }); return child;
   } });
+  assert.equal(unreferenced, true);
   assert.equal((await helper.readJSON(path.join(f.control, 'result.json'))).pass, true); assert.equal(await fs.readFile(path.join(f.stage, 'previous.app/value'), 'utf8'), 'old');
+});
+test('completed install helper exits while its acknowledged app remains running',async t=>{
+  // Real process lifetime regression; the small app/inspection fixture is not native installation proof.
+  const f=await installFixture(t), pidFile=path.join(f.root,'new-pid');
+  const code=`const {spawn}=require('node:child_process'),fs=require('node:fs'),path=require('node:path');
+    const h=require(process.argv[1]),file=process.argv[2],pidFile=process.argv[3];
+    (async()=>{const r=await h.readJSON(file);await h.runInstall(file,{inspect:async app=>({inventory:await h.inventory(app)}),isAlive:()=>false,launch:async app=>{
+      const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});fs.writeFileSync(pidFile,String(child.pid));
+      await h.writeJSON(path.join(path.dirname(file),'ack.json'),{token:r.token,pid:child.pid,version:r.version,arch:r.arch,app});return child;
+    }});console.log('completed');})().catch(e=>{console.error(e);process.exitCode=1});`;
+  try{
+    const exec=require('node:util').promisify(require('node:child_process').execFile);
+    const result=await exec(process.execPath,['-e',code,require.resolve('../shell/update_install.cjs'),f.file,pidFile],{timeout:3000});
+    assert.match(result.stdout,/completed/);const pid=Number(await fs.readFile(pidFile,'utf8'));assert.ok(pid>1);process.kill(pid,0);
+    assert.equal((await helper.readJSON(path.join(f.control,'result.json'))).pass,true);
+  }finally{
+    if(require('node:fs').existsSync(pidFile)){const pid=Number(await fs.readFile(pidFile,'utf8'));try{process.kill(pid,'SIGTERM');}catch(error){if(error.code!=='ESRCH')throw error;}}
+  }
 });
 test('failed new app is stopped and original startup acknowledged before rollback passes', async t => {
   const f = await installFixture(t); let launches = 0;

@@ -327,6 +327,7 @@ async function runInstall(requestFile, { inspect = inspectBundle, isAlive = aliv
         requireThat(ack.token === request.token && ack.pid === child.pid && ack.version === request.version && ack.arch === request.arch && ack.app === app && ack.rollback !== true, 'Invalid restarted-application acknowledgement');
         await writeJSON(path.join(root, 'journal.json'), { token: request.token, phase: 'complete', app, backup });
         await writeJSON(resultFile, { token: request.token, pass: true, version: request.version, backup, updatedPid: child.pid, pgid: child.ownedUpdateGroup ? child.pid : null, readyAcknowledgement: ack });
+        child.unref?.(); // The acknowledged new app outlives this completed helper.
         return;
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
       await wait(100);
@@ -371,5 +372,6 @@ async function runInstall(requestFile, { inspect = inspectBundle, isAlive = aliv
 module.exports = { requireThat, ownedDirectory, readJSON, writeJSON, hashFile, validateZip, inventory, inspectBundle, runAsNodeEnabled, copyCandidate, stopOwnedChild, runInstall, MAX_ZIP, MAX_TREE };
 if (require.main === module) {
   const file = process.argv[2];
-  runInstall(file).catch(error => { if (process.connected) process.send({ type: 'error', error: error.message }); console.error(error.message); process.exitCode = 1; });
+  runInstall(file).catch(error => { if (process.connected) process.send({ type: 'error', error: error.message }); console.error(error.message); process.exitCode = 1; })
+    .finally(() => { if (process.connected) process.disconnect(); });
 }

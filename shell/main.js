@@ -41,6 +41,7 @@ async function ensureWorker() {
     dataDir: process.env.CASSQUERY_DATA_DIR || path.join(app.getPath('userData'), 'worker'),
     env: { ...process.env, ...(app.isPackaged ? { PYTHONDONTWRITEBYTECODE: '1' } : {}),
       CASSQUERY_WORKBENCH_TOKEN: workbenchToken },
+    timeoutMs: app.isPackaged ? 90000 : 30000,
     signal: startup.signal });
   if (quitting) {
     await stopWorker(result.child);
@@ -182,6 +183,7 @@ async function runNativeSmoke(win) {
   const ownedWorker = worker;
   try {
     if (!app.isPackaged) throw new Error('Native assurance requires the packaged Electron app');
+    if (!ownedWorker || workerPort === null) throw new Error('Owned packaged worker startup failed: ' + JSON.stringify(tried));
     const crypto = require('node:crypto');
     const declared = require(path.join(REPO, 'package.json')).cassquerySources?.shell;
     if (!Array.isArray(declared) || !declared.length || !declared.every(name => /^shell\/[a-z_]+\.(?:js|cjs)$/.test(name)))

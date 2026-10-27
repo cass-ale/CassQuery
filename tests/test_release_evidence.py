@@ -244,6 +244,48 @@ class NativeConformanceTests(unittest.TestCase):
         manifest['assets'] = [records[asset['path']] for asset in manifest['assets']]
         self.put('candidate.json', manifest)
 
+    def test_public_quota_fallback_requires_physical_digest_and_candidate_closure(self):
+        name = 'evidence/updatecheck-arm64.json'
+        report = self.report(name)
+        metadata_name = 'evidence/' + report['metadata']['path']
+        metadata = self.report(metadata_name)
+        metadata['metadata_source'] = 'public-github-release'
+        for asset in metadata['assets']:
+            asset['browser_download_url'] = 'https://github.com/' + evidence.REPOSITORY + '/releases/download/v0.1.0/' + asset['name']
+        candidate = {'schema': 1, 'repository': evidence.REPOSITORY, 'version': '0.1.0',
+                     'architecture': 'arm64', 'source_sha': 'b' * 40,
+                     'assets': [{'path': 'dist/mac-app/' + a['name'], 'bytes': a['size'], 'sha256': a['digest'][7:]}
+                                for a in metadata['assets'] if a['name'].endswith('.zip')]}
+        candidate_bytes = json.dumps(candidate).encode()
+        base = 'https://github.com/' + evidence.REPOSITORY + '/releases'
+        rows = [(a['name'], a['digest'][7:]) for a in metadata['assets']]
+        rows.append(('candidate-arm64.json', hashlib.sha256(candidate_bytes).hexdigest()))
+        html = ''.join(f'<a href="/{evidence.REPOSITORY}/releases/download/v0.1.0/{n}"></a><clipboard-copy aria-label="Copy to clipboard digest for {n}" value="sha256:{h}"></clipboard-copy>' for n, h in rows).encode()
+        checksum_name = 'evidence/' + report['checksums']['path']
+        data = {'assets': html, 'candidate': candidate_bytes, 'checksums': (self.root / checksum_name).read_bytes()}
+        report['public_sources'] = []
+        for kind, raw in data.items():
+            file = 'evidence/updatecheck-public-' + kind + ('.json' if kind == 'candidate' else '.txt')
+            (self.root / file).write_bytes(raw); self.files[file] = raw
+            item = evidence.file_record(self.root, file); item['path'] = Path(file).name
+            endpoint = base + '/expanded_assets/v0.1.0' if kind == 'assets' else base + '/download/v0.1.0/' + ('candidate-arm64.json' if kind == 'candidate' else 'SHA256SUMS.txt')
+            report['public_sources'].append({'kind': kind, 'endpoint': endpoint, **item})
+        report['api_quota'] = {'status': 403, 'headers': {'x-ratelimit-remaining': '0'}}
+        report['statuses'][0].update(status=403)
+        self.put(metadata_name, metadata)
+        report['metadata'].update(bytes=(self.root / metadata_name).stat().st_size, sha256=evidence.digest(self.root / metadata_name))
+        report['metadata_bytes'] = report['metadata']['bytes']; report['metadata_sha256'] = report['metadata']['sha256']
+        self.put(name, report); self.refresh(); self.verify()
+        report['api_quota']['headers']['x-ratelimit-remaining'] = '1'
+        self.put(name, report); self.refresh()
+        with self.assertRaisesRegex(ValueError, 'quota exhaustion'): self.verify()
+        report['api_quota']['headers']['x-ratelimit-remaining'] = '0'
+        bad = report['public_sources'][1]
+        path = self.root / 'evidence' / bad['path']; path.write_bytes(candidate_bytes + b' ')
+        bad.update(bytes=path.stat().st_size, sha256=evidence.digest(path))
+        self.put(name, report); self.refresh()
+        with self.assertRaisesRegex(ValueError, 'candidate raw digest'): self.verify()
+
     def test_complete_producer_protocol_and_all_physical_images_pass(self):
         self.verify()
         import importlib.util

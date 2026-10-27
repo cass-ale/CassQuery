@@ -359,7 +359,7 @@ def launch(app, output, env, version, arch, *, bundled):
                                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         try:
             try:
-                code = process.wait(timeout=240)
+                code = process.wait(timeout=360)  # Includes up to90s cold frozen-worker startup and the native renderer checks.
             except subprocess.TimeoutExpired:
                 raise RuntimeError('Packaged app did not finish renderer smoke') from None
             finished = checkpoint('launch-exit')

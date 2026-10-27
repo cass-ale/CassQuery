@@ -851,13 +851,49 @@ def verify_update_check(root, report_path, report, manifest, records):
     require(report.get('release_url') == metadata.get('html_url'), 'update channel release URL changed')
     require(finite_number(report.get('started_ms')) and finite_number(report.get('finished_ms'))
             and report['finished_ms'] >= report['started_ms'], 'missing update network request bounds')
+    public = metadata.get('metadata_source') == 'public-github-release'
+    if public:
+        sources = report.get('public_sources')
+        require(isinstance(sources, list) and len(sources) == 3 and {s.get('kind') for s in sources} == {'assets', 'candidate', 'checksums'}, 'public release raw sources incomplete')
+        originals = {}
+        for item in sources:
+            path = verify_record(root, report_path, item); manifest_record(root, records, path)
+            originals[item['kind']] = relative_file(root, path).read_bytes()
+        tag = metadata.get('tag_name', '')
+        require(isinstance(tag, str) and re.fullmatch(r'v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)', tag), 'invalid public release tag')
+        base = f'https://github.com/{REPOSITORY}/releases'
+        for item in sources:
+            expected_url = f'{base}/expanded_assets/{tag}' if item['kind'] == 'assets' else f'{base}/download/{tag}/' + (f"candidate-{manifest['architecture']}.json" if item['kind'] == 'candidate' else 'SHA256SUMS.txt')
+            require(item.get('endpoint') == expected_url, 'public release metadata endpoint changed')
+        require(len(originals['assets']) <= 256*1024 and len(originals['candidate']) <= 8*1024*1024 and len(originals['checksums']) <= 64*1024, 'public release metadata exceeds bounds')
+        html = originals['assets'].decode('utf-8')
+        def public_digest(name):
+            require(f'href="/{REPOSITORY}/releases/download/{tag}/{name}"' in html, 'public asset URL missing')
+            matches = re.findall(r'<clipboard-copy\b[^>]*aria-label="Copy to clipboard digest for ' + re.escape(name) + r'"[^>]*value="sha256:([a-f0-9]{64})"[^>]*>', html)
+            require(len(matches) == 1, 'public asset digest ambiguous'); return matches[0]
+        require(hashlib.sha256(originals['candidate']).hexdigest() == public_digest(f"candidate-{manifest['architecture']}.json"), 'public candidate raw digest mismatch')
+        candidate = json.loads(originals['candidate'])
+        require(type(candidate.get('schema')) is int and candidate['schema'] == 1 and candidate.get('repository') == REPOSITORY
+                and candidate.get('version') == tag[1:] and candidate.get('architecture') == manifest['architecture']
+                and re.fullmatch(r'[a-f0-9]{40}', candidate.get('source_sha', '')), 'public candidate identity mismatch')
+        for asset in metadata.get('assets', []):
+            require(asset.get('browser_download_url') == f"{base}/download/{tag}/{asset['name']}" and asset.get('digest') == 'sha256:' + public_digest(asset['name']), 'public asset digest or URL mismatch')
+            if asset['name'] == 'SHA256SUMS.txt':
+                require(asset['size'] == len(originals['checksums']) and asset['digest'] == 'sha256:' + hashlib.sha256(originals['checksums']).hexdigest(), 'public checksum document mismatch')
+            else:
+                matches = [v for v in candidate.get('assets', []) if v.get('path') == 'dist/mac-app/' + asset['name']]
+                require(len(matches) == 1 and matches[0].get('bytes') == asset.get('size') and matches[0].get('sha256') == asset['digest'][7:], 'public candidate archive bytes mismatch')
+        quota = report.get('api_quota', {})
+        require(quota.get('status') in (403, 429) and quota.get('headers', {}).get('x-ratelimit-remaining') == '0', 'public metadata fallback has no proven API quota exhaustion')
     statuses = report.get('statuses', [])
-    require(isinstance(statuses, list) and 2 <= len(statuses) <= 8 and all(isinstance(status, dict)
-            and type(status.get('status')) is int and status['status'] in (200, 301, 302, 303, 307, 308)
+    permitted_statuses = (200, 301, 302, 303, 307, 308, 403, 429) if public else (200, 301, 302, 303, 307, 308)
+    require(isinstance(statuses, list) and 2 <= len(statuses) <= (12 if public else 8) and all(isinstance(status, dict)
+            and type(status.get('status')) is int and status['status'] in permitted_statuses
             and isinstance(status.get('endpoint'), str) and status['endpoint'].startswith('https://')
             and '?' not in status['endpoint']
             and status.get('accept') in ('application/vnd.github+json', 'application/octet-stream')
-            for status in statuses) and statuses[0]['status'] == 200 and statuses[-1]['status'] == 200,
+            for status in statuses) and statuses[0]['status'] in ((403, 429) if public else (200,)) and statuses[-1]['status'] == 200
+            and (not public or all(status['status'] not in (403, 429) for status in statuses[1:])),
             'update network did not execute successful bounded request/redirect phases')
     version = report.get('published_release', '')
     require(isinstance(version, str) and re.fullmatch(r'v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)', version), 'noncanonical update channel release')

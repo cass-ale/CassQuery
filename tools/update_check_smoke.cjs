@@ -43,7 +43,7 @@ async function runCheck({ arch, output }, { fetcher = globalThis.fetch, snapshot
     source_clean: false, source_unchanged: false, statuses: [], started_ms: Date.now(), error: null };
   let before, beforeHashes, failure;
   const save = async (name, value) => {
-    const bytes = Buffer.from(JSON.stringify(value, null, 2) + '\n');
+    const bytes = Buffer.isBuffer(value) ? value : Buffer.from(JSON.stringify(value, null, 2) + '\n');
     await fs.writeFile(path.join(directory, name), bytes); return { path: name, bytes: bytes.length, sha256: digest(bytes) };
   };
   try {
@@ -60,9 +60,14 @@ async function runCheck({ arch, output }, { fetcher = globalThis.fetch, snapshot
       return response;
     };
     const signal = AbortSignal.timeout(30000); // One aggregate metadata/checksum budget.
-    const metadata = await client.smallBody(client.API, 256 * 1024, observedFetch, signal);
+    const found = await client.releaseMetadata(arch, observedFetch, signal), metadata = found.bytes;
     report.metadata_sha256 = digest(metadata); report.metadata_bytes = metadata.length;
-    const release = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(metadata));
+    report.metadata_source = found.publicSources.length ? 'public-github-release' : 'github-api';
+    report.public_sources = [];
+    for (const source of found.publicSources) report.public_sources.push({kind: source.kind, endpoint: source.url,
+      ...await save(`${stem}-public-${source.kind}.${source.kind === 'assets' ? 'html' : source.kind === 'candidate' ? 'json' : 'txt'}`, source.bytes)});
+    if (found.quota) report.api_quota = found.quota;
+    const release = found.release;
     const selected = client.selectRelease(release, '0.0.0', arch);
     requireThat(selected && selected.arch === arch, 'No actual published stable native release');
     const checksums = await client.smallBody(selected.checksums.url, 64 * 1024, observedFetch, signal);

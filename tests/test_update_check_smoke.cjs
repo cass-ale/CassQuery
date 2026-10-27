@@ -51,7 +51,7 @@ test('failure report preserves server headers and public JSON error before throw
     fetcher: async () => { requests++; return new Response(JSON.stringify({ message: 'API rate limit exceeded for 192.0.2.1', documentation_url: 'https://docs.github.com/rest/rate-limits?sig=SECRET' }), {
       status: 403, headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '1792939999', date: 'Sun, 25 Oct 2026 14:00:00 GMT', 'retry-after': '60', 'set-cookie': 'PRIVATE' } }); } }), /HTTP 403/);
   const report = JSON.parse(await fs.readFile(f.output, 'utf8'));
-  assert.equal(report.pass, false); assert.equal(report.CI_qualification, false); assert.equal(requests, 1);
+  assert.equal(report.pass, false); assert.equal(report.CI_qualification, false); assert.equal(requests, 2);
   assert.equal(report.error.http.status, 403); assert.equal(report.error.http.headers['x-ratelimit-remaining'], '0');
   assert.equal(report.error.http.headers['retry-after'], '60'); assert.equal(report.error.http.body.format, 'json');
   assert.ok(report.error.http.retryAt > Date.now()); assert.equal(report.error.http.body.documentation_url, 'https://docs.github.com/rest/rate-limits');

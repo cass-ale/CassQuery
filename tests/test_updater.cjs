@@ -148,7 +148,7 @@ test('later checks respect server retryAt without sleeping, retrying, or control
       headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': String(Math.floor(Date.now() / 1000) + 3600) } }); } });
   t.after(() => client.dispose()); await assert.rejects(client.check(), /HTTP 403/);
   assert.ok(client.getState().retryAt > Date.now()); assert.equal(client.getState().httpError.status, 403);
-  await assert.rejects(client.check(), /server requested backoff/); assert.equal(requests, 1); assert.equal(quits, 0);
+  await assert.rejects(client.check(), /server requested backoff/); assert.equal(requests, 2); assert.equal(quits, 0);
 });
 
 test('healthy ZIP and internal relative links validate without extraction', async t => {
@@ -195,6 +195,30 @@ test('actual ASAR bytes have identical custody under Node and Electron RunAsNode
   assert.deepEqual(observed.result, before); assert.equal(before.bytes, archiveBefore.bytes); assert.equal(before.entries, 4);
   const bytes = await fs.readFile(asar); bytes[bytes.length - 1] ^= 1; await fs.writeFile(asar, bytes);
   assert.notEqual((await helper.inventory(app)).sha256, before.sha256); // Physical archive tampering is not waived.
+});
+
+test('public release discovery preserves archive size and independently published digests on exhausted quota',async()=>{
+ const version='0.1.0',arch='arm64',name=`CassQuery-${version}-mac-${arch}.zip`,zipDigest='a'.repeat(64);
+ const sums=Buffer.from(`${zipDigest}  ${name}\n`),sumsDigest=sha(sums);
+ const candidate={schema:1,repository:'cass-ale/CassQuery',version,architecture:arch,source_sha:'b'.repeat(40),assets:[{path:'dist/mac-app/'+name,bytes:1024,sha256:zipDigest}]};
+ const candidateBytes=Buffer.from(JSON.stringify(candidate)),candidateDigest=sha(candidateBytes);
+ const row=(n,d)=>`<a href="/cass-ale/CassQuery/releases/download/v${version}/${n}"></a><clipboard-copy aria-label="Copy to clipboard digest for ${n}" value="sha256:${d}"></clipboard-copy>`;
+ const html=row(name,zipDigest)+row('SHA256SUMS.txt',sumsDigest)+row('candidate-arm64.json',candidateDigest);
+ const release=updater.publicRelease(html,candidate,sums,version,arch);assert.equal(updater.selectRelease(release,'0.0.0',arch).archive.size,1024);
+ assert.throws(()=>updater.publicRelease(html,{...candidate,architecture:'x64'},sums,version,arch));
+ assert.throws(()=>updater.publicRelease(html+row(name,zipDigest),candidate,sums,version,arch));
+ assert.throws(()=>updater.publicRelease(html,candidate,Buffer.from('changed'),version,arch));
+ const requests=[];const fetcher=async(url,options)=>{
+  requests.push(url);assert.ok(!Object.keys(options.headers).some(k=>/authorization|cookie/i.test(k)));
+  if(url===updater.API)return new Response('{"message":"quota"}',{status:403,headers:{'x-ratelimit-remaining':'0'}});
+  if(url===updater.RELEASES+'/latest')return new Response(null,{status:302,headers:{location:updater.RELEASES+'/tag/v'+version}});
+  if(url.endsWith('/expanded_assets/v'+version))return new Response(html);
+  if(url.endsWith('/candidate-arm64.json'))return new Response(candidateBytes);
+  if(url.endsWith('/SHA256SUMS.txt'))return new Response(sums);
+  throw Error('Unexpected fallback request');
+ };
+ const found=await updater.releaseMetadata(arch,fetcher,AbortSignal.timeout(1000));assert.deepEqual(found.release,release);assert.equal(found.publicSources.length,3);assert.equal(requests.length,5);
+ let attempts=0;await assert.rejects(updater.releaseMetadata(arch,async()=>{attempts++;return new Response('denied',{status:403});},AbortSignal.timeout(1000)),/403/);assert.equal(attempts,1);
 });
 
 test('inventory binds root mode and refuses escapes', async t => {

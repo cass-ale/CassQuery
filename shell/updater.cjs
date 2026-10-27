@@ -22,8 +22,8 @@ function compareVersions(a, b) {
   for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
   return 0;
 }
-function assetRecord(asset, name, version) {
-  need(asset && asset.name === name && Number.isSafeInteger(asset.id) && asset.id > 0 && Number.isSafeInteger(asset.size) && asset.size > 0 && typeof asset.digest === 'string' && /^sha256:[a-f0-9]{64}$/.test(asset.digest), 'Release asset lacks verified size/digest metadata');
+function assetRecord(asset, name, version, publicMetadata = false) {
+  need(asset && asset.name === name && (publicMetadata || Number.isSafeInteger(asset.id) && asset.id > 0) && Number.isSafeInteger(asset.size) && asset.size > 0 && typeof asset.digest === 'string' && /^sha256:[a-f0-9]{64}$/.test(asset.digest), 'Release asset lacks verified size/digest metadata');
   const url = `${RELEASES}/download/v${version}/${name}`;
   need(asset.browser_download_url === url, 'Release asset is outside the canonical repository');
   return { name, size: asset.size, sha256: asset.digest.slice(7), url };
@@ -37,7 +37,7 @@ function selectRelease(release, currentVersion, arch) {
   const names = [`CassQuery-${version}-mac-${arch}.zip`, 'SHA256SUMS.txt'];
   const selected = names.map(name => {
     const matches = release.assets.filter(asset => asset.name === name); need(matches.length === 1, 'Missing/duplicate native release asset');
-    return assetRecord(matches[0], name, version);
+    return assetRecord(matches[0], name, version, release.metadata_source === 'public-github-release');
   });
   need(selected[0].size <= helper.MAX_ZIP && selected[1].size <= 64 * 1024, 'Release exceeds update size limits');
   return { version, arch, url: release.html_url, archive: selected[0], checksums: selected[1] };
@@ -55,8 +55,61 @@ function allowedURL(url, initial) {
   const value = new URL(url);
   need(value.protocol === 'https:' && !value.username && !value.password && !value.hash && (!value.port || value.port === '443'), 'Unsafe update transport URL');
   if (value.hostname === 'api.github.com') need(value.href === API && initial === API, 'Unexpected API redirect');
-  else if (value.hostname === 'github.com') need(value.href === initial && initial.startsWith(RELEASES + '/download/'), 'Unexpected repository redirect');
+  else if (value.hostname === 'github.com') need(value.href === initial && (initial.startsWith(RELEASES + '/download/') || /^https:\/\/github\.com\/cass-ale\/CassQuery\/releases\/expanded_assets\/v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/.test(initial)), 'Unexpected repository redirect');
   else need(['release-assets.githubusercontent.com', 'objects.githubusercontent.com'].includes(value.hostname) && initial.startsWith(RELEASES + '/download/') && value.pathname.startsWith(`/github-production-release-asset/${REPOSITORY_ID}/`), 'Unexpected release download host/path');
+}
+function publicAssetDigest(html, name, version) {
+  const href = `/${REPOSITORY}/releases/download/v${version}/${name}`;
+  need(html.includes(`href="${href}"`), 'Public release asset URL missing');
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const matches = [...html.matchAll(new RegExp(`<clipboard-copy\\b[^>]*aria-label="Copy to clipboard digest for ${escaped}"[^>]*value="sha256:([a-f0-9]{64})"[^>]*>`, 'g'))];
+  need(matches.length === 1, 'Public release digest missing or ambiguous');
+  return matches[0][1];
+}
+function publicRelease(html, candidate, sums, version, arch) {
+  versionParts(version); need(['arm64', 'x64'].includes(arch), 'Unsupported public update architecture');
+  need(candidate.schema === 1 && candidate.repository === REPOSITORY && candidate.version === version
+    && candidate.architecture === arch && /^[a-f0-9]{40}$/.test(candidate.source_sha) && Array.isArray(candidate.assets), 'Public candidate identity mismatch');
+  const name = `CassQuery-${version}-mac-${arch}.zip`, matches = candidate.assets.filter(a => a.path === `dist/mac-app/${name}`);
+  need(matches.length === 1 && Number.isSafeInteger(matches[0].bytes) && matches[0].bytes > 0 && matches[0].bytes <= helper.MAX_ZIP, 'Public candidate native archive missing or oversized');
+  const zipDigest = publicAssetDigest(html, name, version), sumsDigest = publicAssetDigest(html, 'SHA256SUMS.txt', version);
+  need(matches[0].sha256 === zipDigest && checksumFor(sums, name) === zipDigest
+    && crypto.createHash('sha256').update(sums).digest('hex') === sumsDigest, 'Public candidate/checksum/GitHub digests disagree');
+  return { draft: false, prerelease: false, tag_name: `v${version}`, html_url: `${RELEASES}/tag/v${version}`, metadata_source: 'public-github-release',
+    assets: [{ name, size: matches[0].bytes, digest: `sha256:${zipDigest}`, browser_download_url: `${RELEASES}/download/v${version}/${name}` },
+      { name: 'SHA256SUMS.txt', size: sums.length, digest: `sha256:${sumsDigest}`, browser_download_url: `${RELEASES}/download/v${version}/SHA256SUMS.txt` }] };
+}
+async function releaseMetadata(arch, fetcher, signal) {
+  try {
+    const bytes = await smallBody(API, 256 * 1024, fetcher, signal);
+    const release = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    need(release && typeof release === 'object' && !Object.hasOwn(release, 'metadata_source'), 'Unexpected API metadata source marker');
+    return { bytes, release, publicSources: [] };
+  } catch (error) {
+    // Only documented exhausted quota selects an alternate public source, never arbitrary denial or malformed metadata.
+    if (error.code !== 'UPDATE_HTTP' || ![403, 429].includes(error.http?.status) || error.http.headers['x-ratelimit-remaining'] !== '0') throw error;
+    const latest = `${RELEASES}/latest`;
+    try {
+    const response = await fetcher(latest, { redirect: 'manual', signal, headers: { Accept: 'application/octet-stream', 'User-Agent': 'CassQuery-Updater', 'Accept-Encoding': 'identity' } });
+    need([301, 302, 303, 307, 308].includes(response.status), 'Public latest release did not resolve to a published tag');
+    const address = new URL(response.headers.get('location'), latest);
+    need(address.origin === 'https://github.com' && !address.username && !address.password && !address.search && !address.hash
+      && address.pathname.startsWith(`/${REPOSITORY}/releases/tag/v`), 'Unexpected public latest release redirect');
+    const version = address.pathname.slice(`/${REPOSITORY}/releases/tag/v`.length); versionParts(version);
+    response.body?.cancel?.().catch?.(() => {});
+    const assetsURL = `${RELEASES}/expanded_assets/v${version}`, candidateName = `candidate-${arch}.json`;
+    const htmlBytes = await smallBody(assetsURL, 256 * 1024, fetcher, signal), html = new TextDecoder('utf-8', { fatal: true }).decode(htmlBytes);
+    const candidateURL = `${RELEASES}/download/v${version}/${candidateName}`, candidateBytes = await smallBody(candidateURL, 8 * 1024 * 1024, fetcher, signal);
+    need(crypto.createHash('sha256').update(candidateBytes).digest('hex') === publicAssetDigest(html, candidateName, version), 'Public candidate metadata digest mismatch');
+    const sumsURL = `${RELEASES}/download/v${version}/SHA256SUMS.txt`, sums = await smallBody(sumsURL, 64 * 1024, fetcher, signal);
+    const release = publicRelease(html, JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(candidateBytes)), sums, version, arch);
+    return { release, bytes: Buffer.from(JSON.stringify(release)), publicSources: [
+      { kind: 'assets', url: assetsURL, bytes: htmlBytes }, { kind: 'candidate', url: candidateURL, bytes: candidateBytes }, { kind: 'checksums', url: sumsURL, bytes: sums }], quota: error.http };
+    } catch (fallbackError) {
+      error.message += '; public release discovery failed: ' + diagnosticText(fallbackError.message, 160);
+      throw error;
+    }
+  }
 }
 function diagnosticText(value, limit = 512) {
   return String(value).replace(/https?:\/\/[^\s"<>]+/gi, '[HTTPS endpoint]')
@@ -213,8 +266,8 @@ async function createUpdater(options) {
     need(state.retryAt === null || state.retryAt <= Date.now(), 'Update server requested backoff; check again at retryAt', 'UPDATE_RETRY_LATER');
     await operation(async signal => {
       emit({ phase: 'checking', error: null, httpError: null, retryAt: null });
-      const bytes = await smallBody(API, 256 * 1024, fetcher, signal);
-      selected = selectRelease(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)), version, arch); lastCheck = Date.now();
+      const metadata = await releaseMetadata(arch, fetcher, signal);
+      selected = selectRelease(metadata.release, version, arch); lastCheck = Date.now();
       emit({ phase: ready ? 'ready' : selected ? 'available' : 'idle', version: ready?.version || selected?.version || null }); await persist();
     });
     if (selected && preferences.autoDownload && !ready) await download();
@@ -340,4 +393,4 @@ async function createUpdater(options) {
   await persist(); onState(getState()); schedule();
   return { check, download, install, reveal, confirmRestart, setPreferences, getState, dispose };
 }
-module.exports = { createUpdater, selectRelease, compareVersions, checksumFor, allowedURL, httpHeaders, retryTiming, responseFor, smallBody, downloadFile, API, RELEASES };
+module.exports = { createUpdater, selectRelease, compareVersions, checksumFor, allowedURL, publicAssetDigest, publicRelease, releaseMetadata, httpHeaders, retryTiming, responseFor, smallBody, downloadFile, API, RELEASES };

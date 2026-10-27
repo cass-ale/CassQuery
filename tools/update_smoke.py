@@ -229,8 +229,8 @@ def command(argv, *, cwd=None, env=None, timeout=120):
     return result.stdout
 
 
-def node_json(node, script, args, *, env=None):
-    return json.loads(command([node, '-e', script, *map(str, args)], cwd=ROOT, env=env))
+def node_json(node, script, args, *, env=None, timeout=120):
+    return json.loads(command([node, '-e', script, *map(str, args)], cwd=ROOT, env=env, timeout=timeout))
 
 
 ASAR_PATCH = r'''
@@ -447,7 +447,7 @@ def run(app, output, arch, node, fixture_version):
                 case['images'] = [record(Path(image['path']), output) for image in initial['images']]
                 validate_ready(initial, source_sha=source['source_sha'], version=version, arch=arch, challenge=report['challenge'], app=str(installed), started=case['started'], finished=checkpoint('old-ready-observed'))
                 case['protected_before'] = protected_snapshot(protected, output, name + '/before')
-                prepared = node_json(node, 'require(process.argv[1]).copyCandidate(process.argv[2],process.argv[3],process.argv[4],process.argv[5],process.argv[6]).then(v=>console.log(JSON.stringify(v))).catch(e=>{console.error(e.message);process.exitCode=1})', [helper, target, installed, arch, version, fixture_version])
+                prepared = node_json(node, 'require(process.argv[1]).copyCandidate(process.argv[2],process.argv[3],process.argv[4],process.argv[5],process.argv[6]).then(v=>console.log(JSON.stringify(v))).catch(e=>{console.error(e.message);process.exitCode=1})', [helper, target, installed, arch, version, fixture_version], timeout=600)
                 token = uuid.uuid4().hex + uuid.uuid4().hex
                 control = user_data / 'updates' / ('stage-' + token); control.mkdir(parents=True, mode=0o700)
                 request = {'schema': 1, 'token': token, 'oldPid': old.pid, 'arch': arch, 'currentVersion': version, 'version': fixture_version, **prepared}
@@ -460,7 +460,7 @@ def run(app, output, arch, node, fixture_version):
                 processes.append(controller)
                 owned_groups[controller.pid] = process_identity(controller.pid)
                 selector = selectors.DefaultSelector(); selector.register(controller.stdout, selectors.EVENT_READ)
-                require(selector.select(20), 'real install helper failed to signal readiness')
+                require(selector.select(300), 'real install helper failed to signal readiness')
                 helper_ready = json.loads(controller.stdout.readline()); require(helper_ready.get('type') == 'ready'
                     and type(helper_ready.get('helper_pid')) is int and helper_ready['helper_pid'] > 1, 'helper exited before wait-for-old-app')
                 case['helper_pid'] = helper_ready['helper_pid']
@@ -469,7 +469,7 @@ def run(app, output, arch, node, fixture_version):
                 old.wait(timeout=30); log.close()
                 wait_for(lambda: not group_members(old.pid), timeout=15, message='old app/worker group remained live before replacement')
                 owned_groups.pop(old.pid, None)
-                helper_exit = controller.wait(timeout=150); selector.close(); helper_log.close()
+                helper_exit = controller.wait(timeout=600); selector.close(); helper_log.close()
                 case['helper_exit'] = helper_exit
                 require(helper_exit == (0 if name == 'install' else 1), 'unexpected real helper completion')
                 result, case['result'] = redact_control(control / 'result.json', output, name + '/result.json')

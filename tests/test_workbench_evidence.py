@@ -242,6 +242,16 @@ class UpdateEvidenceTests(unittest.TestCase):
             self.assertTrue(report['fixture_only'])
             update.validate_report(report, folder, expected_sha=self.sha, expected_arch=arch, expected_version='0.2.0')
 
+    def test_native_copy_budget_is_explicit_and_bounded(self):
+        from unittest.mock import patch
+        with patch.object(update, 'command', return_value=b'{}') as run:
+            update.node_json('node', 'fixed script', [], timeout=600)
+            self.assertEqual(run.call_args.kwargs['timeout'], 600)
+        source = (ROOT / 'tools/update_smoke.py').read_text()
+        self.assertIn('require(selector.select(300)', source)
+        self.assertIn('controller.wait(timeout=600)', source)
+        self.assertIn('fixture_version], timeout=600)', source)
+
     def test_private_control_tokens_are_not_published_in_nested_receipts(self):
         file = self.output / 'private-control.json'
         token = 'c' * 64

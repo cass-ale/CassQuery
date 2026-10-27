@@ -1,7 +1,11 @@
 'use strict';
 // Standalone helper: only Node built-ins. No privilege escalation, network or project I/O.
-const fs = require('node:fs/promises');
-const { constants, createReadStream } = require('node:fs');
+// Electron virtualizes .asar as directories. Package custody must hash the actual
+// archive bytes in both the GUI importer and copied RunAsNode helper, without
+// changing process.noAsar for the rest of the application.
+const physicalFs = process.versions.electron ? require('original-fs') : require('node:fs');
+const fs = physicalFs.promises;
+const { constants, createReadStream } = physicalFs;
 const path = require('node:path');
 const crypto = require('node:crypto');
 const zlib = require('node:zlib');

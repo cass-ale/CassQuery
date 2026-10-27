@@ -171,6 +171,32 @@ test('ZIP rejects chained escapes, cycles, CRC corruption and expansion lies', a
   const stored = zip(appEntries().map(e => ({ ...e, method: 0 }))); stored[stored.indexOf(Buffer.from('binary'))] ^= 1;
   await fs.writeFile(file, stored); await assert.rejects(helper.validateZip(file), /CRC/);
 });
+test('actual ASAR bytes have identical custody under Node and Electron RunAsNode', async t => {
+  const root = await scratch(t), app = path.join(root, 'Custody.app'), source = path.join(root, 'source');
+  const resources = path.join(app, 'Contents/Resources');
+  await fs.mkdir(resources, { recursive: true }); await fs.mkdir(source);
+  await fs.writeFile(path.join(source, 'inside.cjs'), 'module.exports=42;\n');
+  const asar = path.join(resources, 'app.asar');
+  await require('@electron/asar').createPackage(source, asar);
+  const before = await helper.inventory(app), archiveBefore = await helper.hashFile(asar);
+  const executable = path.join(path.dirname(require.resolve('electron/package.json')), 'dist',
+    process.platform === 'darwin' ? 'Electron.app/Contents/MacOS/Electron' : process.platform === 'win32' ? 'electron.exe' : 'electron');
+  const code = `const fs=require('node:fs');const prior=process.noAsar;const virtual=fs.lstatSync(process.argv[2]).isDirectory();
+    const h=require(process.argv[1]);h.inventory(process.argv[3]).then(result=>{
+      if(process.noAsar!==prior)throw Error('Global ASAR mode changed');
+      if(require(process.argv[2]+'/inside.cjs')!==42)throw Error('Application ASAR require disabled');
+      console.log(JSON.stringify({result,virtual,archiveRequire:true,noAsarUnchanged:true,node:process.versions.node}));
+    }).catch(e=>{console.error(e);process.exitCode=1});`;
+  const exec = require('node:util').promisify(require('node:child_process').execFile);
+  const { stdout } = await exec(executable, ['-e', code, require.resolve('../shell/update_install.cjs'), asar, app],
+    { env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, timeout: 15000, maxBuffer: 65536 });
+  const observed = JSON.parse(stdout.trim());
+  assert.equal(observed.virtual, true); assert.equal(observed.noAsarUnchanged, true); assert.equal(observed.archiveRequire, true);
+  assert.deepEqual(observed.result, before); assert.equal(before.bytes, archiveBefore.bytes); assert.equal(before.entries, 4);
+  const bytes = await fs.readFile(asar); bytes[bytes.length - 1] ^= 1; await fs.writeFile(asar, bytes);
+  assert.notEqual((await helper.inventory(app)).sha256, before.sha256); // Physical archive tampering is not waived.
+});
+
 test('inventory binds root mode and refuses escapes', async t => {
   const root = await scratch(t), app = path.join(root, 'App.app'); await fs.mkdir(app, { mode: 0o755 }); await fs.writeFile(path.join(app, 'file'), 'safe');
   const first = await helper.inventory(app); await fs.chmod(app, 0o700); assert.notEqual((await helper.inventory(app)).sha256, first.sha256);

@@ -386,6 +386,9 @@ end tell'''
 
 def os_input(pid, commands, *, deadline=None):
     require(type(pid) is int and pid > 0, 'Native input needs the owned app PID')
+    if 'set the clipboard to ' in commands:
+        require(os.environ.get('GITHUB_ACTIONS') == 'true' and os.environ.get('CI') == 'true'
+                and os.environ.get('RUNNER_OS') == 'macOS', 'Native fixture clipboard paste is restricted to disposable GitHub macOS CI')
     timeout = 20 if deadline is None else min(20, deadline - time.monotonic())
     require(timeout > 0, 'Standard native input exceeded its existing deadline')
     script = ('tell application "System Events"\n'
@@ -539,13 +542,13 @@ def serve_native_actions(process, proof, challenge, user):
                          '    set focused of goField to true\n'
                          '    set goField to value of attribute "AXFocusedUIElement" of targetProcess\n'
                          '    if role of goField is not "AXTextField" and role of goField is not "AXComboBox" then error "Native directory text field not focused"\n'
-                         '    keystroke "a" using command down\n    keystroke ' + json.dumps(str(target_path.parent)) + '\n'
+                         '    keystroke "a" using command down\n    set the clipboard to ' + json.dumps(str(target_path.parent)) + '\n    keystroke "v" using command down\n'
                          '    repeat until (value of goField is ' + json.dumps(str(target_path.parent)) + ' or value of goField is ' + json.dumps(str(target_path.parent) + '/') + ')\n'
                          '      if (current date) >= saveDeadline then error "Native directory input acknowledgement deadline: " & (value of goField as text)\n      delay 0.1\n    end repeat\n'
                          '    key code 36\n    repeat while exists goPanel\n'
                          '      if (current date) >= saveDeadline then error "Native directory selection deadline"\n      delay 0.1\n    end repeat\n'
                          '    set nameField to text field 1 of savePanel\n    set focused of nameField to true\n'
-                         '    keystroke "a" using command down\n    keystroke ' + json.dumps(native_name) + '\n'
+                         '    keystroke "a" using command down\n    set the clipboard to ' + json.dumps(native_name) + '\n    keystroke "v" using command down\n'
                          '    repeat until value of nameField is ' + json.dumps(native_name) + '\n'
                          '      if (current date) >= saveDeadline then error "Native filename input acknowledgement deadline"\n      delay 0.1\n    end repeat\n'
                          '    if not enabled of button "Save" of savePanel then error "Owned native Save control disabled"\n'
@@ -563,7 +566,16 @@ def serve_native_actions(process, proof, challenge, user):
                     time.sleep(0.1)
                 else: raise RuntimeError('Matching native Save completion deadline')
             else:
-                commands = '    keystroke "g" using {command down, shift down}\n    delay 0.4\n    keystroke ' + json.dumps(target) + '\n    key code 36\n    delay 0.5'
+                commands = '    set openDeadline to (current date) + ' + str(max(0,action_deadline-time.monotonic())) + '\n'
+                commands += '    set openPanel to window 1\n    if exists sheet 1 of window 1 then set openPanel to sheet 1 of window 1\n'
+                commands += '    keystroke "g" using {command down, shift down}\n'
+                commands += '    repeat until exists sheet 1 of openPanel\n      if (current date) >= openDeadline then error "Native Go To panel deadline"\n      delay 0.1\n    end repeat\n'
+                commands += '    set goPanel to sheet 1 of openPanel\n    if exists combo box 1 of goPanel then\n      set goField to combo box 1 of goPanel\n    else\n      set goField to text field 1 of goPanel\n    end if\n'
+                commands += '    set focused of goField to true\n    set goField to value of attribute "AXFocusedUIElement" of targetProcess\n'
+                commands += '    if role of goField is not "AXTextField" and role of goField is not "AXComboBox" then error "Native path text field not focused"\n'
+                commands += '    keystroke "a" using command down\n    set the clipboard to ' + json.dumps(target) + '\n    keystroke "v" using command down\n'
+                commands += '    repeat until (value of goField is ' + json.dumps(target) + ' or value of goField is ' + json.dumps(target+'/') + ')\n      if (current date) >= openDeadline then error "Native path input acknowledgement deadline"\n      delay 0.1\n    end repeat\n'
+                commands += '    key code 36\n    repeat while exists goPanel\n      if (current date) >= openDeadline then error "Native path selection deadline"\n      delay 0.1\n    end repeat'
                 os_input(process.pid, commands, deadline=action_deadline)
                 remaining = max(0, action_deadline - time.monotonic())
                 os_input(process.pid, '    set openDeadline to (current date) + ' + str(remaining) + '\n'

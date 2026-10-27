@@ -676,8 +676,9 @@ const context=vm.createContext({fs:observed,path,process,require:name=>name==='e
                         self.assertIn('Native directory input acknowledgement deadline', commands)
                         self.assertIn('AXFocusedUIElement', commands)
                         self.assertIn('Native directory text field not focused', commands)
-                        self.assertIn('keystroke "export"', commands)
-                        self.assertNotIn('keystroke "export.step"', commands)
+                        self.assertIn('set the clipboard to "export"', commands)
+                        self.assertIn('keystroke "v" using command down', commands)
+                        self.assertNotIn('set the clipboard to "export.step"', commands)
                         self.assertIn('if not enabled of button "Save"', commands)
                         self.assertEqual(commands.count('key code 36'), 1)
                         finished[0]=True
@@ -688,6 +689,14 @@ const context=vm.createContext({fs:observed,path,process,require:name=>name==='e
                 self.assertEqual(receipt['pass'],mode=='saved')
                 if mode=='saved': self.assertEqual(receipt['native_call']['result']['filePath'],target)
                 else: self.assertTrue(receipt['error'])
+
+    def test_fixture_clipboard_input_cannot_run_outside_github_ci(self):
+        from unittest.mock import patch
+        import workbench_native_smoke as native
+        with patch.dict(native.os.environ, {}, clear=True), patch.object(native.subprocess, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, 'restricted to disposable GitHub'):
+                native.os_input(1234, 'set the clipboard to "public fixture"')
+            run.assert_not_called()
 
     def test_native_transform_wait_rejects_the_previous_certificate(self):
         source = (ROOT / 'tools/native_workbench_probe.cjs').read_text()

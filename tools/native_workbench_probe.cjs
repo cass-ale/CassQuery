@@ -144,6 +144,7 @@ async function qualifyWorkbench(win, directory, context) {
     await waitFor(win, `Array.from(document.querySelectorAll('#projects button')).some(b=>b.textContent.includes(${JSON.stringify(name)}))`);
     const index = await js(`Array.from(document.querySelectorAll('#projects button')).findIndex(b=>b.textContent.includes(${JSON.stringify(name)}))`);
     await click(win, `#projects button:nth-child(${index + 1})`);
+    await waitFor(win, `window.__workbench?.project === ${JSON.stringify(name)} && window.__workbench.active?.project === ${JSON.stringify(name)} && window.__workbench.busy === 0`);
     if (rebuild) {
       await waitFor(win, `window.__workbench?.project === ${JSON.stringify(name)} && window.__workbench.active?.project === ${JSON.stringify(name)} && window.__workbench.busy === 0 && !window.__workbench.sourceDirty`);
       const previous = (await request('http://127.0.0.1:' + workerPort, '/payload/' + name + '-certified.json')).json;
@@ -302,7 +303,10 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
       try { frames.push(JSON.parse(params.response.payloadData)); } catch { /* Non-JSON frames are not certified announcements. */ }
     }
   };
-  const js = (code) => evaluate(win, code, Math.max(1, Math.min(10000, end - Date.now())));
+  const js = async (code) => {
+    try { return await evaluate(win, code, Math.max(1, Math.min(10000, end - Date.now()))); }
+    catch (error) { error.message += '; native expression: ' + code.slice(0, 180); throw error; }
+  };
   const consoleError = (event) => recordRendererConsole(report.errors, event);
   const rendererGone = (_event, details) => report.errors.push('Renderer gone: ' + details.reason);
   win.webContents.on('console-message', consoleError); win.webContents.on('render-process-gone', rendererGone);

@@ -674,6 +674,8 @@ const context=vm.createContext({fs:observed,path,process,require:name=>name==='e
                         self.assertIn('set focused of nameField to true', commands)
                         self.assertIn('repeat until value of nameField is "export"', commands)
                         self.assertIn('Native directory input acknowledgement deadline', commands)
+                        self.assertIn('AXFocusedUIElement', commands)
+                        self.assertIn('Native directory text field not focused', commands)
                         self.assertIn('keystroke "export"', commands)
                         self.assertNotIn('keystroke "export.step"', commands)
                         self.assertIn('if not enabled of button "Save"', commands)

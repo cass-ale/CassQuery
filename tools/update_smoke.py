@@ -514,6 +514,13 @@ def run(app, output, arch, node, fixture_version):
     finally:
         try:
             stop_groups(owned_groups, processes, controls)
+            if not completed:
+                report['failed_control_records'] = []
+                for index, (control, token, installed) in enumerate(controls):
+                    for name in ('install.json', 'launch.json', 'journal.json', 'ack.json', 'rollback-ack.json', 'result.json'):
+                        if (control / name).is_file():
+                            _, saved = redact_control(control / name, output, f'failed-control-{index}/{name}')
+                            report['failed_control_records'].append(saved)
             if scratch is not None:
                 shutil.rmtree(scratch)
             report['cleanup_complete'] = True

@@ -55,6 +55,14 @@ test('editor flex constraints keep source controls inside the available column',
   assert.match(rule('.document-pane'), /overflow:\s*auto\s*;/);
 });
 
+test('short split viewport gives scrollable model controls space without canvas overflow',()=>{
+ const css=fs.readFileSync(path.join(ROOT,'viewer/style.css'),'utf8');
+ const responsive=css.slice(css.indexOf('@media (min-width: 761px) and (max-width: 1200px)'));
+ assert.match(responsive,/\.viewport-pane\s*\{\s*overflow:\s*hidden/);
+ assert.match(responsive,/#stage\s*\{\s*min-height:\s*0;\s*overflow:\s*hidden/);
+ assert.match(responsive,/aside\s*\{[^}]*min-height:\s*120px/);
+});
+
 test('camera controls occupy a normal-flow row outside the model canvas', () => {
   const html = fs.readFileSync(path.join(ROOT, 'viewer/index.html'), 'utf8');
   const css = fs.readFileSync(path.join(ROOT, 'viewer/style.css'), 'utf8');

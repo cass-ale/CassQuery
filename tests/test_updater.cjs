@@ -295,6 +295,27 @@ test('failed new app is stopped and original startup acknowledged before rollbac
   const result = await helper.readJSON(path.join(f.control, 'result.json')); assert.equal(result.pass, false); assert.equal(result.rollbackAcknowledged, true); assert.equal(result.rollbackRestored, true);
   assert.equal((await helper.inventory(f.app)).sha256, f.request.oldHash);
 });
+test('unacknowledged restored app is stopped and cannot keep a failed helper alive',async t=>{
+ const f=await installFixture(t);let launches=0,restored;
+ await assert.rejects(helper.runInstall(f.file,{inspect:f.inspect,isAlive:()=>false,timeout:30,wait:()=>new Promise(r=>setTimeout(r,1)),launch:async()=>{
+  const child=fakeChild(100500+launches++);if(launches===1)child.exitCode=1;else restored=child;return child;
+ }}),/exited before readiness/);
+ assert.equal(restored.signalCode,'SIGTERM');assert.equal(restored.updateReaped,true);
+ const result=await helper.readJSON(path.join(f.control,'result.json'));assert.equal(result.pass,false);assert.equal(result.rollbackAcknowledged,false);assert.match(result.rollbackError,/readiness was not confirmed/);
+ assert.equal((await helper.inventory(f.app)).sha256,f.request.oldHash);
+});
+test('restart acknowledgement cannot be committed after the helper moved into rollback',async t=>{
+ const f=await installFixture(t),data=path.join(f.root,'restart-data'),control=path.join(data,'updates',`stage-${f.request.token}`);await fs.mkdir(control,{recursive:true,mode:0o700});
+ await helper.writeJSON(path.join(control,'install.json'),{...f.request,oldPid:100004,app:f.app,version:'0.2.0'});
+ await helper.writeJSON(path.join(control,'journal.json'),{token:f.request.token,phase:'launching'});
+ t.mock.method(helper,'inspectBundle',async()=>{await helper.writeJSON(path.join(control,'journal.json'),{token:f.request.token,phase:'rollback-launching'});return{inventory:{sha256:f.request.newHash}};});
+ const previousToken=process.env.CASSQUERY_UPDATE_TOKEN;process.env.CASSQUERY_UPDATE_TOKEN=f.request.token;
+ let client;
+ try{client=await updater.createUpdater({version:'0.2.0',arch:'arm64',userData:data,appPath:f.app,autoCheck:false,autoDownload:false});}
+ finally{if(previousToken===undefined)delete process.env.CASSQUERY_UPDATE_TOKEN;else process.env.CASSQUERY_UPDATE_TOKEN=previousToken;}
+ t.after(()=>client.dispose());
+ await assert.rejects(client.confirmRestart(),/phase changed/);await assert.rejects(fs.stat(path.join(control,'ack.json')),/ENOENT/);
+});
 test('alive old PID prevents all application writes', async t => {
   const f = await installFixture(t);
   await assert.rejects(helper.runInstall(f.file, { inspect: f.inspect, isAlive: () => true, timeout: 20, wait: ms => new Promise(r => setTimeout(r, Math.min(ms, 5))), launch: () => { throw new Error('must not launch'); } }), /did not exit/);

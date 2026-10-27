@@ -364,6 +364,8 @@ async function createUpdater(options) {
     const app = await fs.realpath(appPath);
     need(request.token === token && expectedVersion === version && request.arch === arch && request.app === app && request.oldPid !== process.pid, 'Restart acknowledgement does not match installed app');
     need((await helper.inspectBundle(app, arch, version)).inventory.sha256 === expectedHash, 'Restarted application differs from verified update');
+    const currentJournal = await helper.readJSON(path.join(stage, 'journal.json'));
+    need(currentJournal.token === token && currentJournal.phase === journal.phase, 'Install phase changed during restarted-app verification');
     // Caller invokes this only AFTER its owned worker and real renderer are ready.
     await helper.writeJSON(path.join(stage, rollback ? 'rollback-ack.json' : 'ack.json'), { token, pid: process.pid, version, arch, app, rollback });
     const deadline = Date.now() + 20000;

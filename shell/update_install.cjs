@@ -282,7 +282,7 @@ async function stopOwnedChild(child) {
   requireThat(!running() && !groupAlive(), 'Update process was not reaped; original backup retained');
   child.updateReaped = true; child.updateGroupGone = true;
 }
-async function runInstall(requestFile, { inspect = inspectBundle, isAlive = alive, launch, wait = sleep, timeout = 60000 } = {}) {
+async function runInstall(requestFile, { inspect = inspectBundle, isAlive = alive, launch, wait = sleep, timeout = 180000 } = {}) {
   const request = await readJSON(requestFile);
   requireThat(request.schema === 1 && TOKEN.test(request.token) && ['arm64', 'x64'].includes(request.arch) && ['oldHash', 'newHash'].every(key => TOKEN.test(request[key])) && ['currentVersion', 'version'].every(key => typeof request[key] === 'string' && /^(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})$/.test(request[key])) && Number.isInteger(request.oldPid) && request.oldPid > 1 && request.oldPid !== process.pid, 'Invalid install request');
   const beforeVersion = request.currentVersion.split('.').map(Number), afterVersion = request.version.split('.').map(Number);
@@ -299,7 +299,7 @@ async function runInstall(requestFile, { inspect = inspectBundle, isAlive = aliv
   }
   requireThat((await inspect(app, request.arch, request.currentVersion)).inventory.sha256 === request.oldHash && (await inspect(incoming, request.arch, request.version)).inventory.sha256 === request.newHash, 'Application changed before install');
   process.send?.({ type: 'ready', token: request.token });
-  let moved = false, placed = false, oldExited = false, child;
+  let moved = false, placed = false, oldExited = false, child, restored;
   try {
     const quitDeadline = Date.now() + timeout;
     while (isAlive(request.oldPid)) { requireThat(Date.now() < quitDeadline, 'Old application did not exit; update was not installed', 'UPDATE_QUIT_TIMEOUT'); await wait(100); }
@@ -346,7 +346,7 @@ async function runInstall(requestFile, { inspect = inspectBundle, isAlive = aliv
         requireThat((await inspect(app, request.arch, request.currentVersion)).inventory.sha256 === request.oldHash, 'Restored application differs from original');
         await writeJSON(path.join(root, 'journal.json'), { token: request.token, phase: 'rollback-launching', app, backup });
         const environment = { ...process.env, CASSQUERY_UPDATE_TOKEN: request.token }; delete environment.ELECTRON_RUN_AS_NODE; delete environment.NODE_OPTIONS; delete environment.NODE_EXTRA_CA_CERTS;
-        const restored = launch ? await launch(app, environment) : spawn(path.join(app, 'Contents/MacOS/CassQuery'), [], { env: environment, stdio: 'ignore', detached: true });
+        restored = launch ? await launch(app, environment) : spawn(path.join(app, 'Contents/MacOS/CassQuery'), [], { env: environment, stdio: 'ignore', detached: true });
         let restoredError; restored.once?.('error', failure => { restoredError = failure; });
         if (!launch && Number.isInteger(restored.pid) && restored.pid > 1) restored.ownedUpdateGroup = true;
         restoredPid = restored.pid;
@@ -364,7 +364,13 @@ async function runInstall(requestFile, { inspect = inspectBundle, isAlive = aliv
         requireThat(rollbackAcknowledged, 'Original app restored but readiness was not confirmed');
         restored.unref?.();
       }
-    } catch (failure) { rollbackError = failure.message; }
+    } catch (failure) {
+      rollbackError = failure.message;
+      if (restored && !rollbackAcknowledged) {
+        try { await stopOwnedChild(restored); }
+        catch (cleanupError) { rollbackError += '; restored process cleanup: ' + cleanupError.message; }
+      }
+    }
     await writeJSON(resultFile, { token: request.token, pass: false, error: error.message, rollbackError, backup, updatedPid: child?.pid, updatedGroup: child?.ownedUpdateGroup ? child.pid : null, updatedExit: child?.exitCode, updatedSignal: child?.signalCode, updatedReaped: !child || child.updateReaped === true, updatedGroupGone: !child || child.updateGroupGone === true, restoredPid, rollbackRestored: oldExited && !rollbackError && rollbackAcknowledged, rollbackAcknowledged });
     throw error;
   }

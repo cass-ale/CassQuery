@@ -214,8 +214,9 @@ dialog .source-heading { padding: 0 0 var(--space-2); margin-bottom: var(--space
 #export-form { display: flex; flex-direction: column; gap: var(--space-2); }
 @media (min-width: 761px) and (max-width: 1200px) {
   .workspace.editor-visible .model-pane { flex-direction: column; }
-  .workspace.editor-visible .model-pane #stage { min-height: 260px; }
-  .workspace.editor-visible aside { width: auto; max-height: 38%; border-left: 0; border-top: 1px solid var(--line); padding: var(--space-3); }
+  .workspace.editor-visible .viewport-pane { overflow: hidden; }
+  .workspace.editor-visible .model-pane #stage { min-height: 0; overflow: hidden; }
+  .workspace.editor-visible aside { width: auto; min-height: 120px; max-height: 38%; border-left: 0; border-top: 1px solid var(--line); padding: var(--space-3); }
 }
 @media (max-width: 760px) {
   .workspace { min-height: 600px; }

@@ -286,6 +286,16 @@ class NativeConformanceTests(unittest.TestCase):
         self.put(name, report); self.refresh()
         with self.assertRaisesRegex(ValueError, 'candidate raw digest'): self.verify()
 
+    def test_successful_install_helper_may_have_empty_stderr_but_not_empty_proof(self):
+        name = 'evidence/update-arm64/install-helper.log'
+        (self.root / name).write_bytes(b''); self.files[name] = b''
+        self.refresh(); self.verify()
+        # Empty geometry/JSON is not made valid by the diagnostic-log exception.
+        metadata = 'evidence/updatecheck-arm64-release.json'
+        (self.root / metadata).write_bytes(b'')
+        self.refresh()
+        with self.assertRaisesRegex(ValueError, 'invalid candidate file size'): self.verify()
+
     def test_complete_producer_protocol_and_all_physical_images_pass(self):
         self.verify()
         import importlib.util

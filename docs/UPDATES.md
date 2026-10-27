@@ -7,13 +7,19 @@ of this code: upgrading v0.1 to v0.2 requires the ordinary manual installer.
 ## Channel and trust
 
 The only channel is [cass-ale/CassQuery Releases](https://github.com/cass-ale/CassQuery/releases).
-Checks use the public GitHub API without tokens or cookies. Only canonical stable
-`vMAJOR.MINOR.PATCH` releases newer than the running version are selected; drafts,
-prereleases, wrong architectures and other repositories are rejected.
+Checks normally use the public GitHub API without tokens or cookies. If GitHub
+explicitly reports exhausted unauthenticated API quota, the client uses the
+canonical public latest-release redirect and raw GitHub asset metadata instead.
+It cross-checks the published asset digests, candidate manifest archive size/hash,
+and `SHA256SUMS.txt`; failed or ambiguous fallback metadata remains an error.
+Only canonical stable `vMAJOR.MINOR.PATCH` releases newer than the running version
+are selected; drafts, prereleases, wrong architectures and other repositories are
+rejected.
 
-The native ZIP must agree with BOTH the release asset's API SHA-256/size and
-`SHA256SUMS.txt`. HTTPS redirects stay on the exact repository download path or
-GitHub's repository-scoped release CDN. These checks authenticate downloaded bytes
+The native ZIP must agree with BOTH GitHub's published asset SHA-256/size (API
+metadata, or digest-bound public candidate metadata) and `SHA256SUMS.txt`. HTTPS
+redirects stay on the exact repository download path or GitHub's repository-scoped
+release CDN. These checks authenticate downloaded bytes
 against the trusted GitHub release origin. They are not an independent publisher
 signature, Developer ID, notarization or Gatekeeper approval.
 

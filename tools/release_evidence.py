@@ -944,7 +944,9 @@ def verify_candidate(root, manifest=None, *, expected_sha, expected_run_id, expe
     records = {}
     for record in files:
         require(re.fullmatch(r'[0-9a-f]{64}', record.get('sha256', '')), 'invalid candidate file digest')
-        require(type(record.get('bytes')) is int and 0 < record['bytes'] <= 4 * 1024**3, 'invalid candidate file size')
+        empty_helper_log = bool(re.fullmatch(r'evidence/update-(?:arm64|x64)/(?:install|rollback)-helper\.log', record['path']))
+        require(type(record.get('bytes')) is int and 0 <= record['bytes'] <= 4 * 1024**3
+                and (record['bytes'] > 0 or empty_helper_log), 'invalid candidate file size')
         actual = file_record(root, record['path'])
         require(actual == record, f'candidate bytes changed: {record["path"]}')
         records[record['path']] = record

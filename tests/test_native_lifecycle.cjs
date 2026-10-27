@@ -58,6 +58,26 @@ test('native camera gesture carries coherent state and acknowledges its endpoint
  }
 });
 
+test('native Tab probe acknowledges delayed insertion before Undo and rejects missing or wrong indentation',async()=>{
+ const source=fs.readFileSync(path.join(__dirname,'../tools/native_workbench_probe.cjs'),'utf8');
+ const start=source.indexOf("    await click(win, '#source-editor');\n    await waitFor(win, `document.activeElement"),end=source.indexOf('    const persisted =',start);
+ assert.ok(start>0&&end>start);const block=source.slice(start,end);
+ for(const mode of ['delayed','missing','wrong']){
+  const old='source\n',editor={value:old,selectionStart:4,selectionEnd:4,readOnly:false,disabled:false};let undone=false;
+  const document={activeElement:editor,getElementById:()=>editor},window={__workbench:{busy:0,active:{text:old}}};
+  const renderer=vm.createContext({document,window});
+  const waitFor=async(_win,code)=>{const deadline=Date.now()+1000;while(Date.now()<deadline){if(vm.runInContext(code,renderer))return;await new Promise(r=>setTimeout(r,5));}throw Error('acknowledgement missing');};
+  const win={webContents:{selectAll:()=>{editor.selectionStart=0;editor.selectionEnd=old.length;}}};
+  const key=code=>setTimeout(()=>{if(code==='Left')editor.selectionStart=editor.selectionEnd=0;
+   if(code==='Tab'&&mode!=='missing'){editor.value=(mode==='wrong'?'    ':'  ')+old;window.__workbench.active.text=editor.value;}},30);
+  const shortcut=code=>{assert.equal(code,'Z');assert.equal(editor.value,'  '+old);undone=true;setTimeout(()=>{editor.value=old;window.__workbench.active.text=old;},30);};
+  const context=vm.createContext({win,waitFor,key,shortcut,external:old,click:async()=>{},js:async code=>vm.runInContext(code,renderer)});
+  const pending=vm.runInContext('(async()=>{'+block+'return {oldText,newText};})()',context);
+  if(mode==='delayed'){const result=await pending;assert.equal(result.newText,'  '+old);assert.equal(undone,true);assert.equal(editor.value,old);}
+  else{await assert.rejects(pending,/acknowledgement missing/);assert.equal(undone,false);}
+ }
+});
+
 test('native graphics sampling follows actual certified renderer readiness',()=>{
  const source=fs.readFileSync(path.join(__dirname,'../shell/main.js'),'utf8');
  const ready=source.indexOf("await waitFor(win, 'window.__cq?.model?.tier === \"certified\" && window.__cq.model.gates?.pass')");

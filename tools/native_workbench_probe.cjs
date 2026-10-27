@@ -578,8 +578,18 @@ async function probe(win, directory, { ownedRoot, projectRoot, projectName = 'WO
     });
     await waitFor(win, `window.__cq?.model?.index.project === 'WORKBENCHPLATE' && document.getElementById('source-editor').value === ${JSON.stringify(external)}`);
     const restoredFont = await js('parseFloat(getComputedStyle(document.getElementById("source-editor")).fontSize)');
-    await click(win, '#source-editor'); shortcut('Home'); const oldText = await js('document.getElementById("source-editor").value'); key('Tab');
-    const newText = await js('document.getElementById("source-editor").value'); shortcut('Z'); await waitFor(win, `document.getElementById('source-editor').value === ${JSON.stringify(oldText)}`);
+    await click(win, '#source-editor');
+    await waitFor(win, `document.activeElement === document.getElementById('source-editor') && !document.activeElement.readOnly && !document.activeElement.disabled && window.__workbench?.busy === 0`, 5000);
+    // Native Edit selection + native Left establish the caret; neither mutates source.
+    win.webContents.selectAll();
+    await waitFor(win, `document.getElementById('source-editor').selectionStart === 0 && document.getElementById('source-editor').selectionEnd === document.getElementById('source-editor').value.length`, 5000);
+    key('Left');
+    await waitFor(win, `document.getElementById('source-editor').selectionStart === 0 && document.getElementById('source-editor').selectionEnd === 0`, 5000);
+    const oldText = await js('document.getElementById("source-editor").value');
+    key('Tab');
+    await waitFor(win, `document.activeElement === document.getElementById('source-editor') && document.getElementById('source-editor').value === ${JSON.stringify('  ' + external)} && window.__workbench?.active?.text === ${JSON.stringify('  ' + external)}`, 5000);
+    const newText = await js('document.getElementById("source-editor").value');
+    shortcut('Z'); await waitFor(win, `document.getElementById('source-editor').value === ${JSON.stringify(oldText)} && window.__workbench?.active?.text === ${JSON.stringify(oldText)}`, 5000);
     const persisted = JSON.parse(fs.readFileSync(path.join(process.env.CASSQUERY_USER_DATA, 'workbench-settings.json')));
     check('font-tabs', { font_size: persisted.editorFontSize, rendered_font_size: await js('parseFloat(getComputedStyle(document.getElementById("source-editor")).fontSize)'),
       tab_size: persisted.tabSize, inserted_spaces: newText.length - oldText.length, persistence_after_reload: restoredFont === 22 });

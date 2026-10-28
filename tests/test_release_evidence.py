@@ -31,6 +31,20 @@ def candidate_fixture(root):
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_component_walk_checks_actual_types_and_paths_on_every_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); (root / 'nested').mkdir(); file = root / 'nested' / 'proof.json'
+            file.write_text('{}')
+            self.assertEqual(evidence.relative_file(root, 'nested/proof.json'), file.resolve())
+            for name in ('/outside', '../outside', 'nested/../proof.json', 'nested//proof.json', 'nested/./proof.json', 'nested\\\\proof.json'):
+                with self.subTest(name=name), self.assertRaises(ValueError): evidence.relative_file(root, name)
+            file.unlink(); file.symlink_to(root / 'elsewhere')
+            with self.assertRaisesRegex(ValueError, 'symlink'): evidence.relative_file(root, 'nested/proof.json')
+            file.unlink(); file.mkdir()
+            with self.assertRaises(ValueError): evidence.relative_file(root, 'nested/proof.json')
+            file.rmdir(); (root / 'nested').rmdir(); (root / 'nested').symlink_to(root)
+            with self.assertRaisesRegex(ValueError, 'symlink'): evidence.relative_file(root, 'nested/proof.json')
+
     def test_candidate_byte_mutations_and_identity_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

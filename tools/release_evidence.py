@@ -90,18 +90,23 @@ def source_snapshot(root):
 
 def relative_file(root, name):
     require(isinstance(name, str) and name and '\\' not in name, 'invalid artifact path')
-    path = PurePosixPath(name)
-    require(not path.is_absolute() and all(part not in ('', '.', '..') for part in name.split('/')),
+    parts = name.split('/')
+    require(not name.startswith('/') and all(part not in ('', '.', '..') for part in parts),
             'artifact path traversal')
-    base = Path(root).resolve()
-    file = base.joinpath(*path.parts)
-    cursor = file
-    while cursor != base:
-        require(not cursor.is_symlink(), f'artifact symlink: {name}')
-        cursor = cursor.parent
-    require(file.is_file(), f'missing artifact file: {name}')
-    require(file.resolve().is_relative_to(base), 'artifact path outside root')
-    return file
+    # Validate every component afresh. String traversal avoids thousands of
+    # Path.resolve/parent reconstructions; no path, file digest or verdict cache.
+    base = os.path.realpath(os.fspath(root))
+    cursor = base
+    for index, part in enumerate(parts):
+        cursor = os.path.join(cursor, part)
+        try:
+            mode = os.lstat(cursor).st_mode
+        except FileNotFoundError:
+            raise ValueError(f'missing artifact file: {name}') from None
+        require(not stat.S_ISLNK(mode), f'artifact symlink: {name}')
+        require(stat.S_ISREG(mode) if index == len(parts) - 1 else stat.S_ISDIR(mode),
+                f'missing artifact file: {name}')
+    return Path(cursor)
 
 
 def file_record(root, name):

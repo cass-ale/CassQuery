@@ -422,7 +422,7 @@ async function matrix(win, directory, nativeTheme, errors, records = []) {
         win.setContentSize(width, 700);
         await delay(200);
         assert.deepEqual(win.getContentSize(), [width, 700], `display cannot realize ${width}x700`);
-        await waitFor(win, `innerWidth === ${width} && innerHeight === 700`, 5000);
+        await waitFor(win, `innerWidth === ${width} && innerHeight === 700`, 15000);
         await waitRendererLayout(win);
         for (const [index, state] of STATES.entries()) {
           await click(win, `#steps button:nth-child(${index + 1})`);

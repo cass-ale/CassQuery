@@ -86,6 +86,18 @@ test('failed renderer execution retains bounded exact-operation diagnostics with
  });assert.equal(calls,1);
 });
 
+test('matrix native resize waits exact dimensions under its finite budget and rejects mismatched size',async()=>{
+ const source=fs.readFileSync(path.join(__dirname,'../shell/smoke.cjs'),'utf8');
+ const statement=source.split('\n').find(line=>line.includes('await waitFor(win, `innerWidth === ${width} && innerHeight === 700`'));
+ assert.ok(statement);assert.match(statement,/15000\)/);
+ for(const healthy of [true,false]){
+  let reads=0;const win={isDestroyed:()=>false,webContents:{executeJavaScript:async code=>{assert.equal(code,'innerWidth === 1000 && innerHeight === 700');reads++;return healthy&&reads>=2;}}};
+  const context=vm.createContext({win,width:1000,waitFor:(_win,code,ms)=>{assert.equal(ms,15000);return api.waitFor(_win,code,healthy?1000:20);}});
+  const pending=vm.runInContext('(async()=>{'+statement+'})()',context);
+  if(healthy){await pending;assert.equal(reads,2);}else await assert.rejects(pending,/timed out/);
+ }
+});
+
 test('native graphics sampling follows actual certified renderer readiness',()=>{
  const source=fs.readFileSync(path.join(__dirname,'../shell/main.js'),'utf8');
  const ready=source.indexOf("await waitFor(win, 'window.__cq?.model?.tier === \"certified\" && window.__cq.model.gates?.pass')");

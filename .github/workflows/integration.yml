@@ -8,7 +8,7 @@ permissions:
   contents: read
 concurrency:
   group: source-integration-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 jobs:
   integration:
     runs-on: ubuntu-24.04
